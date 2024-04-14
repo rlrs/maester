@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
+import torch.nn.init as init
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -59,6 +61,7 @@ class ModelArgs:
 
 transformer_configs = {
     "CodeLlama-7b-Python-hf": dict(block_size=16384, vocab_size=32000, n_layer=32, dim = 4096, rope_base=1000000),
+    "test": dict(n_layer=16, n_head=16, dim=4096, n_local_heads=8),
     "7B": dict(n_layer=32, n_head=32, dim=4096),
     "13B": dict(n_layer=40, n_head=40, dim=5120),
     "30B": dict(n_layer=60, n_head=52, dim=6656),
@@ -68,24 +71,6 @@ transformer_configs = {
     "stories15M": dict(n_layer=6, n_head=6, dim=288),
     "stories110M": dict(n_layer=12, n_head=12, dim=768),
 }
-
-class KVCache(nn.Module):
-    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
-        super().__init__()
-        cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
-        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
-        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
-
-    def update(self, input_pos, k_val, v_val):
-        # input_pos: [S], k_val: [B, H, S, D]
-        assert input_pos.shape[0] == k_val.shape[2]
-
-        k_out = self.k_cache
-        v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val
-        v_out[:, :, input_pos] = v_val
-
-        return k_out, v_out
 
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
@@ -115,15 +100,13 @@ class Transformer(nn.Module):
             dtype = self.output.scales.dtype
         elif hasattr(self.output, "scales_and_zeros"):
             dtype = self.output.scales_and_zeros.dtype
-        for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype)
 
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
-        mask = self.causal_mask[None, None, input_pos]
+        mask = self.causal_mask[None, input_pos] #self.causal_mask[None, None, input_pos] # TODO: what's up here?
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
 
@@ -191,12 +174,11 @@ class Attention(nn.Module):
 
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
-        if self.kv_cache is not None:
-            k, v = self.kv_cache.update(input_pos, k, v)
-
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION): # ensure flash only
+            # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0) # attn_mask does not work with flash
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0) # TODO: ensure causal mask is right?
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
@@ -227,6 +209,9 @@ class RMSNorm(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
+    
+    def reset_parameters(self):
+        init.ones_(self.weight)
 
 
 def precompute_freqs_cis(
