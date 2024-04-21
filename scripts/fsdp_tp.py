@@ -9,7 +9,8 @@ import torch.nn.functional as F
 from torch.utils.flop_counter import FlopCounterMode
 from torch.nn.utils import skip_init
 
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.distributed.tensor.parallel import (
     parallelize_module,
     ColwiseParallel,
@@ -19,8 +20,8 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.profiler import profile, record_function, ProfilerActivity, schedule
 
 from maester.log_utils import rank0_log, rank_log, get_logger
-from maester.model import ModelArgs, Transformer, TransformerBlock
-from maester.memory import set_activation_checkpointing
+from maester.model import ModelArgs, Transformer, TransformerBlock, Attention, FeedForward
+from maester.memory import set_activation_checkpointing, cleanup_before_training
 
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
@@ -28,7 +29,7 @@ torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce co
 
 # torch.cuda.memory._record_memory_history() # for memory tracebacks and event history
 
-tp_size = 1
+tp_size = 2
 logger = get_logger()
 
 # understand world topology
@@ -48,7 +49,7 @@ dp_size = _world_size // tp_size
 # First dim is the data parallel dimension
 # Second dim is the tensor parallel dimension.
 # device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
-device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
 
 rank0_log(_rank, logger, f"Device Mesh created: {device_mesh=}")
 dp_mesh = device_mesh["dp"]
@@ -68,15 +69,17 @@ with torch.device("meta"):
     rank_log(_rank, logger, f"Num params: {n_params}")
 
 # Init FSDP using the dp device mesh
-sharded_model = FSDP(base_model, device_mesh=dp_mesh, use_orig_params=True, 
+sharded_model = FSDP(base_model, device_mesh=device_mesh, use_orig_params=True, 
+                     auto_wrap_policy=ModuleWrapPolicy({Transformer, TransformerBlock}),
+                     sharding_strategy=ShardingStrategy._HYBRID_SHARD_ZERO2,
                      mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.bfloat16))
-del base_model
+# for name, param in sharded_model.named_parameters():
+#     rank0_log(_rank, logger, f"{name}: {param}")
 
 with torch.device("cuda"):
     sharded_model.setup_caches(32, model_args.block_size) # setup rope caches because fsdp doesn't handle this
 for param in sharded_model.parameters():
     assert param.device.type == "cuda"
-    assert param.device.index == dp_rank
 
 # Custom parallelization plan for the swiglu MLP model
 # custom_tp_model = parallelize_module(
@@ -90,8 +93,8 @@ for param in sharded_model.parameters():
 # )
 # custom_tp_model = base_model
 
-if True: # activation checkpointing
-    set_activation_checkpointing(sharded_model, auto_wrap_policy={TransformerBlock})
+if False: # activation checkpointing
+    set_activation_checkpointing(sharded_model, auto_wrap_policy={FeedForward})
     rank0_log(_rank, logger, "Activation checkpointing enabled")
 
 rank0_log(_rank, logger, f"Model after parallelization {sharded_model=}\n")
@@ -108,15 +111,6 @@ rank0_log(_rank, logger, "\nStarting 2D training...")
 num_iterations = 20
 batch_size = 4
 
-def step(inp):
-    output = sharded_model(inp)
-    rank_log(_rank, logger, "After fwd")
-    rank_log(_rank, logger, "torch.cuda.memory_allocated: %fGB"%(torch.cuda.memory_allocated()/1024/1024/1024))
-    rank_log(_rank, logger, "torch.cuda.memory_reserved: %fGB"%(torch.cuda.memory_reserved()/1024/1024/1024))
-    rank_log(_rank, logger, "torch.cuda.max_memory_reserved: %fGB"%(torch.cuda.max_memory_reserved()/1024/1024/1024))
-    output.sum().backward()
-    optimizer.step()
-
 # torch.cuda.memory._dump_snapshot("before_compile.pickle")
 
 # compile the sharded model for speed
@@ -124,34 +118,55 @@ rank_log(_rank, logger, "Before compile")
 rank_log(_rank, logger, "torch.cuda.memory_allocated: %fGB"%(torch.cuda.memory_allocated()/1024/1024/1024))
 rank_log(_rank, logger, "torch.cuda.memory_reserved: %fGB"%(torch.cuda.memory_reserved()/1024/1024/1024))
 rank_log(_rank, logger, "torch.cuda.max_memory_reserved: %fGB"%(torch.cuda.max_memory_reserved()/1024/1024/1024))
-#sharded_model = torch.compile(sharded_model, backend="inductor", mode="max-autotune")
+sharded_model = torch.compile(sharded_model, backend="inductor", mode="default")
+
+def step(inp: torch.Tensor):
+    optimizer.zero_grad()
+    output = sharded_model(inp)
+    # rank_log(_rank, logger, "After fwd")
+    # rank_log(_rank, logger, "torch.cuda.memory_allocated: %fGB"%(torch.cuda.memory_allocated()/1024/1024/1024))
+    # rank_log(_rank, logger, "torch.cuda.memory_reserved: %fGB"%(torch.cuda.memory_reserved()/1024/1024/1024))
+    # rank_log(_rank, logger, "torch.cuda.max_memory_reserved: %fGB"%(torch.cuda.max_memory_reserved()/1024/1024/1024))
+    loss = output.sum()
+    loss.backward()
+    optimizer.step()
 
 # get HFU and MFU flops
-flop_counter = FlopCounterMode(display=False)
-inp = torch.randint(size=(batch_size, model_args.block_size), low=0, high=2**17, device="cuda", dtype=torch.int)
-with flop_counter:
-    step(inp)
-hfu_flops_per_bs = flop_counter.get_total_flops() / batch_size
+# flop_counter = FlopCounterMode(display=False)
+# inp = torch.randint(size=(batch_size, model_args.block_size), low=0, high=128, device="cuda", dtype=torch.int)
+# with flop_counter:
+#     step(inp)
+# hfu_flops_per_bs = flop_counter.get_total_flops() / batch_size
+# rank0_log(_rank, logger, f"HFU FLOPS: {hfu_flops_per_bs / 1e12}T")
+# del inp, flop_counter
 L, H, Q, T = model_args.n_layer, model_args.n_head, model_args.head_dim, model_args.block_size
 mfu_flops_per_bs = 6*n_params*T + 3*(4*L*H*Q*(T**2))/2
-rank0_log(_rank, logger, f"HFU FLOPS: {hfu_flops_per_bs / 1e12}T")
 rank0_log(_rank, logger, f"MFU FLOPS: {mfu_flops_per_bs / 1e12}T")
 
 profiler_schedule = schedule(
-    skip_first = 4,
+    skip_first = 3,
     wait = 2,
     warmup = 1,
-    active = 2,
+    active = 3,
     repeat = 1
 )
 def trace_handler(p):
     output = p.key_averages().table(sort_by="self_cuda_time_total", row_limit=10)
     rank0_log(_rank, logger, output)
     p.export_chrome_trace("profiler/trace_" + str(_rank) + "_" + str(p.step_num) + ".json")
+    if _rank == 0:
+        p.export_memory_timeline("profiler/mem_.html")
+        p.export_stacks("profiler/stacks.stacks", metric="self_cuda_time_total")
+
+cleanup_before_training()
 
 with profile(
     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
     schedule=profiler_schedule,
+    profile_memory=True,
+    with_flops=True,
+    with_stack=True,
+    record_shapes=True,
     on_trace_ready=trace_handler
 ) as prof:
     for i in range(num_iterations):
@@ -166,3 +181,7 @@ with profile(
         prof.step()
 
 rank_log(_rank, logger, "2D training successfully completed!")
+
+# Destroy the process group to clean up the distributed environment
+dist.destroy_process_group()
+
