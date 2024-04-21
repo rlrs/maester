@@ -18,8 +18,9 @@ from torch.distributed.tensor.parallel import (
 from torch.distributed.device_mesh import init_device_mesh
 from torch.profiler import profile, record_function, ProfilerActivity, schedule
 
-from maester.log_utils import rank0_log, rank_log, get_logger, verify_min_gpu_count
-from maester.model import ModelArgs, Transformer
+from maester.log_utils import rank0_log, rank_log, get_logger
+from maester.model import ModelArgs, Transformer, TransformerBlock
+from maester.memory import set_activation_checkpointing
 
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
@@ -88,6 +89,10 @@ for param in sharded_model.parameters():
 #     },
 # )
 # custom_tp_model = base_model
+
+if True: # activation checkpointing
+    set_activation_checkpointing(sharded_model, auto_wrap_policy={TransformerBlock})
+    rank0_log(_rank, logger, "Activation checkpointing enabled")
 
 rank0_log(_rank, logger, f"Model after parallelization {sharded_model=}\n")
 
