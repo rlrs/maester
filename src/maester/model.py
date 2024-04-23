@@ -13,6 +13,8 @@ from torch import Tensor
 from torch.nn import functional as F
 import torch.nn.init as init
 from torch.nn.attention import sdpa_kernel, SDPBackend
+from flash_attn import flash_attn_func, flash_attn_varlen_func
+from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -61,7 +63,7 @@ class ModelArgs:
 
 transformer_configs = {
     "CodeLlama-7b-Python-hf": dict(block_size=16384, vocab_size=32000, n_layer=32, dim = 4096, rope_base=1000000),
-    "test": dict(n_layer=16, n_head=16, dim=2048, n_local_heads=8),
+    "test": dict(n_layer=16, n_head=32, dim=4096, n_local_heads=8),
     "7B": dict(n_layer=32, n_head=32, dim=4096),
     "13B": dict(n_layer=40, n_head=40, dim=5120),
     "30B": dict(n_layer=60, n_head=52, dim=6656),
@@ -176,9 +178,17 @@ class Attention(nn.Module):
 
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        with sdpa_kernel(SDPBackend.FLASH_ATTENTION): # ensure flash only
-            # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0) # attn_mask does not work with flash
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0) # TODO: ensure causal mask is right?
+        # with sdpa_kernel(SDPBackend.FLASH_ATTENTION): # ensure flash only
+        #     # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0) # attn_mask does not work with flash
+        #     y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0) # TODO: ensure causal mask is right?
+        # use FA2 instead
+        y = flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    dropout_p=0.0,
+                    causal=True,
+                )
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 

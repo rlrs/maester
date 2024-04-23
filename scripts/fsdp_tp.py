@@ -9,8 +9,8 @@ import torch.nn.functional as F
 from torch.utils.flop_counter import FlopCounterMode
 from torch.nn.utils import skip_init
 
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy
-from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, BackwardPrefetch
+from torch.distributed.fsdp.wrap import ModuleWrapPolicy, size_based_auto_wrap_policy
 from torch.distributed.tensor.parallel import (
     parallelize_module,
     ColwiseParallel,
@@ -22,6 +22,8 @@ from torch.profiler import profile, record_function, ProfilerActivity, schedule
 from maester.log_utils import rank0_log, rank_log, get_logger
 from maester.model import ModelArgs, Transformer, TransformerBlock, Attention, FeedForward
 from maester.memory import set_activation_checkpointing, cleanup_before_training
+from maester.utils import transformer_flops
+from functools import partial
 
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
@@ -29,7 +31,7 @@ torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce co
 
 # torch.cuda.memory._record_memory_history() # for memory tracebacks and event history
 
-tp_size = 2
+tp_size = 8
 logger = get_logger()
 
 # understand world topology
@@ -62,8 +64,8 @@ dp_rank = dp_mesh.get_local_rank()
 
 # create model and move it to GPU with id rank
 with torch.device("meta"):
-    model_args = ModelArgs.from_name("test")
-    model_args.block_size = 2048
+    model_args = ModelArgs.from_name("Mistral-7B")
+    model_args.block_size = 8192
     base_model = Transformer(model_args)
     n_params = sum([p.numel() for p in base_model.parameters()]) # before sharding, otherwise we only get per-rank params
     rank_log(_rank, logger, f"Num params: {n_params}")
@@ -71,7 +73,9 @@ with torch.device("meta"):
 # Init FSDP using the dp device mesh
 sharded_model = FSDP(base_model, device_mesh=device_mesh, use_orig_params=True, 
                      auto_wrap_policy=ModuleWrapPolicy({Transformer, TransformerBlock}),
-                     sharding_strategy=ShardingStrategy._HYBRID_SHARD_ZERO2,
+                     # auto_wrap_policy=partial(size_based_auto_wrap_policy, min_num_params=int(3e8)),
+                     sharding_strategy=ShardingStrategy.HYBRID_SHARD,
+                     backward_prefetch=BackwardPrefetch.BACKWARD_PRE, # PRE is faster, uses more mem
                      mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.bfloat16))
 # for name, param in sharded_model.named_parameters():
 #     rank0_log(_rank, logger, f"{name}: {param}")
@@ -94,7 +98,8 @@ for param in sharded_model.parameters():
 # custom_tp_model = base_model
 
 if False: # activation checkpointing
-    set_activation_checkpointing(sharded_model, auto_wrap_policy={FeedForward})
+    # set_activation_checkpointing(sharded_model, auto_wrap_policy={FeedForward})
+    set_activation_checkpointing(sharded_model, auto_wrap_policy={TransformerBlock})
     rank0_log(_rank, logger, "Activation checkpointing enabled")
 
 rank0_log(_rank, logger, f"Model after parallelization {sharded_model=}\n")
@@ -109,7 +114,7 @@ optimizer = torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, 
 # and optimizations for the sharded module.
 rank0_log(_rank, logger, "\nStarting 2D training...")
 num_iterations = 20
-batch_size = 4
+batch_size = 1
 
 # torch.cuda.memory._dump_snapshot("before_compile.pickle")
 
@@ -142,6 +147,9 @@ def step(inp: torch.Tensor):
 L, H, Q, T = model_args.n_layer, model_args.n_head, model_args.head_dim, model_args.block_size
 mfu_flops_per_bs = 6*n_params*T + 3*(4*L*H*Q*(T**2))/2
 rank0_log(_rank, logger, f"MFU FLOPS: {mfu_flops_per_bs / 1e12}T")
+new_mfu_flops = transformer_flops(model_args, batch_size, T, is_causal=True) / batch_size
+rank0_log(_rank, logger, f"New MFU FLOPS: {new_mfu_flops / 1e12}T")
+
 
 profiler_schedule = schedule(
     skip_first = 3,
