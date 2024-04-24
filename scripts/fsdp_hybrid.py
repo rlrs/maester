@@ -1,137 +1,81 @@
 import os
-import sys
-import itertools
 import time
 import torch
 import torch.distributed as dist
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.flop_counter import FlopCounterMode
-from torch.nn.utils import skip_init
 
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, BackwardPrefetch
-from torch.distributed.fsdp.wrap import ModuleWrapPolicy, size_based_auto_wrap_policy
-from torch.distributed.tensor.parallel import (
-    parallelize_module,
-    ColwiseParallel,
-    RowwiseParallel,
-)
+from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.distributed.device_mesh import init_device_mesh
-from torch.profiler import profile, record_function, ProfilerActivity, schedule
-
+from torch.profiler import profile, ProfilerActivity, schedule
+from schedulefree import AdamWScheduleFree
 from maester.log_utils import rank0_log, rank_log, get_logger
 from maester.model import ModelArgs, Transformer, TransformerBlock, Attention, FeedForward
 from maester.memory import set_activation_checkpointing, cleanup_before_training
 from maester.utils import transformer_flops
-from functools import partial
 
+# TODO: does this do much/anything?
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce compilation times, will be on by default in future
 
-# torch.cuda.memory._record_memory_history() # for memory tracebacks and event history
-
-tp_size = 8
 logger = get_logger()
 
-# understand world topology
 _rank = int(os.environ["RANK"])
 _world_size = int(os.environ["WORLD_SIZE"])
 
 print(f"Starting PyTorch 2D (FSDP + TP) example on rank {_rank}.")
-assert (
-    _world_size % tp_size == 0
-), f"World size {_world_size} needs to be divisible by TP size {tp_size}"
 
-
-# create a sharding plan based on the given world_size.
-dp_size = _world_size // tp_size
-
-# Create a device mesh with 2 dimensions.
-# First dim is the data parallel dimension
-# Second dim is the tensor parallel dimension.
-# device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
-device_mesh = init_device_mesh("cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+# create a sharding plan for hybrid fsdp
+shard_size = 8 # move to config
+replicate_size = _world_size // shard_size
+device_mesh = init_device_mesh("cuda", (replicate_size, shard_size), mesh_dim_names=("replicate", "shard"))
 
 rank0_log(_rank, logger, f"Device Mesh created: {device_mesh=}")
-dp_mesh = device_mesh["dp"]
-
-# For TP, input needs to be same across all TP ranks.
-# while for SP, input can be different across all ranks.
-# We will use dp_rank for setting the random seed
-# to mimic the behavior of the dataloader.
+dp_mesh = device_mesh["replicate"]
 dp_rank = dp_mesh.get_local_rank()
 
 # create model and move it to GPU with id rank
 with torch.device("meta"):
-    model_args = ModelArgs.from_name("Mistral-7B")
+    model_args = ModelArgs.from_name("Mistral-7B") # move model config to config
     model_args.block_size = 8192
     base_model = Transformer(model_args)
     n_params = sum([p.numel() for p in base_model.parameters()]) # before sharding, otherwise we only get per-rank params
     rank_log(_rank, logger, f"Num params: {n_params}")
 
-# Init FSDP using the dp device mesh
-sharded_model = FSDP(base_model, device_mesh=device_mesh, use_orig_params=True, 
+# Init FSDP, not on meta
+sharded_model = FSDP(base_model, device_mesh=device_mesh, use_orig_params=True, # move *some* fsdp things to config
                      auto_wrap_policy=ModuleWrapPolicy({Transformer, TransformerBlock}),
-                     # auto_wrap_policy=partial(size_based_auto_wrap_policy, min_num_params=int(3e8)),
                      sharding_strategy=ShardingStrategy.HYBRID_SHARD,
                      backward_prefetch=BackwardPrefetch.BACKWARD_PRE, # PRE is faster, uses more mem
                      mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.bfloat16))
-# for name, param in sharded_model.named_parameters():
-#     rank0_log(_rank, logger, f"{name}: {param}")
 
 with torch.device("cuda"):
-    sharded_model.setup_caches(32, model_args.block_size) # setup rope caches because fsdp doesn't handle this
+    sharded_model.setup_caches(32, model_args.block_size) # setup rope cache on gpu
 for param in sharded_model.parameters():
     assert param.device.type == "cuda"
 
-# Custom parallelization plan for the swiglu MLP model
-# custom_tp_model = parallelize_module(
-#     module=base_model,
-#     device_mesh=tp_mesh,
-#     parallelize_plan={
-#         "w1": ColwiseParallel(),
-#         "w3": ColwiseParallel(),
-#         "w2": RowwiseParallel(),
-#     },
-# )
-# custom_tp_model = base_model
-
-if False: # activation checkpointing
-    # set_activation_checkpointing(sharded_model, auto_wrap_policy={FeedForward})
+if False: # activation checkpointing, move to config
+    # set_activation_checkpointing(sharded_model, auto_wrap_policy={Attention, FeedForward})
     set_activation_checkpointing(sharded_model, auto_wrap_policy={TransformerBlock})
     rank0_log(_rank, logger, "Activation checkpointing enabled")
 
 rank0_log(_rank, logger, f"Model after parallelization {sharded_model=}\n")
 
-# Create an optimizer for the parallelized and sharded model.
 lr = 3e-4
-rank0_log(_rank, logger, f"Creating AdamW optimizer with learning rate {lr}")
-optimizer = torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
+optimizer = AdamWScheduleFree(sharded_model.parameters(), lr=lr) # torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
 
-# Training loop:
-# Perform a num of iterations of forward/backward
-# and optimizations for the sharded module.
+# Training loop
 rank0_log(_rank, logger, "\nStarting 2D training...")
-num_iterations = 20
+num_iterations = 20 # move to config
 batch_size = 1
 
-# torch.cuda.memory._dump_snapshot("before_compile.pickle")
-
-# compile the sharded model for speed
-rank_log(_rank, logger, "Before compile")
-rank_log(_rank, logger, "torch.cuda.memory_allocated: %fGB"%(torch.cuda.memory_allocated()/1024/1024/1024))
-rank_log(_rank, logger, "torch.cuda.memory_reserved: %fGB"%(torch.cuda.memory_reserved()/1024/1024/1024))
-rank_log(_rank, logger, "torch.cuda.max_memory_reserved: %fGB"%(torch.cuda.max_memory_reserved()/1024/1024/1024))
+# compile the sharded model
 sharded_model = torch.compile(sharded_model, backend="inductor", mode="default")
 
 def step(inp: torch.Tensor):
     optimizer.zero_grad()
     output = sharded_model(inp)
-    # rank_log(_rank, logger, "After fwd")
-    # rank_log(_rank, logger, "torch.cuda.memory_allocated: %fGB"%(torch.cuda.memory_allocated()/1024/1024/1024))
-    # rank_log(_rank, logger, "torch.cuda.memory_reserved: %fGB"%(torch.cuda.memory_reserved()/1024/1024/1024))
-    # rank_log(_rank, logger, "torch.cuda.max_memory_reserved: %fGB"%(torch.cuda.max_memory_reserved()/1024/1024/1024))
     loss = output.sum()
     loss.backward()
     optimizer.step()
