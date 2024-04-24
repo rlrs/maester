@@ -1,17 +1,22 @@
 import os
 import time
+
 import torch
 import torch.distributed as dist
+from schedulefree import AdamWScheduleFree
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import BackwardPrefetch
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+from torch.profiler import ProfilerActivity, profile, schedule
 from torch.utils.flop_counter import FlopCounterMode
 
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, BackwardPrefetch
-from torch.distributed.fsdp.wrap import ModuleWrapPolicy
-from torch.distributed.device_mesh import init_device_mesh
-from torch.profiler import profile, ProfilerActivity, schedule
-from schedulefree import AdamWScheduleFree
-from maester.log_utils import rank0_log, rank_log, get_logger
-from maester.model import ModelArgs, Transformer, TransformerBlock, Attention, FeedForward
-from maester.memory import set_activation_checkpointing, cleanup_before_training
+from maester.log_utils import get_logger, rank0_log, rank_log
+from maester.memory import (cleanup_before_training,
+                            set_activation_checkpointing)
+from maester.model import (Attention, FeedForward, ModelArgs, Transformer,
+                           TransformerBlock)
 from maester.utils import transformer_flops
 
 # TODO: does this do much/anything?
