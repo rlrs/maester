@@ -1,26 +1,17 @@
 import logging
-import torch
+import os
 
-logging.basicConfig(
-    format="%(asctime)s %(message)s", datefmt="%m/%d/%Y %I:%M:%S %p", level=logging.INFO
-)
+logger = logging.getLogger()
 
-def get_logger():
-    return logging.getLogger(__name__)
+def init_logger():
+    logger.setLevel(logging.INFO)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
 
-
-def rank0_log(_rank, logger, msg):
-    """helper function to log only on global rank 0"""
-    if _rank == 0:
-        logger.info(f" {msg}")
-
-def rank_log(_rank, logger, msg):
-    """helper function to log on all ranks"""
-    logger.info(f"[rank{_rank}]: {msg}")
-
-
-def verify_min_gpu_count(min_gpus: int = 2) -> bool:
-    """ verification that we have at least 2 gpus to run dist examples """
-    has_cuda = torch.cuda.is_available()
-    gpu_count = torch.cuda.device_count()
-    return has_cuda and gpu_count >= min_gpus
+    # suppress verbose torch.profiler logging
+    os.environ["KINETO_LOG_LEVEL"] = "5"

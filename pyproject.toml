@@ -13,6 +13,10 @@ dependencies = [
     "numpy<2",
     "matplotlib>=3.8.4",
     "wandb>=0.16.6",
+    "schedulefree>=1.2.5",
+    "tiktoken",
+    "blobfile",
+    "sentencepiece"
 ]
 readme = "README.md"
 requires-python = ">= 3.10"
@@ -35,7 +39,7 @@ packages = ["src/maester"]
 
 [[tool.rye.sources]]
 name = "pytorch-nightly"
-url = "https://download.pytorch.org/whl/nightly/cpu"
+url = "https://download.pytorch.org/whl/nightly/rocm5.7"
 
 [tool.pylint."MESSAGES CONTROL"]
 max-line-length = 120

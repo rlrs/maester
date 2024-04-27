@@ -17,8 +17,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 
-from maester.log_utils import get_logger
-logger = get_logger()
+from maester.log_utils import logger
 
 def set_activation_checkpointing(
     model: nn.Module, auto_wrap_policy: Optional[Set[nn.Module]] = None, **kwargs
