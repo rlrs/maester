@@ -182,7 +182,7 @@ class Attention(nn.Module):
         #     # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0) # attn_mask does not work with flash
         #     y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0) # TODO: ensure causal mask is right?
         # use FA2 instead
-        y = flash_attn_func(
+        y = flash_attn_func( # TODO: test that this is correct!!
                     q,
                     k,
                     v,

@@ -63,7 +63,7 @@ class Config(BaseModel):
     enable_profiling: bool = False
     # TODO: rest of the profiling settings
 
-
+# Training state that is saved in checkpoints
 @dataclass
 class TrainState(Stateful):
     step: int = 0
