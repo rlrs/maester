@@ -9,19 +9,19 @@ import os
 import time
 
 import torch
-from torchtitan.config_manager import JobConfig
-from torchtitan.logging_utils import logger
+import torch.distributed as dist
+# from torchtitan.config_manager import JobConfig # TODO: typed cfg
+from maester.log_utils import logger
 
 # the number of warmup steps before the active step in each profiling cycle
 WARMUP = 3
 
 
 @contextlib.contextmanager
-def maybe_enable_profiling(config: JobConfig, *pos_args, **kwargs):
+def maybe_enable_profiling(config, *pos_args, **kwargs):
     # get user defined profiler settings
-    enable_profiling = config.profiling.enable_profiling
 
-    if enable_profiling:
+    if config.enable_profiling:
         dump_dir = config.job.dump_folder
         save_trace_dir = config.profiling.save_traces_folder
         trace_dir = os.path.join(dump_dir, save_trace_dir)
@@ -29,7 +29,7 @@ def maybe_enable_profiling(config: JobConfig, *pos_args, **kwargs):
 
         _global_iter_count = 0
 
-        rank = torch.distributed.get_rank()
+        rank = dist.get_rank()
 
         def trace_handler(prof):
             nonlocal _global_iter_count
@@ -49,7 +49,7 @@ def maybe_enable_profiling(config: JobConfig, *pos_args, **kwargs):
             # across all ranks. Insert a barrier to make sure all ranks have finished profiling
             # before moving on.
             # TODO: Can we find a cleaner way?
-            torch.distributed.barrier()
+            dist.barrier()
 
         logger.info(f"Profiling active. Traces will be saved at {trace_dir}")
 

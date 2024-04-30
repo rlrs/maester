@@ -3,7 +3,7 @@ import gc
 import time
 
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Type
 
 import torch
 import torch.distributed as dist
@@ -15,7 +15,6 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.profiler import ProfilerActivity, profile, schedule
 from torch.utils.flop_counter import FlopCounterMode
 import torch.nn.functional as F
 
@@ -28,37 +27,42 @@ from maester.model import (Attention, FeedForward, ModelArgs, Transformer,
                            TransformerBlock)
 from maester.utils import transformer_flops
 from maester.datasets import build_hf_data_loader, create_tokenizer
+from maester.profiling import maybe_enable_profiling
 
 class Config(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True)
 
-    max_grad_norm = 1.0
-    gc_freq = 1
-    shard_size = 8
-    train_batch_size = 1
-    train_num_batches = 20
-    compile = True
+    max_grad_norm: float = 1.0
+    gc_freq: int = 1
+    shard_size: int = 8
+    train_batch_size: int = 1
+    train_num_batches: int = 20
+    compile: bool = True
 
     # model
-    model_name = "test" # name of model args in model.py
-    block_size = 8192
+    model_name: str = "test" # name of model args in model.py
+    block_size: int = 8192
 
     # optimizer
-    opt_class = AdamWScheduleFree
-    opt_cfg = dict( # TODO: don't use dict, not validateable
+    opt_class: Type[Any] = AdamWScheduleFree
+    opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
         lr = 1e-5,
         betas = (0.9, 0.999)
     )
 
     # fsdp
-    sharding_strategy = ShardingStrategy.HYBRID_SHARD
-    auto_wrap_policy = ModuleWrapPolicy({Transformer, TransformerBlock})
-    backward_prefetch = BackwardPrefetch.BACKWARD_PRE
-    mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.bfloat16)
+    sharding_strategy: ShardingStrategy = ShardingStrategy.HYBRID_SHARD
+    auto_wrap_policy: ModuleWrapPolicy = ModuleWrapPolicy({Transformer, TransformerBlock})
+    backward_prefetch: BackwardPrefetch = BackwardPrefetch.BACKWARD_PRE
+    mixed_precision: MixedPrecision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.bfloat16)
 
     # activation checkpointing
-    activation_checkpointing = True
-    ac_auto_wrap_policy = {TransformerBlock} # TODO: naming? selective ac?
+    activation_checkpointing: bool = True
+    ac_auto_wrap_policy: set = {TransformerBlock} # TODO: naming? selective ac?
+
+    # profiling
+    enable_profiling: bool = False
+    # TODO: rest of the profiling settings
 
 
 @dataclass
@@ -147,8 +151,7 @@ def main():
         dp_rank,
     )
 
-    lr = 3e-4
-    optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg) # torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
+    optimizer = AdamWScheduleFree(sharded_model.parameters(), **cfg.opt_cfg) # torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
 
     # Training loop
     logger.info("\nStarting 2D training...")
@@ -175,22 +178,6 @@ def main():
     def loss_fn(pred, labels):
         return F.cross_entropy(pred.flatten(0, 1), labels.flatten(0, 1))
 
-
-    profiler_schedule = schedule(
-        skip_first = 3,
-        wait = 2,
-        warmup = 1,
-        active = 3,
-        repeat = 1
-    )
-    def trace_handler(p):
-        output = p.key_averages().table(sort_by="self_cuda_time_total", row_limit=10)
-        logger.info(output)
-        p.export_chrome_trace("profiler/trace_" + str(_rank) + "_" + str(p.step_num) + ".json")
-        if _rank == 0:
-            p.export_memory_timeline("profiler/mem_.html")
-            p.export_stacks("profiler/stacks.stacks", metric="self_cuda_time_total")
-
     train_state = TrainState()
 
     # training loop
@@ -215,7 +202,10 @@ def main():
         # checkpoint.reset() # TODO
         while train_state.step < cfg.train_num_batches:
             # seeding with dp_rank to ensure identical inputs for TP groups
-            torch.manual_seed(i + dp_rank)
+            torch.manual_seed(train_state.step + dp_rank)
+            train_state.step += 1
+            if train_state.step > 1 and train_state.step % cfg.gc_freq == 0:
+                gc.collect(1)
             batch = next(data_iterator)
             input_ids, labels = batch
             input_ids = input_ids.cuda()
@@ -233,8 +223,18 @@ def main():
             optimizer.step()
             
             time_taken = time.time() - start_time
-            logger.info(f"Iteration {i} complete. Time taken: {time_taken}. MFU: {mfu_flops_per_bs * cfg.train_batch_size / time_taken / 1e12} TFLOPs/s")
-            torch_profiler.step()
+            logger.info(f"Iteration {train_state.step} complete. Time taken: {time_taken}. MFU: {mfu_flops_per_bs * cfg.train_batch_size / time_taken / 1e12} TFLOPs/s")
+            
+            # signals the profiler that the next profiling step has started
+            if torch_profiler:
+                torch_profiler.step()
+
+            # TODO: Reduce timeout after first train step for faster signal (assumes lazy init, compile are finished)
+            # if train_state.step == 1:
+            #     set_pg_timeouts(
+            #         timeout=timedelta(seconds=job_config.comm.train_timeout_seconds),
+            #         world_mesh=world_mesh,
+            #     )
 
     if dist.get_rank() == 0:
         logger.info("Sleeping 2 seconds for other ranks to complete")
