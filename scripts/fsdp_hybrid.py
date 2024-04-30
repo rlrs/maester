@@ -1,33 +1,32 @@
-import os
 import gc
+import os
 import time
-
 from dataclasses import dataclass
 from typing import Any, Dict, Type
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
+from pydantic import BaseModel, ConfigDict, Field
 from schedulefree import AdamWScheduleFree
+from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.fsdp import BackwardPrefetch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
-from torch.distributed.elastic.multiprocessing.errors import record
-from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.flop_counter import FlopCounterMode
-import torch.nn.functional as F
 
-from pydantic import BaseModel, Field, ConfigDict
-
-from maester.log_utils import logger, init_logger
+from maester.datasets import build_hf_data_loader, create_tokenizer
+from maester.log_utils import init_logger, logger
 from maester.memory import (cleanup_before_training,
                             set_activation_checkpointing)
 from maester.model import (Attention, FeedForward, ModelArgs, Transformer,
                            TransformerBlock)
-from maester.utils import transformer_flops
-from maester.datasets import build_hf_data_loader, create_tokenizer
 from maester.profiling import maybe_enable_profiling
+from maester.utils import transformer_flops
+
 
 class Config(BaseModel):
     model_config = ConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True)
@@ -122,7 +121,7 @@ def main():
                         backward_prefetch=cfg.backward_prefetch,
                         mixed_precision=cfg.mixed_precision)
 
-    with torch.device("cuda"):
+    with torch.device("cuda"): # TODO: clean this up, mostly an artifact of inference (kv-cache) impl
         sharded_model.setup_caches(32, model_args.block_size) # setup rope cache on gpu
     for param in sharded_model.parameters():
         assert param.device.type == "cuda"
@@ -135,7 +134,7 @@ def main():
     logger.info(f"Model after parallelization {sharded_model=}\n")
 
     # build tokenizer
-    tokenizer_type = "tiktoken"
+    tokenizer_type = "tiktoken" # TODO: get the correct one for the model
     tokenizer = create_tokenizer(tokenizer_type, "src/maester/datasets/tokenizer/original/tokenizer.model")
 
     # build dataloader
@@ -151,7 +150,7 @@ def main():
         dp_rank,
     )
 
-    optimizer = AdamWScheduleFree(sharded_model.parameters(), **cfg.opt_cfg) # torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
+    optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg) # torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
 
     # Training loop
     logger.info("\nStarting 2D training...")
