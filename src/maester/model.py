@@ -31,7 +31,7 @@ class ModelArgs:
     n_head: int = 32
     dim: int = 4096
     intermediate_size: int = None
-    n_local_heads: int = -1
+    n_local_heads: int = -1 # why not None? Matching HF I assume.
     head_dim: int = 64
     rope_base: float = 10000
     norm_eps: float = 1e-5
@@ -46,7 +46,7 @@ class ModelArgs:
         self.head_dim = self.dim // self.n_head
 
     @classmethod
-    def from_name(cls, name: str):
+    def from_name(cls, name: str): # KCE: This seems a bit hacky, but I assume it is inconsistencies of HFs side
         if name in transformer_configs:
             return cls(**transformer_configs[name])
         # fuzzy search
@@ -103,7 +103,7 @@ class Transformer(nn.Module):
         elif hasattr(self.output, "scales_and_zeros"):
             dtype = self.output.scales_and_zeros.dtype
 
-        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype)
+        self.freqs_cis = precompute_freqs_cis(self.config.block_size, head_dim, self.config.rope_base, dtype)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
     def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
@@ -161,7 +161,9 @@ class Attention(nn.Module):
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:  
+        # KCE: two unused arguments here. Unsure if mask is needed (but might be is we want to do training similar to Mistral).
+        # Assume input_pos is in case we want to change the pos encoding?
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim
@@ -180,7 +182,7 @@ class Attention(nn.Module):
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         # with sdpa_kernel(SDPBackend.FLASH_ATTENTION): # ensure flash only
         #     # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0) # attn_mask does not work with flash
-        #     y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0) # TODO: ensure causal mask is right?
+        #     y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0) # TODO: ensure causal mask is right? # KCE: might be an outdated to, fairly sure casual should be true, did also double check it
         # use FA2 instead
         y = flash_attn_func( # TODO: test that this is correct!!
                     q,
@@ -207,7 +209,7 @@ class FeedForward(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
-class RMSNorm(nn.Module):
+class RMSNorm(nn.Module): # KCE: didn't know that RMSNorm was faster choice, couldn't imagine it is a huge difference though - I imagine it is just from LLama?
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps

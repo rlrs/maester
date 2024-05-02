@@ -23,6 +23,8 @@ that is impossible if we just shuffle the whole thing in preprocessing. We can e
 the batch size during training, or other interesting things that might be discovered in the future. 
 Code below is heavily inspired by the fms-fsdp dataloader, see e.g. https://github.com/foundation-model-stack/fms-fsdp/blob/main/docs/dataloader.md
 """
+# KCE: This looks like a good place to start, don't think I have much to add here.
+# if you want to discuss the approach I am happy to do so.
 
 class _StatefulDataset(IterableDataset):
     """
