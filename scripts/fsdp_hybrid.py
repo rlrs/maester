@@ -25,11 +25,14 @@ from maester.utils import (
     get_num_params)
 from maester.parallelize_llama import parallelize_llama, ParallelDims
 from maester.utils import set_pg_timeouts
+from maester.checkpoint import CheckpointManager
+from maester.lr_scheduling import get_lr_scheduler
 
 
 class Config(BaseModel):
     model_config = ConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True)
 
+    job_folder: str = "job/"
     max_grad_norm: float = 1.0
     gc_freq: int = 4
     data_parallel_degree: int = -1
@@ -42,6 +45,13 @@ class Config(BaseModel):
     init_timeout_seconds: int = 300
     train_timeout_seconds: int = 30
 
+    # checkpointing
+    enable_checkpoint: bool = True
+    checkpoint_folder: str = "checkpoints"
+    checkpoint_interval: int = 11 # steps
+    model_weights_only: bool = True # just for the final weight export
+    export_dtype: str = "bfloat16" # just for the final weight export
+
     # model
     model_name: str = "llama3"
     flavor: str = "8B"
@@ -51,11 +61,15 @@ class Config(BaseModel):
     # optimizer
     opt_class: Type[Any] = torch.optim.AdamW # AdamWScheduleFree
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
-        lr = 1e-5,
+        lr = 1e-5, # initial lr
         betas = (0.9, 0.999),
         foreach=True,
-        fused=False
+        fused=False # can't get fused to work with FSDP2
     )
+
+    # lr schedule
+    scheduler: str = "linear"
+    warmup_steps: int = 15
 
     # fsdp
     mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
@@ -175,6 +189,7 @@ def main():
 
     # build optimizer after model parallelization
     optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg) # torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
+    scheduler = get_lr_scheduler(optimizer, cfg)
     
     # compile the sharded model
     if cfg.compile:
@@ -197,15 +212,15 @@ def main():
     if hasattr(optimizer, 'train'): # some optimizers need to be put in train mode (e.g. schedule free)
         optimizer.train()
 
-    # TODO: checkpointing
-    # checkpoint = CheckpointManager(
-    #     model=model,
-    #     optimizer=optimizer,
-    #     lr_scheduler=scheduler,
-    #     states={"train_state": train_state},
-    #     job_config=job_config,
-    # )
-    # checkpoint.load()
+    # checkpointing
+    checkpoint = CheckpointManager(
+        model=model,
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        states={"train_state": train_state},
+        cfg=cfg,
+    )
+    checkpoint.load()
 
     data_iterator = iter(data_loader)
 
@@ -232,9 +247,14 @@ def main():
                 sharded_model.parameters(), cfg.max_grad_norm, foreach=True
             )
             optimizer.step()
+            scheduler.step()
             
             time_taken = time.time() - start_time
             logger.info(f"Iteration {train_state.step} complete. Time taken: {time_taken}. MFU: {num_flop_per_token * cfg.seq_len * cfg.train_batch_size / time_taken / 1e12} TFLOPs/s")
+
+            checkpoint.save(
+                train_state.step, force=(train_state.step == cfg.train_num_batches)
+            )
             
             # signals the profiler that the next profiling step has started
             if torch_profiler:

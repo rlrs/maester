@@ -15,6 +15,7 @@ uv pip install torch --index-url https://download.pytorch.org/whl/nightly/rocm5.
 uv pip install -e .
 uv pip install "pytorch-triton-rocm==3.0.0+dafe145982" --index-url https://download.pytorch.org/whl/nightly/rocm5.7 --upgrade # the installed one is broken!!
 # check `cat .venv/lib/python3.10/site-packages/triton/third_party/hip/include/hip/hip_version.h` to ensure it's rocm5.7
+# newer ones are at .venv/lib/python3.10/site-packages/triton/backends/amd/include/hip/hip_version.h, and they are for rocm6.1...
 
 # Install flash attention
 TMP_DIR=$(mktemp -d)
