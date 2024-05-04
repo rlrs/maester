@@ -1,23 +1,103 @@
-from maester.model import ModelArgs
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
-#  https://github.com/Dao-AILab/flash-attention/blob/main/benchmarks/benchmark_flash_attention.py#L27-L30
-def flash_attention_flops(seqlen, headdim, nheads, causal, mode="fwd"):
-    assert mode in ["fwd", "bwd", "fwd_bwd"]
-    f = 4 * seqlen**2 * nheads * headdim // (2 if causal else 1)
-    return f if mode == "fwd" else (2.5 * f if mode == "bwd" else 3.5 * f)
+import os
+from datetime import timedelta
 
-def transformer_flops(cfg: ModelArgs, batch_size: int, seq_len: int, is_causal: bool = True) -> float:
-    attention_flops = flash_attention_flops(seq_len, cfg.dim / cfg.n_head, cfg.n_head, is_causal, mode="fwd_bwd")
-    # other people use: attention_flops = 4 * h * (s**2) * 3
+import torch
 
-    flop_attn_qkv = cfg.dim * (cfg.head_dim * (cfg.n_head + 2 * cfg.n_local_heads))
-    flop_attn_wo = (cfg.n_head * cfg.head_dim) * cfg.dim
+from maester.log_utils import logger
 
-    flop_mlp = 3 * cfg.dim * cfg.intermediate_size
+def _warn_overwrite_env(env, val):
+    if env in os.environ:
+        logger.warning(
+            f"ENV[{env}] = {os.environ[env]} will be overridden to {val} based on job config"
+        )
+    os.environ[env] = val
 
-    flop_head = cfg.dim * cfg.vocab_size
+def set_pg_timeouts(timeout, world_mesh):
+    """
+    Sets the timeout for all PGs in the provided mesh, and the default (world) group.
 
-    flops_total = 3 * 2 * batch_size * (cfg.n_layer * (seq_len * (flop_attn_qkv + flop_attn_wo + flop_mlp)) + seq_len * flop_head)
-    flops_total += batch_size * cfg.n_layer * attention_flops  # attn FLOPs already account for the 3 * 2 factors
+    Note: synchronizes via a barrier, before changing the timeouts. This is important, becuase
+    otherwise you may face a race where the slow rank has not reached the timeout reduction point
+    yet due to slow operations permitted under the old timeout value, but other faster ranks may
+    start issueing collectives under the new shorter timeout and then immediately timeout.
+    """
+    logger.info(
+        f"Synchronizing and adjusting timeout for all ProcessGroups to {timeout}"
+    )
+    # Ensure that all the ranks have reached the point of setting the new timeout-
+    # otherwise, some ranks may issue collectives with the new/shorter timeout and
+    # those may time out, before other ranks have finished with initialization done
+    # under the old/slow timeout.
+    torch.distributed.barrier()
+    torch.cuda.synchronize()
 
-    return flops_total
+    groups = (
+        [world_mesh.get_group()] if world_mesh.ndim == 1 else world_mesh.get_group()
+    )
+
+    # None represents the 'default' PG, not part of the mesh
+    groups.append(None)
+    for group in groups:
+        torch.distributed.distributed_c10d._set_pg_timeout(timeout, group)
+
+
+def get_num_params(model: torch.nn.Module, exclude_embedding: bool = False) -> int:
+    num_params = sum(p.numel() for p in model.parameters())
+    if exclude_embedding:
+        num_params -= model.tok_embeddings.weight.numel()
+    return num_params
+
+
+def get_num_flop_per_token(num_params: int, model_config, seq_len) -> int:
+    l, h, q, t = (
+        model_config.n_layers,
+        model_config.n_heads,
+        model_config.dim // model_config.n_heads,
+        seq_len,
+    )
+    # Reasoning behind the factor of 12 for the self-attention part of the formula:
+    # 1. each self-attention has 2 matmul in the forward and 4 in the backward (6)
+    # 2. the flash attention does 1 more matmul recomputation in the backward
+    #    but recomputation should not be counted in calculating MFU           (+0)
+    # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
+    # 4. we follow the convention and do not account for sparsity in causal attention
+    flop_per_token = 6 * num_params + 12 * l * h * q * t
+
+    return flop_per_token
+
+TRACE_BUFFER_SIZE = "TORCH_NCCL_TRACE_BUFFER_SIZE"
+TRACE_FILE = "TORCH_NCCL_DEBUG_INFO_TEMP_FILE"
+DUMP_ON_TIMEOUT = "TORCH_NCCL_DUMP_ON_TIMEOUT"
+ASYNC_ERROR_HANDLING = "TORCH_NCCL_ASYNC_ERROR_HANDLING"
+SKIP_CLEANUP = "3"
+
+def init_distributed(cfg):
+    # FlightRecorder is incompatible with =1 mode where watchdog aborts work, must use =3 (skipcleanup)
+    # to get flight recorder dumps. See https://github.com/pytorch/pytorch/issues/121055
+    # This could be done only when flight recorder is enabled, but its nice to be consistent to avoid subtle
+    # behavior differences
+    _warn_overwrite_env(ASYNC_ERROR_HANDLING, SKIP_CLEANUP)
+
+    # enable torch nccl flight recorder in the mode that would dump files if timeout is detected
+    # _warn_overwrite_env(TRACE_BUFFER_SIZE, str(job_config.comm.trace_buf_size))
+    # if job_config.comm.trace_buf_size > 0:
+    #     # dump on timeout by default if trace buffer is enabled
+    #     _warn_overwrite_env(DUMP_ON_TIMEOUT, "1")
+    #     dump_dir = f"{job_config.job.dump_folder}/comm_trace"
+    #     os.makedirs(dump_dir, exist_ok=True)
+    #     _warn_overwrite_env(TRACE_FILE, f"{dump_dir}/rank_")
+
+    torch.distributed.init_process_group(
+        "nccl", timeout=timedelta(seconds=cfg.init_timeout_seconds)
+    )
+
+    # to mitigate the memory issue that collectives using
+    # async_op=True hold memory longer than they should
+    # such as those in tensor parallelism
+    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"

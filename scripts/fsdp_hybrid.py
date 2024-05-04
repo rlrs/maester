@@ -1,8 +1,9 @@
+from datetime import timedelta
 import gc
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Type
+from typing import Any, Type
 
 import torch
 import torch.distributed as dist
@@ -10,54 +11,58 @@ import torch.nn.functional as F
 from pydantic import BaseModel, ConfigDict, Field
 from schedulefree import AdamWScheduleFree
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.elastic.multiprocessing.errors import record
-from torch.distributed.fsdp import BackwardPrefetch
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
-from torch.distributed.fsdp.wrap import ModuleWrapPolicy
-from torch.utils.flop_counter import FlopCounterMode
+from torch.distributed._composable.fsdp import MixedPrecisionPolicy
 
 from maester.datasets import build_hf_data_loader, create_tokenizer
 from maester.log_utils import init_logger, logger
-from maester.memory import (cleanup_before_training,
-                            set_activation_checkpointing)
-from maester.model import (Attention, FeedForward, ModelArgs, Transformer,
-                           TransformerBlock)
+from maester.memory import cleanup_before_training
+from maester.models import model_name_to_cls, model_name_to_tokenizer, models_config
 from maester.profiling import maybe_enable_profiling
-from maester.utils import transformer_flops
+from maester.utils import (
+    init_distributed,
+    get_num_flop_per_token, 
+    get_num_params)
+from maester.parallelize_llama import parallelize_llama, ParallelDims
+from maester.utils import set_pg_timeouts
 
 
 class Config(BaseModel):
     model_config = ConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True)
 
     max_grad_norm: float = 1.0
-    gc_freq: int = 1
-    shard_size: int = 8
+    gc_freq: int = 4
+    data_parallel_degree: int = -1
+    tensor_parallel_degree: int = 1
+    pipeline_parallel_degree: int = 1
     train_batch_size: int = 1
     train_num_batches: int = 20
-    compile: bool = True
+    compile: bool = False # TODO: compile doesn't work lol
+    enable_loss_parallel: bool = False
+    init_timeout_seconds: int = 300
+    train_timeout_seconds: int = 30
 
     # model
-    model_name: str = "test" # name of model args in model.py
-    block_size: int = 8192
+    model_name: str = "llama3"
+    flavor: str = "8B"
+    seq_len: int = 8192
+    norm_type: str = "rmsnorm"
 
     # optimizer
-    opt_class: Type[Any] = AdamWScheduleFree
+    opt_class: Type[Any] = torch.optim.AdamW # AdamWScheduleFree
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
         lr = 1e-5,
-        betas = (0.9, 0.999)
+        betas = (0.9, 0.999),
+        foreach=True,
+        fused=False
     )
 
     # fsdp
-    sharding_strategy: ShardingStrategy = ShardingStrategy.HYBRID_SHARD
-    auto_wrap_policy: ModuleWrapPolicy = ModuleWrapPolicy({Transformer, TransformerBlock})
-    backward_prefetch: BackwardPrefetch = BackwardPrefetch.BACKWARD_PRE
-    mixed_precision: MixedPrecision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.bfloat16)
+    mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 
     # activation checkpointing
-    activation_checkpointing: bool = True
-    ac_auto_wrap_policy: set = {TransformerBlock} # TODO: naming? selective ac?
+    ac_mode: str = "selective" # "full" | "selective" | "none"
+    selective_ac_option: str | int = "op"
 
     # profiling
     enable_profiling: bool = False
@@ -83,9 +88,6 @@ torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce compilation times, will be on by default in future
 
 
-_rank = int(os.environ["RANK"])
-_world_size = int(os.environ["WORLD_SIZE"])
-
 # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
 @record
 def main():
@@ -98,80 +100,90 @@ def main():
     gc.disable()
     gc.collect(1)
 
-    # create a sharding plan for hybrid fsdp
-    replicate_size = _world_size // cfg.shard_size
-    device_mesh = init_device_mesh("cuda", (replicate_size, cfg.shard_size), mesh_dim_names=("replicate", "shard"))
+    # init world mesh
+    world_size = int(os.environ["WORLD_SIZE"])
+    parallel_dims = ParallelDims(
+        dp=cfg.data_parallel_degree,
+        tp=cfg.tensor_parallel_degree,
+        pp=cfg.pipeline_parallel_degree,
+        world_size=world_size,
+        enable_loss_parallel=cfg.enable_loss_parallel,
+    )
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    init_distributed(cfg)
 
-    logger.info(f"Device Mesh created: {device_mesh=}")
-    dp_mesh = device_mesh["replicate"]
-    dp_rank = dp_mesh.get_local_rank()
+    world_mesh = parallel_dims.build_mesh(device_type="cuda")
 
-    # create model and move it to GPU with id rank
+    # build tokenizer
+    tokenizer_type = model_name_to_tokenizer[cfg.model_name]
+    # tokenizer = create_tokenizer(tokenizer_type, job_config.model.tokenizer_path) # TODO: path
+    tokenizer = create_tokenizer(tokenizer_type, "src/maester/datasets/tokenizer/original/tokenizer.model")
+
+    # build model w/ meta init
+    model_cls = model_name_to_cls[cfg.model_name]
+    model_config = models_config[cfg.model_name][cfg.flavor]
+    # set the model configs from training inputs:
+    # 1. norm type to decide which norm layer to use
+    # 2. vocab size from tokenizer
+    # 3. max_seq_len base on inputs
+    model_config.norm_type = cfg.norm_type
+    model_config.vocab_size = tokenizer.n_words
+    model_config.max_seq_len = cfg.seq_len
+
     with torch.device("meta"):
-        model_args = ModelArgs.from_name(cfg.model_name)
-        model_args.block_size = cfg.block_size
-        base_model = Transformer(model_args)
-        n_params = sum([p.numel() for p in base_model.parameters()]) # before sharding, otherwise we only get per-rank params
-        logger.info(f"Num params: {n_params}")
+        logger.info(
+            f"Building {cfg.model_name} {cfg.flavor} with {model_config}"
+        )
+        model = model_cls.from_model_args(model_config)
 
-    # Init FSDP, not on meta
-    sharded_model = FSDP(base_model, device_mesh=device_mesh, use_orig_params=True,
-                        auto_wrap_policy=cfg.auto_wrap_policy,
-                        sharding_strategy=cfg.sharding_strategy,
-                        backward_prefetch=cfg.backward_prefetch,
-                        mixed_precision=cfg.mixed_precision)
+    # log model size
+    model_param_count = get_num_params(model)
+    num_flop_per_token = get_num_flop_per_token(
+        get_num_params(model, exclude_embedding=True),
+        model_config,
+        cfg.seq_len,
+    )
+    logger.info(
+        f"Model {cfg.model_name} {cfg.flavor} "
+        f"size: {model_param_count:,} total parameters"
+    )
 
-    with torch.device("cuda"): # TODO: clean this up, mostly an artifact of inference (kv-cache) impl
-        sharded_model.setup_caches(32, model_args.block_size) # setup rope cache on gpu
-    for param in sharded_model.parameters():
-        assert param.device.type == "cuda"
+    sharded_model = parallelize_llama(model, world_mesh, parallel_dims, cfg)
 
-    if cfg.activation_checkpointing:
-        # set_activation_checkpointing(sharded_model, auto_wrap_policy={Attention, FeedForward})
-        set_activation_checkpointing(sharded_model, auto_wrap_policy=cfg.ac_auto_wrap_policy)
-        logger.info("Activation checkpointing enabled")
+    # allocate sharded model on GPU and initialize weights via DTensor
+    sharded_model.to_empty(device="cuda")
+    sharded_model.init_weights()
 
     logger.info(f"Model after parallelization {sharded_model=}\n")
 
-    # build tokenizer
-    tokenizer_type = "tiktoken" # TODO: get the correct one for the model
-    tokenizer = create_tokenizer(tokenizer_type, "src/maester/datasets/tokenizer/original/tokenizer.model")
-
     # build dataloader
-    dp_degree = dp_mesh.size()
-    dp_rank = dp_mesh.get_local_rank()
+    if parallel_dims.dp_enabled:
+        dp_mesh = world_mesh["dp"]
+        dp_degree = dp_mesh.size()
+        dp_rank = dp_mesh.get_local_rank()
+    else:
+        dp_degree, dp_rank = 1, 0
     data_loader = build_hf_data_loader(
         "c4_mini",
         "src/maester/datasets/c4_mini",
         tokenizer,
         cfg.train_batch_size,
-        model_args.block_size,
+        cfg.seq_len,
         dp_degree,
         dp_rank,
     )
 
+    # build optimizer after model parallelization
     optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg) # torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
-
-    # Training loop
-    logger.info("\nStarting 2D training...")
     
     # compile the sharded model
     if cfg.compile:
-        sharded_model = torch.compile(sharded_model, backend="inductor", mode="default")
-
-    # get HFU and MFU flops
-    # flop_counter = FlopCounterMode(display=False)
-    # inp = torch.randint(size=(batch_size, model_args.block_size), low=0, high=128, device="cuda", dtype=torch.int)
-    # with flop_counter:
-    #     step(inp)
-    # hfu_flops_per_bs = flop_counter.get_total_flops() / batch_size
-    # rank0_log(_rank, logger, f"HFU FLOPS: {hfu_flops_per_bs / 1e12}T")
-    # del inp, flop_counter
-    L, H, Q, T = model_args.n_layer, model_args.n_head, model_args.head_dim, model_args.block_size
-    mfu_flops_per_bs = 6*n_params*T + 3*(4*L*H*Q*(T**2))/2
-    logger.info(f"MFU FLOPS: {mfu_flops_per_bs / 1e12}T")
-    new_mfu_flops = transformer_flops(model_args, cfg.train_batch_size, T, is_causal=True) / cfg.train_batch_size
-    logger.info(f"New MFU FLOPS: {new_mfu_flops / 1e12}T")
+        if cfg.ac_mode == "selective" and cfg.selective_ac_option == "op":
+            torch._dynamo.config._experimental_support_context_fn_in_torch_utils_checkpoint = True
+        logger.info("Compiling model with torch.compile")
+        # Dynamic shape have issues with distributed, turn dynamic off as Transformer
+        # training is static_shape TODO: resolve dynamic shape issue and restore defaults
+        sharded_model = torch.compile(sharded_model, backend="inductor", mode="default", dynamic=False)
 
     # loss fn can be shared by pipeline-parallel or non-pp execution
     def loss_fn(pred, labels):
@@ -182,7 +194,8 @@ def main():
     # training loop
     cleanup_before_training()
     sharded_model.train()
-    optimizer.train()
+    if hasattr(optimizer, 'train'): # some optimizers need to be put in train mode (e.g. schedule free)
+        optimizer.train()
 
     # TODO: checkpointing
     # checkpoint = CheckpointManager(
@@ -200,9 +213,8 @@ def main():
     with maybe_enable_profiling(cfg) as torch_profiler:
         # checkpoint.reset() # TODO
         while train_state.step < cfg.train_num_batches:
-            # seeding with dp_rank to ensure identical inputs for TP groups
-            torch.manual_seed(train_state.step + dp_rank)
             train_state.step += 1
+            torch.manual_seed(train_state.step + dp_rank) # seeding with dp_rank to ensure identical inputs for TP groups
             if train_state.step > 1 and train_state.step % cfg.gc_freq == 0:
                 gc.collect(1)
             batch = next(data_iterator)
@@ -222,18 +234,18 @@ def main():
             optimizer.step()
             
             time_taken = time.time() - start_time
-            logger.info(f"Iteration {train_state.step} complete. Time taken: {time_taken}. MFU: {mfu_flops_per_bs * cfg.train_batch_size / time_taken / 1e12} TFLOPs/s")
+            logger.info(f"Iteration {train_state.step} complete. Time taken: {time_taken}. MFU: {num_flop_per_token * cfg.seq_len * cfg.train_batch_size / time_taken / 1e12} TFLOPs/s")
             
             # signals the profiler that the next profiling step has started
             if torch_profiler:
                 torch_profiler.step()
 
             # TODO: Reduce timeout after first train step for faster signal (assumes lazy init, compile are finished)
-            # if train_state.step == 1:
-            #     set_pg_timeouts(
-            #         timeout=timedelta(seconds=job_config.comm.train_timeout_seconds),
-            #         world_mesh=world_mesh,
-            #     )
+            if train_state.step == 1:
+                set_pg_timeouts(
+                    timeout=timedelta(seconds=cfg.train_timeout_seconds),
+                    world_mesh=world_mesh,
+                )
 
     if dist.get_rank() == 0:
         logger.info("Sleeping 2 seconds for other ranks to complete")
