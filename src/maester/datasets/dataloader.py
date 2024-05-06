@@ -5,7 +5,7 @@ import math
 import random
 from typing import Any, Callable, List, Optional, Type
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, DataLoader
 from torch.distributed.checkpoint.stateful import Stateful
 import pyarrow as pa
 
@@ -29,6 +29,62 @@ that is impossible if we just shuffle the whole thing in preprocessing. We can e
 the batch size during training, or other interesting things that might be discovered in the future. 
 Code below is heavily inspired by the fms-fsdp dataloader, see e.g. https://github.com/foundation-model-stack/fms-fsdp/blob/main/docs/dataloader.md
 """
+
+def get_data_loader(cfg, rank, world_size):
+    """
+    Pytorch dataloader for stateful, distributed, and rescalable causal language model (CLM) training
+    ...
+    Args
+    ----
+    cfg : dataclass
+        Training config containing seq len, dataset, dataset weight, datapath, etc. arguments
+    rank : int
+        Rank of current distributed worker. Used for handling dataset sharding logic.
+    world_size : int
+        Number of distributed workers. Used for handling dataset sharding logic.
+    """
+
+    datasets, weights = cfg.datasets, cfg.weights
+
+    def causal_lm(data_seq, prompt_len=1):
+        """
+        Perform causal language modeling by right-shifting the input sequence.
+        Sets first prompt_len tokens to be ignored by the loss.
+        """
+        data_seq = torch.LongTensor(data_seq)
+        t = data_seq.clone()[1:]
+        data_seq = data_seq[:-1]
+        t[:prompt_len] = -100
+        return data_seq, t
+
+    # Base streaming dataset. Returns doc chunks in sequence.
+    # Implements dataset sampling and rescalability.
+    data = SamplingDataset(
+        cfg.data_path,
+        ScalableShardDataset,
+        rank,
+        world_size,
+        cfg.sep_token,
+        min_length=3,
+        datasets=datasets,
+        weights=weights,
+        seed=cfg.seed,
+        verbose=(rank == 0),
+        n_logical_shards=cfg.logical_shards,
+    )
+    # Wrap above dataset in packing logic to form constant-length lines.
+    data = BufferDataset(
+        data,
+        cfg.seq_len + 1,
+        drop_final_token=cfg.sep_token,
+        pack_hard=True,
+    )
+    # Shuffle outputs in length 10k buffer. Consecutive lines appear 10k steps apart on average.
+    data = PreloadBufferDataset(data, 10000)
+    # Split line into input and target for the CLM task.
+    data = PreprocessDataset(data, causal_lm)
+
+    return DataLoader(data, num_workers=0, batch_size=cfg.train_batch_size)
 
 def _shard_partition(itemlist: List[Any], rank: int, worldsize: int) -> List[Any]:
     """
@@ -314,13 +370,15 @@ class StreamingDocDataset(_StatefulDataset):
         assert len(countfiles) == 1
         doc_counts = {}
         with open(os.path.join(datapath, "meta", countfiles[0]), "r") as csvfile:
-            reader = csv.DictReader(csvfile)
+            reader = csv.DictReader(csvfile, strict=True)
             for row in reader:
                 fullpath = row["dataset/filename"]
                 prefix = max([fullpath.find("/" + d) for d in self.datasets]) + 1
                 if prefix > 0:
                     key = fullpath[prefix:]
                     doc_counts[key] = int(row["documents"])
+        if verbose:
+            logger.info(f"Dataset files: {doc_counts.keys():}")
 
         # Assemble document sets owned by this worker
         for dataset in self.datasets:

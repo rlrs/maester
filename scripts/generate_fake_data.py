@@ -13,4 +13,5 @@ with pa.ipc.new_file(
 
 os.mkdir(os.path.join("data", "meta"))
 with open(os.path.join("data", "meta", "combined_counts.csv"), "w") as f:
+    f.write("dataset/filename,documents,tokens\n")
     f.write("/fake_dataset/fullshard.arrow,1000,100000\n")

@@ -12,7 +12,8 @@ from maester.datasets.dataloader import (
     SamplingDataset, 
     PreloadBufferDataset,
     BufferDataset,
-    PreprocessDataset
+    PreprocessDataset,
+    get_data_loader
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "PreloadBufferDataset",
     "BufferDataset",
     "PreprocessDataset",
+    "get_data_loader",
 ]

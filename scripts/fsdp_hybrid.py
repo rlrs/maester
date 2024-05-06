@@ -27,6 +27,7 @@ from maester.parallelize_llama import parallelize_llama, ParallelDims
 from maester.utils import set_pg_timeouts
 from maester.checkpoint import CheckpointManager
 from maester.lr_scheduling import get_lr_scheduler
+from maester.datasets import get_data_loader
 
 
 class Config(BaseModel):
@@ -45,6 +46,14 @@ class Config(BaseModel):
     init_timeout_seconds: int = 300
     train_timeout_seconds: int = 30
 
+    # datasets
+    datasets: list[str] = ["fake_dataset/"]
+    weights: list[float] = [1.0]
+    data_path: str = "data/"
+    seed: int = 42 # TODO: standardize this, where is it used?
+    sep_token: int = 0
+    logical_shards: int = 16
+
     # checkpointing
     enable_checkpoint: bool = True
     checkpoint_folder: str = "checkpoints"
@@ -62,7 +71,7 @@ class Config(BaseModel):
     opt_class: Type[Any] = torch.optim.AdamW # AdamWScheduleFree
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
         lr = 1e-5, # initial lr
-        betas = (0.9, 0.999),
+        betas = (0.9, 0.95),
         foreach=True,
         fused=False # can't get fused to work with FSDP2
     )
@@ -177,15 +186,16 @@ def main():
         dp_rank = dp_mesh.get_local_rank()
     else:
         dp_degree, dp_rank = 1, 0
-    data_loader = build_hf_data_loader(
-        "c4_mini",
-        "src/maester/datasets/c4_mini",
-        tokenizer,
-        cfg.train_batch_size,
-        cfg.seq_len,
-        dp_degree,
-        dp_rank,
-    )
+    # data_loader = build_hf_data_loader(
+    #     "c4_mini",
+    #     "src/maester/datasets/c4_mini",
+    #     tokenizer,
+    #     cfg.train_batch_size,
+    #     cfg.seq_len,
+    #     dp_degree,
+    #     dp_rank,
+    # )
+    data_loader = get_data_loader(cfg, rank=dist.get_rank(), world_size=world_size)
 
     # build optimizer after model parallelization
     optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg) # torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
