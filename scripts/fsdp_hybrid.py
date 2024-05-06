@@ -226,7 +226,7 @@ def main():
 
     logger.info(f"Training starts at step {train_state.step + 1}")
     with maybe_enable_profiling(cfg) as torch_profiler:
-        # checkpoint.reset() # TODO
+        checkpoint.reset()
         while train_state.step < cfg.train_num_batches:
             train_state.step += 1
             torch.manual_seed(train_state.step + dp_rank) # seeding with dp_rank to ensure identical inputs for TP groups
