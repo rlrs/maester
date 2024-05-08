@@ -27,7 +27,6 @@ from maester.parallelize_llama import parallelize_llama, ParallelDims
 from maester.utils import set_pg_timeouts
 from maester.checkpoint import CheckpointManager
 from maester.lr_scheduling import get_lr_scheduler
-from maester.datasets import get_data_loader
 
 
 class Config(BaseModel):
@@ -47,12 +46,7 @@ class Config(BaseModel):
     train_timeout_seconds: int = 30
 
     # datasets
-    datasets: list[str] = ["fake_dataset/"]
-    weights: list[float] = [1.0]
-    data_path: str = "data/"
-    seed: int = 42 # TODO: standardize this, where is it used?
-    sep_token: int = 0
-    logical_shards: int = 16
+    
 
     # checkpointing
     enable_checkpoint: bool = True
@@ -78,7 +72,7 @@ class Config(BaseModel):
 
     # lr schedule
     scheduler: str = "linear"
-    warmup_steps: int = 15
+    warmup_steps: int = 10
 
     # fsdp
     mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
@@ -186,16 +180,16 @@ def main():
         dp_rank = dp_mesh.get_local_rank()
     else:
         dp_degree, dp_rank = 1, 0
-    # data_loader = build_hf_data_loader(
-    #     "c4_mini",
-    #     "src/maester/datasets/c4_mini",
-    #     tokenizer,
-    #     cfg.train_batch_size,
-    #     cfg.seq_len,
-    #     dp_degree,
-    #     dp_rank,
-    # )
-    data_loader = get_data_loader(cfg, rank=dist.get_rank(), world_size=world_size)
+    data_loader = build_hf_data_loader(
+        "c4_mini",
+        "src/maester/datasets/c4_mini",
+        tokenizer,
+        cfg.train_batch_size,
+        cfg.seq_len,
+        dp_degree,
+        dp_rank,
+    )
+    # data_loader = get_data_loader(cfg, rank=dist.get_rank(), world_size=world_size) # IBM
 
     # build optimizer after model parallelization
     optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg) # torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
@@ -227,6 +221,7 @@ def main():
         model=model,
         optimizer=optimizer,
         lr_scheduler=scheduler,
+        dataloader=data_loader,
         states={"train_state": train_state},
         cfg=cfg,
     )
