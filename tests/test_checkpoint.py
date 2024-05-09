@@ -80,10 +80,11 @@ def test_checkpoint_manager_initialization():
 def test_checkpoint_save_and_load():
     print(tmpdir)
     manager = checkpoint_manager
+    data_iterator = iter(dataloader)
 
     # do an optimization step first, to make sure everything is initialized (e.g. dataloader won't be otherwise)
     optimizer.zero_grad()
-    input_ids, _ = next(iter(dataloader))
+    input_ids, _ = next(data_iterator)
     model(input_ids).sum().backward()
     optimizer.step()
     lr_scheduler.step()
@@ -101,7 +102,7 @@ def test_checkpoint_save_and_load():
 
     # 2. do an optimization step to change all states
     optimizer.zero_grad()
-    input_ids, _ = next(iter(dataloader))
+    input_ids, _ = next(data_iterator)
     model(input_ids).sum().backward()
     optimizer.step()
     lr_scheduler.step()
