@@ -8,8 +8,20 @@ import os
 from datetime import timedelta
 
 import torch
+import torch.distributed._functional_collectives as funcol
+import torch.distributed.distributed_c10d as c10d
+from torch.distributed.device_mesh import DeviceMesh
 
 from maester.log_utils import logger
+
+def dist_max(x: int | float, mesh: DeviceMesh) -> float:
+    tensor = torch.tensor(x).cuda()
+    return funcol.all_reduce(tensor, reduceOp=c10d.ReduceOp.MAX.name, group=mesh)
+
+
+def dist_mean(x: int | float, mesh: DeviceMesh) -> float:
+    tensor = torch.tensor(x).cuda()
+    return funcol.all_reduce(tensor, reduceOp=c10d.ReduceOp.AVG.name, group=mesh)
 
 def _warn_overwrite_env(env, val):
     if env in os.environ:
@@ -70,6 +82,28 @@ def get_num_flop_per_token(num_params: int, model_config, seq_len) -> int:
     flop_per_token = 6 * num_params + 12 * l * h * q * t
 
     return flop_per_token
+
+# hardcoded BF16 peak flops for some GPUs
+def get_peak_flops(device_name: str) -> int:
+    if "A100" in device_name:
+        # data from https://www.nvidia.com/en-us/data-center/a100/
+        return 312e12
+    elif "H100" in device_name:
+        # data from https://www.nvidia.com/en-us/data-center/h100/
+        # NOTE: Specifications are one-half lower without sparsity.
+        if "NVL" in device_name:
+            return 1979e12
+        elif "PCIe" in device_name:
+            return 756e12
+        else:  # for SXM and other variants
+            return 989e12
+    elif "A10" in device_name:
+        return 125e12
+    elif "MI250X" in device_name:
+        return 191.5e12
+    else:  # for other GPU types, assume A100
+        return 312e12
+
 
 TRACE_BUFFER_SIZE = "TORCH_NCCL_TRACE_BUFFER_SIZE"
 TRACE_FILE = "TORCH_NCCL_DEBUG_INFO_TEMP_FILE"

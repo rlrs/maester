@@ -1,32 +1,33 @@
-from datetime import timedelta
 import gc
 import os
 import time
 from dataclasses import dataclass
+from datetime import timedelta
+from timeit import default_timer as timer
 from typing import Any, Type
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from pydantic import BaseModel, ConfigDict, Field
 from schedulefree import AdamWScheduleFree
+from torch.distributed._composable.fsdp import MixedPrecisionPolicy
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
-from torch.distributed._composable.fsdp import MixedPrecisionPolicy
 
+from maester.checkpoint import CheckpointManager
 from maester.datasets import build_hf_data_loader, create_tokenizer
 from maester.log_utils import init_logger, logger
-from maester.memory import cleanup_before_training
-from maester.models import model_name_to_cls, model_name_to_tokenizer, models_config
-from maester.profiling import maybe_enable_profiling
-from maester.utils import (
-    init_distributed,
-    get_num_flop_per_token, 
-    get_num_params)
-from maester.parallelize_llama import parallelize_llama, ParallelDims
-from maester.utils import set_pg_timeouts
-from maester.checkpoint import CheckpointManager
 from maester.lr_scheduling import get_lr_scheduler
+from maester.memory import cleanup_before_training
+from maester.metrics import build_gpu_memory_monitor, build_metric_logger
+from maester.models import (model_name_to_cls, model_name_to_tokenizer,
+                            models_config)
+from maester.parallelize_llama import ParallelDims, parallelize_llama
+from maester.profiling import maybe_enable_profiling
+from maester.utils import (dist_max, dist_mean, get_num_flop_per_token, get_num_params, get_peak_flops,
+                           init_distributed, set_pg_timeouts)
 
 
 class Config(BaseModel):
@@ -38,8 +39,8 @@ class Config(BaseModel):
     data_parallel_degree: int = -1
     tensor_parallel_degree: int = 1
     pipeline_parallel_degree: int = 1
-    train_batch_size: int = 1
-    train_num_batches: int = 20
+    train_batch_size: int = 2
+    train_num_batches: int = 1000
     compile: bool = False # TODO: compile doesn't work lol
     enable_loss_parallel: bool = False
     init_timeout_seconds: int = 300
@@ -47,24 +48,28 @@ class Config(BaseModel):
 
     # datasets
     
+    # logging/metrics
+    log_freq: int = 5
+    save_tb_folder: str = "tb"
+    enable_tensorboard: bool = True
 
     # checkpointing
-    enable_checkpoint: bool = True
+    enable_checkpoint: bool = False
     checkpoint_folder: str = "checkpoints"
-    checkpoint_interval: int = 11 # steps
+    checkpoint_interval: int = 100 # steps
     model_weights_only: bool = True # just for the final weight export
     export_dtype: str = "bfloat16" # just for the final weight export
 
     # model
     model_name: str = "llama3"
-    flavor: str = "8B"
-    seq_len: int = 8192
+    flavor: str = "debugmodel"
+    seq_len: int = 4096
     norm_type: str = "rmsnorm"
 
     # optimizer
     opt_class: Type[Any] = torch.optim.AdamW # AdamWScheduleFree
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
-        lr = 1e-5, # initial lr
+        lr = 3e-4, # initial lr
         betas = (0.9, 0.95),
         foreach=True,
         fused=False # can't get fused to work with FSDP2
@@ -72,7 +77,7 @@ class Config(BaseModel):
 
     # lr schedule
     scheduler: str = "linear"
-    warmup_steps: int = 10
+    warmup_steps: int = 100
 
     # fsdp
     mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
@@ -165,13 +170,25 @@ def main():
         f"size: {model_param_count:,} total parameters"
     )
 
+    # initialize GPU memory monitor before applying parallelisms to the model
+    gpu_memory_monitor = build_gpu_memory_monitor()
+    # obtain the peak flops of bf16 type for MFU calculation
+    gpu_peak_flops = get_peak_flops(torch.cuda.get_device_properties(0).name)
+
     sharded_model = parallelize_llama(model, world_mesh, parallel_dims, cfg)
+    # logger.info(f"Model after parallelization {sharded_model=}\n")
 
     # allocate sharded model on GPU and initialize weights via DTensor
     sharded_model.to_empty(device="cuda")
     sharded_model.init_weights()
 
-    logger.info(f"Model after parallelization {sharded_model=}\n")
+    gpu_mem_stats = gpu_memory_monitor.get_peak_stats()
+    logger.info(
+        f"GPU memory usage for model: "
+        f"{gpu_mem_stats.max_reserved_gib:.2f}GiB"
+        f"({gpu_mem_stats.max_reserved_pct:.2f}%)"
+    )
+
 
     # build dataloader
     if parallel_dims.dp_enabled:
@@ -194,6 +211,8 @@ def main():
     # build optimizer after model parallelization
     optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg) # torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
     scheduler = get_lr_scheduler(optimizer, cfg)
+
+    metric_logger = build_metric_logger(cfg)
     
     # compile the sharded model
     if cfg.compile:
@@ -227,35 +246,113 @@ def main():
     )
     checkpoint.load()
 
+    # TODO: do we want to checkpoint metrics?
+
     data_iterator = iter(data_loader)
 
     logger.info(f"Training starts at step {train_state.step + 1}")
-    with maybe_enable_profiling(cfg) as torch_profiler:
+    with maybe_enable_profiling(cfg, global_step=train_state.step) as torch_profiler:
         checkpoint.reset()
+
+        # variables for metric logging
+        losses_since_last_log: list[torch.Tensor] = []
+        ntokens_since_last_log = 0
+        data_loading_times: list[float] = []
+        time_last_log = timer()
+        gpu_memory_monitor.reset_peak_stats()
+
         while train_state.step < cfg.train_num_batches:
             train_state.step += 1
             torch.manual_seed(train_state.step + dp_rank) # seeding with dp_rank to ensure identical inputs for TP groups
             if train_state.step > 1 and train_state.step % cfg.gc_freq == 0:
                 gc.collect(1)
+
+            data_load_start = timer()
             batch = next(data_iterator)
             input_ids, labels = batch
+            ntokens_since_last_log += labels.numel()
+            data_loading_times.append(timer() - data_load_start)
+
             input_ids = input_ids.cuda()
             labels = labels.cuda()
 
             start_time = time.time()
 
             optimizer.zero_grad()
+
+            # TODO: loss parallel
             pred = sharded_model(input_ids)
             loss = loss_fn(pred, labels)
             loss.backward()
+
             torch.nn.utils.clip_grad_norm_(
                 sharded_model.parameters(), cfg.max_grad_norm, foreach=True
             )
             optimizer.step()
             scheduler.step()
-            
-            time_taken = time.time() - start_time
-            logger.info(f"Iteration {train_state.step} complete. Time taken: {time_taken}. MFU: {num_flop_per_token * cfg.seq_len * cfg.train_batch_size / time_taken / 1e12} TFLOPs/s")
+
+            losses_since_last_log.append(loss)
+
+            # log metrics
+            if train_state.step == 1 or train_state.step % cfg.log_freq == 0:
+                losses = [l.item() for l in losses_since_last_log]
+                avg_loss, max_loss = (
+                    np.mean(losses),
+                    np.max(losses),
+                )
+                if parallel_dims.dp_enabled:
+                    global_avg_loss, global_max_loss = (
+                        dist_mean(avg_loss, dp_mesh).item(),
+                        dist_max(max_loss, dp_mesh).item()
+                    )
+                else:
+                    global_avg_loss, global_max_loss = avg_loss, max_loss
+                
+                time_delta = timer() - time_last_log
+
+                tps = ntokens_since_last_log / (time_delta * parallel_dims.model_parallel_size)
+                mfu = 100 * num_flop_per_token * tps / gpu_peak_flops
+
+                time_end_to_end = time_delta / cfg.log_freq
+                time_data_loading = np.mean(data_loading_times)
+                time_data_loading_pct = 100 * np.sum(data_loading_times) / time_delta
+
+                gpu_mem_stats = gpu_memory_monitor.get_peak_stats()
+
+                metrics = {
+                    "lr": scheduler.get_last_lr()[0],
+                    "loss/global_avg": global_avg_loss,
+                    "loss/global_max": global_max_loss,
+                    "tps": tps,
+                    "mfu(%)": mfu,
+                    "time/end_to_end(s)": time_end_to_end,
+                    "time/data_loading(s)": time_data_loading,
+                    "time/data_loading(%)": time_data_loading_pct,
+                    "memory/max_active(GiB)": gpu_mem_stats.max_active_gib,
+                    "memory/max_active(%)": gpu_mem_stats.max_active_pct,
+                    "memory/max_reserved(GiB)": gpu_mem_stats.max_reserved_gib,
+                    "memory/max_reserved(%)": gpu_mem_stats.max_reserved_pct,
+                    "memory/num_alloc_retries": gpu_mem_stats.num_alloc_retries,
+                    "memory/num_ooms": gpu_mem_stats.num_ooms,
+                }
+                metric_logger.log(metrics, step=train_state.step)
+
+                logger.info(
+                    f"Step {train_state.step:2}: "
+                    f"lr={scheduler.get_last_lr()[0]:7.4f}, "
+                    f"loss={global_avg_loss:7.4f} (max={global_max_loss:7.4f}), "
+                    f"tps={round(tps):}, "
+                    f"mfu={mfu:.2f}%, "
+                    f"memory: {gpu_mem_stats.max_reserved_gib:5.2f}GiB"
+                    f"({gpu_mem_stats.max_reserved_pct:.2f}%) "
+                    f"time/data_loading={time_data_loading:.2f}s ({time_data_loading_pct:.2f}%)"
+                )
+
+                losses_since_last_log.clear()
+                ntokens_since_last_log = 0
+                data_loading_times.clear()
+                time_last_log = timer()
+                # gpu_memory_monitor.reset_peak_stats()
 
             checkpoint.save(
                 train_state.step, force=(train_state.step == cfg.train_num_batches)
