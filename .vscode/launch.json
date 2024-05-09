@@ -5,11 +5,23 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: fsdp_tp",
+            "name": "Python: Debug Unit Tests",
+            "type": "python",
+            "request": "launch",
+            "purpose": ["debug-test"],
+            "justMyCode": false
+        },
+        {
+            "name": "Python: Debug FSDP train",
             "type": "python",
             "request": "launch",
             "module": "torch.distributed.run",
-            "args": ["--standalone", "--nproc-per-node", "2", "scripts/fsdp_tp.py"],
+            "args": [
+                "--standalone",
+                "--nproc-per-node",
+                "4",
+                "scripts/fsdp_hybrid.py"
+            ],
             "console": "integratedTerminal",
             "justMyCode": false
         }
