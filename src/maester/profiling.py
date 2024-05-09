@@ -22,10 +22,10 @@ def maybe_enable_profiling(config, *pos_args, **kwargs):
     # get user defined profiler settings
 
     if config.enable_profiling:
-        dump_dir = config.job.dump_folder
-        save_trace_dir = config.profiling.save_traces_folder
+        dump_dir = config.job_folder
+        save_trace_dir = config.traces_folder
         trace_dir = os.path.join(dump_dir, save_trace_dir)
-        profile_freq = config.profiling.profile_freq
+        profile_freq = config.profile_freq
 
         _global_iter_count = 0
 

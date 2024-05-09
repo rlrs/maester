@@ -41,7 +41,7 @@ class Config(BaseModel):
     pipeline_parallel_degree: int = 1
     train_batch_size: int = 2
     train_num_batches: int = 1000
-    compile: bool = False # TODO: compile doesn't work lol
+    compile: bool = True # TODO: compile doesn't work lol
     enable_loss_parallel: bool = False
     init_timeout_seconds: int = 300
     train_timeout_seconds: int = 30
@@ -88,7 +88,9 @@ class Config(BaseModel):
 
     # profiling
     enable_profiling: bool = False
-    # TODO: rest of the profiling settings
+    traces_folder: str = "traces"
+    profile_freq: int = 5
+
 
 # Training state that is saved in checkpoints
 @dataclass
