@@ -74,6 +74,7 @@ class DataLoaderWrapper(Stateful):
     
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         if isinstance(self.dataloader, StatefulDataLoader):
+            assert state_dict[str(self.rank_id)], f"StatefulDataLoader state_dict is empty: {state_dict}"
             self.dataloader.load_state_dict(state_dict[str(self.rank_id)])
 
 
@@ -208,6 +209,8 @@ class CheckpointManager:
         # We won't have optimizer states to load, if we are loading a seed checkpoint
         states = {"model": self.states["model"]} if step == 0 else self.states
         logger.info(f"Loading the checkpoint at step {step}, containing keys {states.keys()}")
+        if "dataloader" in states:
+            next(iter(self.states["dataloader"].dataloader)) # FIXME: this is a hack to make sure the dataloader is initialized
         begin = time.monotonic()
         dcp.load(
             states,

@@ -114,14 +114,13 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         self.seq_len = seq_len
         self.infinite = infinite
 
-        # varibles for checkpointing
+        # variables for checkpointing
         self._sample_idx = 0
         self._all_tokens: List[int] = []
         self._first_iter = True
 
     def __iter__(self):
         max_buffer_token_len = 1 + self.seq_len
-        all_tokens: List[int] = []
 
         while True:
             # skip samples for the first iteration to resume from checkpoint
@@ -172,6 +171,7 @@ class HuggingFaceDataset(IterableDataset, Stateful):
     def load_state_dict(self, state_dict):
         self._sample_idx = state_dict["sample_idx"]
         self._all_tokens = state_dict["token_buffer"]
+        self._first_iter = True
     
     def state_dict(self):
         return {
