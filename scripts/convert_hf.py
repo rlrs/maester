@@ -6,8 +6,12 @@
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
-from typing import Optional
+from safetensors import safe_open
+from torch.distributed.checkpoint.format_utils import torch_save_to_dcp
+import torch.distributed.checkpoint as DCP
+from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
 
 import torch
 
@@ -15,23 +19,25 @@ import torch
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from maester.model import ModelArgs
+from maester.models import models_config
 
 
 @torch.inference_mode()
 def convert_hf_checkpoint(
     *,
-    checkpoint_dir: Path = Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf"),
-    model_name: Optional[str] = None,
+    model_name: str,
+    variant: str,
+    checkpoint_dir: Path,
+    output_dir: Path,
 ) -> None:
     if model_name is None:
         model_name = checkpoint_dir.name
 
-    config = ModelArgs.from_name(model_name)
+    config = models_config[model_name][variant]
     print(f"Model config {config.__dict__}")
 
     # Load the json file containing weight mapping
-    model_map_json = checkpoint_dir / "pytorch_model.bin.index.json"
+    model_map_json = checkpoint_dir / "model.safetensors.index.json"
 
     assert model_map_json.is_file()
 
@@ -57,17 +63,20 @@ def convert_hf_checkpoint(
 
     def permute(w, n_head):
         dim = config.dim
+        head_dim = (config.dim // config.n_heads)
         return (
-            w.view(n_head, 2, config.head_dim // 2, dim)
+            w.view(n_head, 2, head_dim // 2, dim)
             .transpose(1, 2)
-            .reshape(config.head_dim * n_head, dim)
+            .reshape(config.n_heads, dim)
         )
 
     merged_result = {}
     for file in sorted(bin_files):
-        state_dict = torch.load(str(file), map_location="cpu", mmap=True, weights_only=True)
-        merged_result.update(state_dict)
+        with safe_open(file, framework="pt", device="cpu") as f:
+            for k in f.keys():
+                merged_result[k] = f.get_tensor(k)
     final_result = {}
+    
     for key, value in merged_result.items():
         if "layers" in key:
             abstract_key = re.sub(r'(\d+)', '{}', key)
@@ -81,28 +90,38 @@ def convert_hf_checkpoint(
 
         final_result[new_key] = value
 
-    for key in tuple(final_result.keys()):
-        if "wq" in key:
-            q = final_result[key]
-            k = final_result[key.replace("wq", "wk")]
-            v = final_result[key.replace("wq", "wv")]
-            q = permute(q, config.n_head)
-            k = permute(k, config.n_local_heads)
-            final_result[key.replace("wq", "wqkv")] = torch.cat([q, k, v])
-            del final_result[key]
-            del final_result[key.replace("wq", "wk")]
-            del final_result[key.replace("wq", "wv")]
-    print(f"Saving checkpoint to {checkpoint_dir / 'model.pth'}")
-    torch.save(final_result, checkpoint_dir / "model.pth")
+    # for key in tuple(final_result.keys()):
+    #     if "wq" in key:
+    #         q = final_result[key]
+    #         k = final_result[key.replace("wq", "wk")]
+    #         v = final_result[key.replace("wq", "wv")]
+    #         q = permute(q, config.n_heads)
+    #         k = permute(k, config.n_kv_heads)
+    #         final_result[key.replace("wq", "wqkv")] = torch.cat([q, k, v])
+    #         del final_result[key]
+    #         del final_result[key.replace("wq", "wk")]
+    #         del final_result[key.replace("wq", "wv")]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp())
+    # torch.save(final_result, tmp_dir / "model.pth")
+    # torch_save_to_dcp(tmp_dir / "model.pth", output_dir)
+    storage_writer = DCP.filesystem.FileSystemWriter(output_dir)
+    DCP.save({"model": final_result}, 
+             # checkpoint_id="step-0",
+             storage_writer=storage_writer)
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Convert HuggingFace checkpoint.')
-    parser.add_argument('--checkpoint_dir', type=Path, default=Path("checkpoints/mistralai/Mistral-7B-v0.1/"))
-    parser.add_argument('--model_name', type=str, default=None)
+    parser.add_argument('--checkpoint', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--model', type=str, required=True)
+    parser.add_argument('--variant', type=str, required=True)
 
     args = parser.parse_args()
     convert_hf_checkpoint(
-        checkpoint_dir=args.checkpoint_dir,
-        model_name=args.model_name,
+        checkpoint_dir=args.checkpoint,
+        output_dir=args.output,
+        model_name=args.model,
+        variant=args.variant,
     )

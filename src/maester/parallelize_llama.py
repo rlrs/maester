@@ -170,7 +170,7 @@ def checkpoint_wrapper(module, config):
         )
 
 
-def parallelize_llama(model, world_mesh: DeviceMesh, parallel_dims, cfg):
+def parallelize_llama(model, world_mesh: DeviceMesh, parallel_dims, cfg) -> torch.nn.Module:
     """
     Apply parallelisms and activation checkpointing to the model.
 
