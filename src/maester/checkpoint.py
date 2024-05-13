@@ -55,7 +55,10 @@ class OptimizerWrapper(Stateful):
         self.optim = optim
 
     def state_dict(self) -> Dict[str, Any]:
-        return get_optimizer_state_dict(self.model, self.optim)
+        if self.optim.state:
+            return get_optimizer_state_dict(self.model, self.optim)
+        logger.warning("Optimizer state is empty.")
+        return {}
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         set_optimizer_state_dict(self.model, self.optim, optim_state_dict=state_dict)

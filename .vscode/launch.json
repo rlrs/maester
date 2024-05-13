@@ -24,6 +24,20 @@
             ],
             "console": "integratedTerminal",
             "justMyCode": false
+        },
+        {
+            "name": "Python: Debug FSDP generate",
+            "type": "python",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "args": [
+                "--standalone",
+                "--nproc-per-node",
+                "4",
+                "scripts/generate.py"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
         }
     ]
 }

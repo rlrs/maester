@@ -193,18 +193,20 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
+        # if False: # use sdpa
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
 
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        sdpa_xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        sdpa_xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        sdpa_xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 
         # we use causal mask for training
-        # output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
-
-        # use ROCm FA2, SDPA is bad
+        sdpa_output = F.scaled_dot_product_attention(sdpa_xq, sdpa_xk, sdpa_xv, is_causal=True)
+        # else: # use ROCm FA2, SDPA is slow
+        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
+        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
         output = flash_attn_func( # TODO: test that this is correct wrt above!!
                     xq,
                     xk,
@@ -213,11 +215,12 @@ class Attention(nn.Module):
                     causal=True,
                 )
 
-        output = output.transpose(
+        sdpa_output = sdpa_output.transpose(
             1, 2
-        ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
-        output = output.view(bs, seqlen, -1)
-        return self.wo(output)
+        ).contiguous()  # (bs, seqlen, n_heads, head_dim)
+        # assert sdpa_output.shape == (bs, seqlen, self.n_heads, self.head_dim), f"sdpa: {sdpa_output.shape} != {(bs, seqlen, self.n_heads, self.head_dim)}"
+        sdpa_output = sdpa_output.view(bs, seqlen, -1)
+        return self.wo(sdpa_output)
 
 
 class FeedForward(nn.Module):
