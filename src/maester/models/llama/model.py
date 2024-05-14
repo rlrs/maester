@@ -78,7 +78,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Ten
     """
     ndim = x.ndim
     assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1]), f"reshape_for_broadcast: {freqs_cis.shape} != {(x.shape[1], x.shape[-1])}"
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
@@ -193,34 +193,34 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        # if False: # use sdpa
-        # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        if True: # use sdpa
+            # repeat k/v heads if n_kv_heads < n_heads
+            keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_heads, head_dim)
+            values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_heads, head_dim)
 
-        sdpa_xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        sdpa_xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        sdpa_xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+            xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+            xk = keys.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+            xv = values.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
 
-        # we use causal mask for training
-        sdpa_output = F.scaled_dot_product_attention(sdpa_xq, sdpa_xk, sdpa_xv, is_causal=True)
-        # else: # use ROCm FA2, SDPA is slow
-        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
-        # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
-        output = flash_attn_func( # TODO: test that this is correct wrt above!!
-                    xq,
-                    xk,
-                    xv,
-                    dropout_p=0.0,
-                    causal=True,
-                )
+            # we use causal mask for training
+            output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
+            output = output.transpose(
+                1, 2
+            ).contiguous()  # (bs, seqlen, n_heads, head_dim)
+        else: # use ROCm FA2, SDPA is slow
+            # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
+            # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
+            output = flash_attn_func( # TODO: test that this is correct wrt above!!
+                        xq,
+                        xk,
+                        xv,
+                        dropout_p=0.0,
+                        causal=True,
+                    )
 
-        sdpa_output = sdpa_output.transpose(
-            1, 2
-        ).contiguous()  # (bs, seqlen, n_heads, head_dim)
-        # assert sdpa_output.shape == (bs, seqlen, self.n_heads, self.head_dim), f"sdpa: {sdpa_output.shape} != {(bs, seqlen, self.n_heads, self.head_dim)}"
-        sdpa_output = sdpa_output.view(bs, seqlen, -1)
-        return self.wo(sdpa_output)
+        assert output.shape == (bs, seqlen, self.n_heads, self.head_dim), f"attn: {output.shape} != {(bs, seqlen, self.n_heads, self.head_dim)}"
+        output = output.view(bs, seqlen, -1)
+        return self.wo(output)
 
 
 class FeedForward(nn.Module):
