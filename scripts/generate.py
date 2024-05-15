@@ -96,34 +96,26 @@ def sample(logits, temperature: float = 1.0, top_k: int | None = None):
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
 
-def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
-    # input_pos: [B, S]
-    logits = model(x)#, input_pos)
-    return sample(logits, **sampling_kwargs)[0]
-
-def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-    # input_pos: [B, 1]
-    assert input_pos.shape[-1] == 1
-    logits = model(x)#, input_pos)
+def decode_one_token(model, x: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+    logits = model(torch.unsqueeze(x, 0)) # add batch dim
     return sample(logits, **sampling_kwargs)
 
-def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
+def decode_n_tokens(model, context: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
         next_token, next_prob = decode_one_token(
-            model, cur_token, input_pos, **sampling_kwargs
+            model, context, **sampling_kwargs
         )
-        input_pos += 1
         new_tokens.append(next_token.clone())
         callback(new_tokens[-1])
         new_probs.append(next_prob.clone())
-        cur_token = next_token.view(1, -1)
+        context = torch.cat([context, next_token], dim=0)
 
-    return new_tokens, new_probs
+    return context, new_probs
 
 @torch.no_grad()
 def generate(
-    model: Transformer,
+    model,
     prompt: torch.Tensor,
     max_new_tokens: int,
     *,
@@ -133,26 +125,9 @@ def generate(
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
     """
-    # create an empty tensor of the expected final shape and fill in the current tokens
-    T = prompt.size(0)
-    T_new = T + max_new_tokens
+    generated_tokens, _ = decode_n_tokens(model, prompt, max_new_tokens - 1, callback=callback, **sampling_kwargs)
 
-    max_seq_length = min(T_new, model.model_args.max_seq_len)
-    empty = torch.empty(T_new, dtype=torch.int, device="cuda")
-
-    empty[:T] = prompt
-    seq = empty
-    input_pos = torch.arange(0, T, device="cuda")
-
-    next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs).clone()
-    seq[T] = next_token
-
-    input_pos = torch.tensor([T], device="cuda", dtype=torch.int)
-
-    generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
-    seq[T + 1:] = torch.cat(generated_tokens)
-
-    return seq
+    return generated_tokens
 
 def main():
     init_logger()
@@ -208,9 +183,9 @@ def main():
     )
     assert checkpoint.load(step=0)
 
-    tks = tokenizer.encode("The Bradley–Terry model is a", bos=True, eos=False)
+    tks = tokenizer.encode("Barack Obama is", bos=True, eos=False)
     input_ids = torch.LongTensor(tks).to("cuda")
-    y = generate(sharded_model, input_ids, max_new_tokens=16, temperature=0.0, top_k=200)
+    y = generate(sharded_model, input_ids, max_new_tokens=32, temperature=0.0, top_k=200)
     print(tokenizer.decode(y.tolist()))
 
 if __name__ == "__main__":
