@@ -41,7 +41,7 @@ class Config(BaseModel):
     pipeline_parallel_degree: int = 1
     train_batch_size: int = 2
     train_num_batches: int = 1000
-    compile: bool = True # TODO: compile doesn't work lol
+    compile: bool = False # TODO: compile doesn't work lol
     enable_loss_parallel: bool = False
     init_timeout_seconds: int = 300
     train_timeout_seconds: int = 30
@@ -54,30 +54,30 @@ class Config(BaseModel):
     enable_tensorboard: bool = True
 
     # checkpointing
-    enable_checkpoint: bool = False
+    enable_checkpoint: bool = True
     checkpoint_folder: str = "checkpoints"
-    checkpoint_interval: int = 100 # steps
+    checkpoint_interval: int = 50 # steps
     model_weights_only: bool = True # just for the final weight export
     export_dtype: str = "bfloat16" # just for the final weight export
 
     # model
     model_name: str = "llama3"
-    flavor: str = "debugmodel"
-    seq_len: int = 4096
+    flavor: str = "8B"
+    seq_len: int = 512
     norm_type: str = "rmsnorm"
 
     # optimizer
-    opt_class: Type[Any] = torch.optim.AdamW # AdamWScheduleFree
+    opt_class: Type[Any] = torch.optim.SGD # AdamWScheduleFree
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
         lr = 3e-4, # initial lr
-        betas = (0.9, 0.95),
+        # betas = (0.9, 0.95),
         foreach=True,
         fused=False # can't get fused to work with FSDP2
     )
 
     # lr schedule
     scheduler: str = "linear"
-    warmup_steps: int = 100
+    warmup_steps: int = 200
 
     # fsdp
     mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
@@ -211,7 +211,7 @@ def main():
     # data_loader = get_data_loader(cfg, rank=dist.get_rank(), world_size=world_size) # IBM
 
     # build optimizer after model parallelization
-    optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg) # torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
+    optimizer: torch.optim.Optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg) # torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
     scheduler = get_lr_scheduler(optimizer, cfg)
 
     metric_logger = build_metric_logger(cfg)
@@ -246,13 +246,33 @@ def main():
         states={"train_state": train_state},
         cfg=cfg,
     )
+
+    # Calculate model parameter statistics per layer
+    test_sd = torch.load('job/checkpoints/step-0/model.pth')
+    with torch.no_grad():
+        for name, param in sharded_model.named_parameters():
+            mean_val = param.mean().item()
+            std_val = 0 # param.std().item()
+            min_val = param.min().item()
+            max_val = param.max().item()
+            logger.info(f"Layer {name} ({param.shape}): Mean={mean_val}, Std={std_val}, Min={min_val}, Max={max_val}")
+            
     checkpoint.load()
+    for name, param in sharded_model.named_parameters():
+        mean_val = param.data.mean().item()
+        std_val = 0 #param.data.std().item()
+        min_val = param.data.min().item()
+        max_val = param.data.max().item()
+        logger.info(f"Layer {name} ({param.shape}): Mean={mean_val}, Std={std_val}, Min={min_val}, Max={max_val}")
+
+        # fqn = name.replace("._checkpoint_wrapped_module", "")
+        # assert torch.allclose(param.full_tensor().bfloat16().cpu(), test_sd[fqn], atol=1e-6), f"Layer {name} does not match"
 
     # TODO: do we want to checkpoint metrics?
 
     data_iterator = iter(data_loader)
 
-    logger.info(f"Training starts at step {train_state.step + 1}")
+    logger.info(f"Training starts at step {train_state.step}")
     with maybe_enable_profiling(cfg, global_step=train_state.step) as torch_profiler:
         checkpoint.reset()
 
@@ -354,7 +374,7 @@ def main():
                 ntokens_since_last_log = 0
                 data_loading_times.clear()
                 time_last_log = timer()
-                # gpu_memory_monitor.reset_peak_stats()
+                gpu_memory_monitor.reset_peak_stats()
 
             checkpoint.save(
                 train_state.step, force=(train_state.step == cfg.train_num_batches)
