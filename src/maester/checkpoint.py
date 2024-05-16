@@ -55,10 +55,7 @@ class OptimizerWrapper(Stateful):
         self.optim = optim
 
     def state_dict(self) -> Dict[str, Any]:
-        if self.optim.state:
-            return get_optimizer_state_dict(self.model, self.optim)
-        logger.warning("Optimizer state is empty.")
-        return {}
+        return get_optimizer_state_dict(self.model, self.optim) # TODO: fails for optimizers without state, like plain SGD
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         set_optimizer_state_dict(self.model, self.optim, optim_state_dict=state_dict)
@@ -104,7 +101,7 @@ class CheckpointManager:
                 }
             )
 
-            self.folder = os.path.join(cfg.job_folder, cfg.checkpoint_folder)
+            self.folder = os.path.join(cfg.job_folder, cfg.job_name, cfg.checkpoint_folder)
             self.interval_type = IntervalType.STEPS # really don't wanna save by seconds...
             self.interval = cfg.checkpoint_interval
             self.model_weights_only = cfg.model_weights_only

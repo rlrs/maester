@@ -80,6 +80,7 @@ class GPUMemoryMonitor:
 
     def reset_peak_stats(self):
         torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_accumulated_memory_stats() # TODO: should we do this here? otherwise `num_retries` isn't reset
 
 
 def build_gpu_memory_monitor():
@@ -111,7 +112,7 @@ class MetricLogger:
 
 
 def build_metric_logger(config, tag: Optional[str] = None):
-    dump_dir = config.job_folder
+    dump_dir = os.path.join(config.job_folder, config.job_name)
     save_tb_folder = config.save_tb_folder
     # since we don't have run id yet, use current minute as identifier
     datetime_str = datetime.now().strftime("%Y%m%d-%H%M")

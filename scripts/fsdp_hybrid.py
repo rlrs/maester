@@ -33,13 +33,15 @@ from maester.utils import (dist_max, dist_mean, get_num_flop_per_token, get_num_
 class Config(BaseModel):
     model_config = ConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True)
 
-    job_folder: str = "job/"
+    job_folder: str = "jobs/"
+    job_name: str = "llama3-debug"
+
     max_grad_norm: float = 1.0
     gc_freq: int = 4
     data_parallel_degree: int = -1
     tensor_parallel_degree: int = 1
     pipeline_parallel_degree: int = 1
-    train_batch_size: int = 2
+    train_batch_size: int = 4
     train_num_batches: int = 1000
     compile: bool = False # TODO: compile doesn't work lol
     enable_loss_parallel: bool = False
@@ -56,21 +58,21 @@ class Config(BaseModel):
     # checkpointing
     enable_checkpoint: bool = True
     checkpoint_folder: str = "checkpoints"
-    checkpoint_interval: int = 50 # steps
+    checkpoint_interval: int = 500 # steps
     model_weights_only: bool = True # just for the final weight export
     export_dtype: str = "bfloat16" # just for the final weight export
 
     # model
     model_name: str = "llama3"
-    flavor: str = "8B"
-    seq_len: int = 512
+    flavor: str = "debugmodel"
+    seq_len: int = 2048
     norm_type: str = "rmsnorm"
 
     # optimizer
-    opt_class: Type[Any] = torch.optim.SGD # AdamWScheduleFree
+    opt_class: Type[Any] = torch.optim.AdamW # AdamWScheduleFree
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
         lr = 3e-4, # initial lr
-        # betas = (0.9, 0.95),
+        betas = (0.9, 0.95),
         foreach=True,
         fused=False # can't get fused to work with FSDP2
     )
@@ -246,27 +248,7 @@ def main():
         states={"train_state": train_state},
         cfg=cfg,
     )
-
-    # Calculate model parameter statistics per layer
-    test_sd = torch.load('job/checkpoints/step-0/model.pth')
-    with torch.no_grad():
-        for name, param in sharded_model.named_parameters():
-            mean_val = param.mean().item()
-            std_val = 0 # param.std().item()
-            min_val = param.min().item()
-            max_val = param.max().item()
-            logger.info(f"Layer {name} ({param.shape}): Mean={mean_val}, Std={std_val}, Min={min_val}, Max={max_val}")
-            
     checkpoint.load()
-    for name, param in sharded_model.named_parameters():
-        mean_val = param.data.mean().item()
-        std_val = 0 #param.data.std().item()
-        min_val = param.data.min().item()
-        max_val = param.data.max().item()
-        logger.info(f"Layer {name} ({param.shape}): Mean={mean_val}, Std={std_val}, Min={min_val}, Max={max_val}")
-
-        # fqn = name.replace("._checkpoint_wrapped_module", "")
-        # assert torch.allclose(param.full_tensor().bfloat16().cpu(), test_sd[fqn], atol=1e-6), f"Layer {name} does not match"
 
     # TODO: do we want to checkpoint metrics?
 

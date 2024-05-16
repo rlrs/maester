@@ -102,6 +102,7 @@ def get_peak_flops(device_name: str) -> int:
     elif "MI250X" in device_name:
         return 191.5e12
     else:  # for other GPU types, assume A100
+        logger.warning("Unknown device, defaulting to A100 peak flops.")
         return 312e12
 
 

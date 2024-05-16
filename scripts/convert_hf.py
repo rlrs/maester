@@ -6,12 +6,9 @@
 import json
 import re
 import sys
-import tempfile
 from pathlib import Path
 from safetensors import safe_open
-from torch.distributed.checkpoint.format_utils import torch_save_to_dcp
 import torch.distributed.checkpoint as DCP
-from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
 
 import torch
 
@@ -61,15 +58,6 @@ def convert_hf_checkpoint(
     }
     bin_files = {checkpoint_dir / bin for bin in bin_index["weight_map"].values()}
 
-    def permute(w, n_head):
-        dim = config.dim
-        head_dim = (config.dim // config.n_heads)
-        return (
-            w.view(n_head, 2, head_dim // 2, dim)
-            .transpose(1, 2)
-            .reshape(config.n_heads, dim)
-        )
-
     merged_result = {}
     for file in sorted(bin_files):
         with safe_open(file, framework="pt", device="cpu") as f:
@@ -90,24 +78,9 @@ def convert_hf_checkpoint(
 
         final_result[new_key] = value
 
-    # for key in tuple(final_result.keys()):
-    #     if "wq" in key:
-    #         q = final_result[key]
-    #         k = final_result[key.replace("wq", "wk")]
-    #         v = final_result[key.replace("wq", "wv")]
-    #         q = permute(q, config.n_heads)
-    #         k = permute(k, config.n_kv_heads)
-    #         final_result[key.replace("wq", "wqkv")] = torch.cat([q, k, v])
-    #         del final_result[key]
-    #         del final_result[key.replace("wq", "wk")]
-    #         del final_result[key.replace("wq", "wv")]
     output_dir.mkdir(parents=True, exist_ok=True)
-    tmp_dir = Path(tempfile.mkdtemp())
-    # torch.save(final_result, tmp_dir / "model.pth")
-    # torch_save_to_dcp(tmp_dir / "model.pth", output_dir)
     storage_writer = DCP.filesystem.FileSystemWriter(output_dir)
     DCP.save({"model": final_result}, 
-             # checkpoint_id="step-0",
              storage_writer=storage_writer)
 
 if __name__ == '__main__':
