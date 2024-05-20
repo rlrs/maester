@@ -15,7 +15,7 @@ from .dataloader import (
     PreprocessDataset,
     get_data_loader
 )
-from .mosaic_dataset import MosaicDataset
+from .mosaic_dataset import MosaicDataset, MosaicDataLoader
 
 __all__ = [
     "build_hf_data_loader",
@@ -27,5 +27,6 @@ __all__ = [
     "BufferDataset",
     "PreprocessDataset",
     "get_data_loader",
-    "MosaicDataset"
+    "MosaicDataset",
+    "MosaicDataLoader",
 ]
