@@ -15,9 +15,10 @@ from schedulefree import AdamWScheduleFree
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
+from torch.utils.data import DataLoader
 
 from maester.checkpoint import CheckpointManager
-from maester.datasets import build_hf_data_loader, create_tokenizer
+from maester.datasets import build_hf_data_loader, create_tokenizer, MosaicDataset
 from maester.log_utils import init_logger, logger
 from maester.lr_scheduling import get_lr_scheduler
 from maester.memory import cleanup_before_training
@@ -41,7 +42,7 @@ class Config(BaseModel):
     data_parallel_degree: int = -1
     tensor_parallel_degree: int = 1
     pipeline_parallel_degree: int = 1
-    train_batch_size: int = 4
+    train_batch_size: int = 1
     train_num_batches: int = 1000
     compile: bool = False # TODO: compile doesn't work lol
     enable_loss_parallel: bool = False
@@ -65,7 +66,7 @@ class Config(BaseModel):
     # model
     model_name: str = "llama3"
     flavor: str = "debugmodel"
-    seq_len: int = 2048
+    seq_len: int = 8192
     norm_type: str = "rmsnorm"
 
     # optimizer
@@ -201,16 +202,18 @@ def main():
         dp_rank = dp_mesh.get_local_rank()
     else:
         dp_degree, dp_rank = 1, 0
-    data_loader = build_hf_data_loader(
-        "c4_mini",
-        "src/maester/datasets/c4_mini",
-        tokenizer,
-        cfg.train_batch_size,
-        cfg.seq_len,
-        dp_degree,
-        dp_rank,
-    )
+    # data_loader = build_hf_data_loader(
+    #     "c4_mini",
+    #     "src/maester/datasets/c4_mini",
+    #     tokenizer,
+    #     cfg.train_batch_size,
+    #     cfg.seq_len,
+    #     dp_degree,
+    #     dp_rank,
+    # )
     # data_loader = get_data_loader(cfg, rank=dist.get_rank(), world_size=world_size) # IBM
+    data_loader = DataLoader(dataset=MosaicDataset(dataset_path="/home/ucloud/2024-v2/tokenized", batch_size=cfg.train_batch_size), 
+                             batch_size=cfg.train_batch_size, num_workers=1, pin_memory=True, shuffle=False)
 
     # build optimizer after model parallelization
     optimizer: torch.optim.Optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg) # torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
@@ -274,6 +277,7 @@ def main():
             data_load_start = timer()
             batch = next(data_iterator)
             input_ids, labels = batch
+            print(input_ids.shape, labels.shape)
             ntokens_since_last_log += labels.numel()
             data_loading_times.append(timer() - data_load_start)
 

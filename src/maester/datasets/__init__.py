@@ -4,9 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from maester.datasets.hf_datasets import build_hf_data_loader
-from maester.datasets.tokenizer import create_tokenizer
-from maester.datasets.dataloader import (
+from .hf_datasets import build_hf_data_loader
+from .tokenizer import create_tokenizer
+from .dataloader import (
     StreamingDocDataset, 
     ScalableShardDataset, 
     SamplingDataset, 
@@ -15,6 +15,7 @@ from maester.datasets.dataloader import (
     PreprocessDataset,
     get_data_loader
 )
+from .mosaic_dataset import MosaicDataset
 
 __all__ = [
     "build_hf_data_loader",
@@ -26,4 +27,5 @@ __all__ = [
     "BufferDataset",
     "PreprocessDataset",
     "get_data_loader",
+    "MosaicDataset"
 ]
