@@ -117,21 +117,12 @@ class HuggingFaceDataset(IterableDataset, Stateful):
         # variables for checkpointing
         self._sample_idx = 0
         self._all_tokens: List[int] = []
-        self._first_iter = True
 
     def __iter__(self):
         max_buffer_token_len = 1 + self.seq_len
 
         while True:
-            # skip samples for the first iteration to resume from checkpoint
-            data_iter = (
-                self._get_skipped_data_iter(self._sample_idx)
-                if self._first_iter
-                else iter(self._data)
-            )
-            self._first_iter = False
-
-            for sample in data_iter:
+            for sample in self._get_data_iter():
                 sample_text = sample["text"]
                 sample_tokens = self._tokenizer.encode(sample_text, bos=True, eos=True)
                 self._all_tokens.extend(sample_tokens)
@@ -155,24 +146,28 @@ class HuggingFaceDataset(IterableDataset, Stateful):
                     f"Dataset {self.dataset_name} is being re-looped. "
                     "Loss related metrics might be misleading."
                 )
-    def _get_skipped_data_iter(self, skip_samples):
-        """Skip data samples until the sample index is reached."""
+    
+    def _get_data_iter(self):
+        if self._sample_idx == 0:
+            return iter(self._data)
+
+        # Skip samples
         if isinstance(self._data, IterableDataset):
             it = iter(self._data)
-            for _ in range(skip_samples):
+            # Naively iterate through the samples as skip may not be supported
+            for _ in range(self._sample_idx):
                 next(it)
             return it
-        
-        # map-style dataset
-        if skip_samples == len(self._data):
+
+        # As skipping to the end throws an error in case of map-style dataset, return an empty iterator
+        if self._sample_idx == len(self._data):
             return iter([])
-        return iter(self._data.skip(skip_samples))
+        return iter(self._data.skip(self._sample_idx))
 
     def load_state_dict(self, state_dict):
         self._sample_idx = state_dict["sample_idx"]
         self._all_tokens = state_dict["token_buffer"]
-        self._first_iter = True
-    
+        
     def state_dict(self):
         return {
             "sample_idx": self._sample_idx,

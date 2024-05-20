@@ -6,6 +6,7 @@
 
 import enum
 import os
+import pickle
 import re
 import time
 from typing import Any, Dict
@@ -63,19 +64,25 @@ class OptimizerWrapper(Stateful):
 class DataLoaderWrapper(Stateful):
     def __init__(self, dataloader: DataLoader) -> None:
         self.dataloader = dataloader
-        self.rank_id = (
+        # Use global rank for now even though dataloader state could be same across dp groups
+        self.rank_id = str(
             dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
         )
 
     def state_dict(self) -> Dict[str, Any]:
-        if isinstance(self.dataloader, StatefulDataLoader):
-            return {str(self.rank_id): self.dataloader.state_dict()}
+        if True:#isinstance(self.dataloader, StatefulDataLoader):
+            return {self.rank_id: pickle.dumps(self.dataloader.state_dict())}
         return {}
     
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        if isinstance(self.dataloader, StatefulDataLoader):
-            assert state_dict[str(self.rank_id)], f"StatefulDataLoader state_dict is empty: {state_dict}"
-            self.dataloader.load_state_dict(state_dict[str(self.rank_id)])
+        if True:#isinstance(self.dataloader, StatefulDataLoader):
+            if not state_dict:
+                return
+            if self.rank_id not in state_dict:
+                logger.warning(f"DataLoader state is empty for rank {self.rank_id}. ")
+                return
+            assert state_dict[self.rank_id], f"StatefulDataLoader state_dict is empty: {state_dict}"
+            self.dataloader.load_state_dict(pickle.loads(state_dict[self.rank_id]))
 
 
 class CheckpointManager:
@@ -209,8 +216,8 @@ class CheckpointManager:
         # We won't have optimizer states to load, if we are loading a seed checkpoint
         states = {"model": self.states["model"]} if step == 0 else self.states
         logger.info(f"Loading the checkpoint at step {step}, containing keys {states.keys()}")
-        if "dataloader" in states:
-            next(iter(self.states["dataloader"].dataloader)) # FIXME: this is a hack to make sure the dataloader is initialized
+        # if "dataloader" in states:
+        #     next(iter(self.states["dataloader"].dataloader)) # FIXME: this is a hack to make sure the dataloader is initialized
         begin = time.monotonic()
         dcp.load(
             states,

@@ -15,10 +15,10 @@ from schedulefree import AdamWScheduleFree
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
-from torch.utils.data import DataLoader
 
 from maester.checkpoint import CheckpointManager
 from maester.datasets import build_hf_data_loader, create_tokenizer, MosaicDataset
+from maester.datasets.mosaic_dataset import MosaicDataLoader
 from maester.log_utils import init_logger, logger
 from maester.lr_scheduling import get_lr_scheduler
 from maester.memory import cleanup_before_training
@@ -59,7 +59,7 @@ class Config(BaseModel):
     # checkpointing
     enable_checkpoint: bool = True
     checkpoint_folder: str = "checkpoints"
-    checkpoint_interval: int = 500 # steps
+    checkpoint_interval: int = 100 # steps
     model_weights_only: bool = True # just for the final weight export
     export_dtype: str = "bfloat16" # just for the final weight export
 
@@ -212,11 +212,11 @@ def main():
     #     dp_rank,
     # )
     # data_loader = get_data_loader(cfg, rank=dist.get_rank(), world_size=world_size) # IBM
-    data_loader = DataLoader(dataset=MosaicDataset(dataset_path="/home/ucloud/2024-v2/tokenized", batch_size=cfg.train_batch_size), 
+    data_loader = MosaicDataLoader(dataset=MosaicDataset(dataset_path="/home/ucloud/2024-v2/tokenized", batch_size=cfg.train_batch_size), 
                              batch_size=cfg.train_batch_size, num_workers=1, pin_memory=True, shuffle=False)
 
     # build optimizer after model parallelization
-    optimizer: torch.optim.Optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg) # torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=False, fused=True)
+    optimizer: torch.optim.Optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg)
     scheduler = get_lr_scheduler(optimizer, cfg)
 
     metric_logger = build_metric_logger(cfg)
@@ -277,7 +277,6 @@ def main():
             data_load_start = timer()
             batch = next(data_iterator)
             input_ids, labels = batch
-            print(input_ids.shape, labels.shape)
             ntokens_since_last_log += labels.numel()
             data_loading_times.append(timer() - data_load_start)
 
