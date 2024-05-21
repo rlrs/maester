@@ -15,14 +15,13 @@ class Config(BaseModel):
     seq_len: int = 256
     norm_type: str = "rmsnorm"
     batch_size: int = 1
-
+    
     job_folder: str = "job/"
-
     checkpoint_folder: str = "checkpoints"
     enable_checkpoint: bool = True
-    checkpoint_interval: int = 50 # steps
-    model_weights_only: bool = True # just for the final weight export
-    export_dtype: str = "bfloat16" # just for the final weight export
+    checkpoint_interval: int = 50
+    model_weights_only: bool = True
+    export_dtype: str = "bfloat16"
     
 
 def main():

@@ -29,7 +29,7 @@ llama2_configs = {
 }
 
 llama3_configs = {
-    "debugmodel": ModelArgs(dim=256, n_layers=2, n_heads=16, rope_theta=500000),
+    "debugmodel": ModelArgs(dim=1024, n_layers=4, n_heads=16, rope_theta=500000),
     "500M": ModelArgs(
         dim=1024,
         n_layers=16,
@@ -57,4 +57,15 @@ llama3_configs = {
         multiple_of=4096,
         rope_theta=500000,
     ),
+}
+
+mistral_configs = {
+    "debugmodel": ModelArgs(dim=256, n_layers=2, n_heads=16),
+    "7B": ModelArgs(dim=4096, 
+                    n_layers=32, 
+                    n_heads=32,
+                    n_kv_heads=8,
+                    ffn_dim_multiplier=1.2,
+                    multiple_of=2048,
+                    rope_theta=10000),
 }

@@ -35,7 +35,7 @@ class Config(BaseModel):
     model_config = ConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True)
 
     job_folder: str = "jobs/"
-    job_name: str = "llama3-debug"
+    job_name: str = "mistral-7b"
 
     max_grad_norm: float = 1.0
     gc_freq: int = 4
@@ -64,23 +64,23 @@ class Config(BaseModel):
     export_dtype: str = "bfloat16" # just for the final weight export
 
     # model
-    model_name: str = "llama3"
-    flavor: str = "debugmodel"
+    model_name: str = "mistral"
+    flavor: str = "7B"
     seq_len: int = 8192
     norm_type: str = "rmsnorm"
 
     # optimizer
-    opt_class: Type[Any] = torch.optim.AdamW # AdamWScheduleFree
+    opt_class: Type[Any] = torch.optim.SGD # AdamWScheduleFree
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
-        lr = 3e-4, # initial lr
-        betas = (0.9, 0.95),
+        lr = 1e-5, # initial lr
+        # betas = (0.9, 0.95),
         foreach=True,
         fused=False # can't get fused to work with FSDP2
     )
 
     # lr schedule
     scheduler: str = "linear"
-    warmup_steps: int = 200
+    warmup_steps: int = 0
 
     # fsdp
     mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
@@ -144,7 +144,7 @@ def main():
     # build tokenizer
     tokenizer_type = model_name_to_tokenizer[cfg.model_name]
     # tokenizer = create_tokenizer(tokenizer_type, job_config.model.tokenizer_path) # TODO: path
-    tokenizer = create_tokenizer(tokenizer_type, "src/maester/datasets/tokenizer/original/tokenizer.model")
+    # tokenizer = create_tokenizer(tokenizer_type, "src/maester/datasets/tokenizer/original/tokenizer.model")
 
     # build model w/ meta init
     model_cls = model_name_to_cls[cfg.model_name]
@@ -154,7 +154,7 @@ def main():
     # 2. vocab size from tokenizer
     # 3. max_seq_len base on inputs
     model_config.norm_type = cfg.norm_type
-    model_config.vocab_size = tokenizer.n_words
+    model_config.vocab_size = 32000 # tokenizer.n_words
     model_config.max_seq_len = cfg.seq_len
 
     with torch.device("meta"):

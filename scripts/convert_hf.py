@@ -22,23 +22,15 @@ from maester.models import models_config
 @torch.inference_mode()
 def convert_hf_checkpoint(
     *,
-    model_name: str,
-    variant: str,
     checkpoint_dir: Path,
     output_dir: Path,
 ) -> None:
-    if model_name is None:
-        model_name = checkpoint_dir.name
-
-    config = models_config[model_name][variant]
-    print(f"Model config {config.__dict__}")
-
     # Load the json file containing weight mapping
     model_map_json = checkpoint_dir / "model.safetensors.index.json"
 
     assert model_map_json.is_file()
 
-    with open(model_map_json) as json_map:
+    with open(model_map_json, 'r') as json_map:
         bin_index = json.load(json_map)
 
     weight_map = {
@@ -88,13 +80,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Convert HuggingFace checkpoint.')
     parser.add_argument('--checkpoint', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--model', type=str, required=True)
-    parser.add_argument('--variant', type=str, required=True)
 
     args = parser.parse_args()
     convert_hf_checkpoint(
         checkpoint_dir=args.checkpoint,
         output_dir=args.output,
-        model_name=args.model,
-        variant=args.variant,
     )
