@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, ConstantLR
 
 # global states for scheduling
 # these are needed as LambdaLR does not support argument passing
@@ -37,7 +37,9 @@ def get_lr_scheduler(optimizer, cfg):
     _warmup_steps = int(cfg.warmup_steps)
     _decay_steps = float(max(1, cfg.train_num_batches - _warmup_steps))
 
-    if cfg.scheduler == "linear":
+    if cfg.scheduler == "constant":
+        warmup_scheduler = ConstantLR(optimizer, factor=1.0)
+    elif cfg.scheduler == "linear":
         warmup_scheduler = LambdaLR(optimizer, lr_lambda=linear_warmup_linear_decay)
     elif cfg.scheduler == "cosine":
         raise NotImplementedError("Cosine LR scheduler not implemented") # a bit annoying...

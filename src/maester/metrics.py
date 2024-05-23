@@ -10,7 +10,9 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 import torch
+import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
+import wandb
 from maester.log_utils import logger
 
 
@@ -93,36 +95,62 @@ def build_gpu_memory_monitor():
     return gpu_memory_monitor
 
 
-class MetricLogger:
-    def __init__(self, log_dir, tag, enable_tb):
+class TBMetricLogger:
+    def __init__(self, log_dir, tag):
         self.tag = tag
-        self.writer: Optional[SummaryWriter] = None
-        if enable_tb:
-            self.writer = SummaryWriter(log_dir, max_queue=1000)
+        self.writer = SummaryWriter(log_dir, max_queue=1000)
 
     def log(self, metrics: Dict[str, Any], step: int):
-        if self.writer is not None:
-            for k, v in metrics.items():
-                tag = k if self.tag is None else f"{self.tag}/{k}"
-                self.writer.add_scalar(tag, v, step)
+        for k, v in metrics.items():
+            tag = k if self.tag is None else f"{self.tag}/{k}"
+            self.writer.add_scalar(tag, v, step)
 
     def close(self):
-        if self.writer is not None:
-            self.writer.close()
+        self.writer.close()
+
+class WandbMetricLogger:
+    def __init__(self, config):
+        self.rank0_only: bool = config.log_rank0_only
+        if (not self.rank0_only) or dist.get_rank() == 0:
+            wandb.init(
+                project=config.job_name,
+                entity=config.wandb_entity,
+                # group="FSDP-group",
+                # id="fsdp-id",
+                # reinit=True, # necessary for multi-process?
+                # config=config, # TODO: not all fields are serializable
+                # resume=True
+            )
+
+    def log(self, metrics: Dict, step: int):
+        if (not self.rank0_only) or dist.get_rank() == 0:
+            wandb.log(metrics, step=step)
+
+    def close(self):
+        if (not self.rank0_only) or dist.get_rank() == 0:
+            wandb.finish()
 
 
 def build_metric_logger(config, tag: Optional[str] = None):
     dump_dir = os.path.join(config.job_folder, config.job_name)
     save_tb_folder = config.save_tb_folder
-    # since we don't have run id yet, use current minute as identifier
+    # TODO: should we use current minute as identifier?
     datetime_str = datetime.now().strftime("%Y%m%d-%H%M")
     log_dir = os.path.join(dump_dir, save_tb_folder, datetime_str)
 
-    enable_tb = config.enable_tensorboard
-    if enable_tb:
+    assert not (config.enable_tensorboard and config.enable_wandb)
+    if config.enable_tensorboard:
         logger.info(
-            f"Metrics logging active. Tensorboard logs will be saved at {log_dir}"
+            f"Tensorboard metrics logging active. Tensorboard logs will be saved at {log_dir}"
         )
+        rank_str = f"rank_{torch.distributed.get_rank()}"
+        return TBMetricLogger(os.path.join(log_dir, rank_str), tag)
+    elif config.enable_wandb:
+        logger.info(
+            "Wandb metrics logging active."
+        )
+        return WandbMetricLogger(config)
+    return None # TODO: how to handle?
 
-    rank_str = f"rank_{torch.distributed.get_rank()}"
-    return MetricLogger(os.path.join(log_dir, rank_str), tag, enable_tb)
+
+    

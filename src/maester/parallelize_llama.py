@@ -203,7 +203,7 @@ def parallelize_llama(model, world_mesh: DeviceMesh, parallel_dims, cfg) -> torc
                 ),
                 "output": col_parallel_strategy(
                     input_layouts=Shard(1),
-                    output_layouts=(Shard(-1) if loss_parallel else Replicate()),
+                    output_layouts=Shard(-1) if loss_parallel else Replicate(),
                     use_local_output=not loss_parallel,
                 ),
                 "norm": SequenceParallel(),
@@ -211,7 +211,7 @@ def parallelize_llama(model, world_mesh: DeviceMesh, parallel_dims, cfg) -> torc
         )
 
         # Apply tensor + sequence parallelism to every transformer block
-        for layer_id, transformer_block in enumerate(model.layers):
+        for layer_id, transformer_block in model.layers.items():
             layer_plan = {
                 "attention": PrepareModuleInput(
                     input_layouts=(Shard(1), None),
@@ -245,21 +245,49 @@ def parallelize_llama(model, world_mesh: DeviceMesh, parallel_dims, cfg) -> torc
 
         logger.info("Applied Tensor Parallelism to the model")
 
+    # apply AC + torch.compile
+    for layer_id, transformer_block in model.layers.items():
+        if cfg.ac_mode in ("full", "selective"):
+            transformer_block = checkpoint_wrapper(transformer_block, cfg)
+        if cfg.compile:
+            # turn on per-transformer block compile after AC wrapping and before FSDP
+            # TODO: dynamic shape have some issues so we turn it off for now.
+            # TODO: inline inbuilt nn modules does not work yet, enable it to accelerate
+            # compile time.
+            # torch._dynamo.config.inline_inbuilt_nn_modules = True
+            transformer_block = torch.compile(transformer_block, dynamic=False)
+        model.layers[layer_id] = transformer_block
+
+    if cfg.ac_mode in ("full", "selective"):
+        logger.info(f"Applied {cfg.ac_mode} activation checkpointing to the model")
+        if (
+            cfg.compile
+            and cfg.ac_mode == "selective"
+            and cfg.selective_ac_option == "op"
+        ):
+            # some temp flags for torch.compile enablement + SAC
+            torch._dynamo.config._experimental_support_context_fn_in_torch_utils_checkpoint = (
+                True
+            )
+    if cfg.compile:
+        if cfg.norm_type == "fused_rmsnorm":
+            raise NotImplementedError(
+                "fused_rmsnorm not yet compatible with torch.compile. Please use layernorm or rmsnorm."
+            )
+        logger.info("Compiled each TransformerBlock with torch.compile")
+
+    # apply DP (FSDP2)
     if parallel_dims.dp_enabled:
         dp_mesh = world_mesh["dp"] if world_mesh.ndim > 1 else world_mesh
         assert dp_mesh.mesh_dim_names == ("dp",), dp_mesh.mesh_dim_names
         mp_policy = cfg.mixed_precision_policy
-        ac_mode = cfg.ac_mode
         fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
-        for layer_id, transformer_block in enumerate(model.layers):
-            if cfg.ac_mode in ("full", "selective"):
-                transformer_block = checkpoint_wrapper(
-                    transformer_block, cfg
-                )
+        for layer_id, transformer_block in model.layers.items():
             # As an optimization, do not reshard after forward for the last
             # transformer block since FSDP would prefetch it immediately
-            # reshard_after_forward = layer_id < len(model.layers) - 1
-            reshard_after_forward = dp_mesh.size() if layer_id < len(model.layers) - 1 else False # hybrid shard
+            reshard_after_forward = (
+                int(layer_id) < len(model.layers) - 1
+            )
             fully_shard(
                 transformer_block,
                 **fsdp_config,
@@ -267,8 +295,6 @@ def parallelize_llama(model, world_mesh: DeviceMesh, parallel_dims, cfg) -> torc
             )
             model.layers[layer_id] = transformer_block
         model = fully_shard(model, **fsdp_config)
-        if ac_mode in ("full", "selective"):
-            logger.info(f"Applied {ac_mode} activation checkpointing to the model")
         logger.info("Applied FSDP to the model")
 
     return model

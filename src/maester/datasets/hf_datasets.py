@@ -4,7 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import List, Optional
+import pickle
+from typing import Any, List, Optional
 
 import torch
 from torch.utils.data import DataLoader, IterableDataset
@@ -173,6 +174,32 @@ class HuggingFaceDataset(IterableDataset, Stateful):
             "sample_idx": self._sample_idx,
             "token_buffer": self._all_tokens,
         }
+    
+class DPAwareDataLoader(StatefulDataLoader, Stateful):
+    """
+    A wrapper around the StatefulDataLoader that ensures that the state is stored only once per DP rank.
+    """
+
+    def __init__(self, dp_rank: int, hf_ds: IterableDataset, batch_size: int):
+        super().__init__(hf_ds, batch_size)
+        self._dp_rank = dp_rank
+        self._rank_id = f"dp_rank_{dp_rank}"
+
+    def state_dict(self) -> dict[str, Any]:
+        # Store state only for dp rank to avoid replicating the same state across other dimensions
+        return {self._rank_id: pickle.dumps(super().state_dict())}
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # State being empty is valid, don't log a warning
+        if not state_dict:
+            return
+
+        if self._rank_id not in state_dict:
+            logger.warning(
+                f"DataLoader state is empty for dp rank {self._dp_rank}, expected key {self._rank_id}."
+            )
+            return
+        super().load_state_dict(pickle.loads(state_dict[self._rank_id]))
 
 
 
@@ -190,4 +217,4 @@ def build_hf_data_loader(
         dataset_name, dataset_path, tokenizer, seq_len, world_size, rank, infinite
     )
 
-    return StatefulDataLoader(hf_ds, batch_size=batch_size)
+    return DPAwareDataLoader(rank, hf_ds, batch_size=batch_size)

@@ -1,3 +1,4 @@
+import contextlib
 import gc
 import os
 import time
@@ -15,6 +16,7 @@ from schedulefree import AdamWScheduleFree
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
+from torch.distributed.tensor.parallel import loss_parallel
 
 from maester.checkpoint import CheckpointManager
 from maester.datasets import build_hf_data_loader, create_tokenizer, MosaicDataset
@@ -42,10 +44,10 @@ class Config(BaseModel):
     data_parallel_degree: int = -1
     tensor_parallel_degree: int = 1
     pipeline_parallel_degree: int = 1
-    train_batch_size: int = 1
-    train_num_batches: int = 1000
-    compile: bool = False # TODO: compile doesn't work lol
-    enable_loss_parallel: bool = False
+    train_batch_size: int = 2
+    train_num_batches: int = 200
+    compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
+    enable_loss_parallel: bool = True
     init_timeout_seconds: int = 300
     train_timeout_seconds: int = 30
 
@@ -53,8 +55,11 @@ class Config(BaseModel):
     
     # logging/metrics
     log_freq: int = 5
+    log_rank0_only: bool = True
     save_tb_folder: str = "tb"
-    enable_tensorboard: bool = True
+    enable_tensorboard: bool = False
+    enable_wandb: bool = True
+    wandb_entity: str = "danish-foundation-models"
 
     # checkpointing
     enable_checkpoint: bool = True
@@ -70,16 +75,16 @@ class Config(BaseModel):
     norm_type: str = "rmsnorm"
 
     # optimizer
-    opt_class: Type[Any] = torch.optim.SGD # AdamWScheduleFree
+    opt_class: Type[Any] = torch.optim.AdamW
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
         lr = 1e-5, # initial lr
-        # betas = (0.9, 0.95),
-        foreach=True,
-        fused=False # can't get fused to work with FSDP2
+        betas = (0.9, 0.95),
+        foreach=True, # must be false for schedulefree, for some reason (this hurts performance)
+        # fused=False # can't get fused to work with FSDP2, would be fastest
     )
 
     # lr schedule
-    scheduler: str = "linear"
+    scheduler: str = "constant"
     warmup_steps: int = 0
 
     # fsdp
@@ -92,7 +97,7 @@ class Config(BaseModel):
     # profiling
     enable_profiling: bool = False
     traces_folder: str = "traces"
-    profile_freq: int = 5
+    profile_freq: int = 10
 
 
 # Training state that is saved in checkpoints
@@ -110,9 +115,9 @@ class TrainState(Stateful):
 
 
 # TODO: do these do much/anything?
-torch._inductor.config.coordinate_descent_tuning = True
-torch._inductor.config.triton.unique_kernel_names = True
-torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce compilation times, will be on by default in future
+torch._inductor.config.coordinate_descent_tuning = True # type: ignore
+torch._inductor.config.triton.unique_kernel_names = True # type: ignore
+torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce compilation times, will be on by default in future # type: ignore
 
 
 # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
@@ -212,7 +217,7 @@ def main():
     #     dp_rank,
     # )
     # data_loader = get_data_loader(cfg, rank=dist.get_rank(), world_size=world_size) # IBM
-    data_loader = MosaicDataLoader(dataset=MosaicDataset(dataset_path="/home/ucloud/2024-v2/tokenized", batch_size=cfg.train_batch_size), 
+    data_loader = MosaicDataLoader(dataset=MosaicDataset(dataset_path="/scratch/project_465000670/2024-v2/tokenized/train", batch_size=cfg.train_batch_size), 
                              batch_size=cfg.train_batch_size, num_workers=1, pin_memory=True, shuffle=False)
 
     # build optimizer after model parallelization
@@ -220,15 +225,11 @@ def main():
     scheduler = get_lr_scheduler(optimizer, cfg)
 
     metric_logger = build_metric_logger(cfg)
-    
-    # compile the sharded model
-    if cfg.compile:
-        if cfg.ac_mode == "selective" and cfg.selective_ac_option == "op":
-            torch._dynamo.config._experimental_support_context_fn_in_torch_utils_checkpoint = True
-        logger.info("Compiling model with torch.compile")
-        # Dynamic shape have issues with distributed, turn dynamic off as Transformer
-        # training is static_shape TODO: resolve dynamic shape issue and restore defaults
-        sharded_model = torch.compile(sharded_model, backend="inductor", mode="default", dynamic=False)
+
+    # loss_parallel enables dispatching to efficient loss operators
+    loss_parallel_ctx = (
+        loss_parallel if parallel_dims.loss_parallel_enabled else contextlib.nullcontext
+    )
 
     # loss fn can be shared by pipeline-parallel or non-pp execution
     def loss_fn(pred, labels):
@@ -240,7 +241,7 @@ def main():
     cleanup_before_training()
     sharded_model.train()
     if hasattr(optimizer, 'train'): # some optimizers need to be put in train mode (e.g. schedule free)
-        optimizer.train()
+        optimizer.train() # type: ignore (.train obviously exists)
 
     # checkpointing
     checkpoint = CheckpointManager(
@@ -287,12 +288,13 @@ def main():
 
             optimizer.zero_grad()
 
-            # TODO: loss parallel
-            pred = sharded_model(input_ids)
-            loss = loss_fn(pred, labels)
-            loss.backward()
+            # non-pp loss parallel, pp is not implemented
+            with loss_parallel_ctx():
+                pred = sharded_model(input_ids)
+                loss = loss_fn(pred, labels)
+                loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(
                 sharded_model.parameters(), cfg.max_grad_norm, foreach=True
             )
             optimizer.step()
@@ -309,8 +311,8 @@ def main():
                 )
                 if parallel_dims.dp_enabled:
                     global_avg_loss, global_max_loss = (
-                        dist_mean(avg_loss, dp_mesh).item(),
-                        dist_max(max_loss, dp_mesh).item()
+                        dist_mean(avg_loss, dp_mesh).item(), # type: ignore (dp_mesh exists)
+                        dist_max(max_loss, dp_mesh).item() # type: ignore (dp_mesh exists)
                     )
                 else:
                     global_avg_loss, global_max_loss = avg_loss, max_loss
@@ -330,6 +332,7 @@ def main():
                     "lr": scheduler.get_last_lr()[0],
                     "loss/global_avg": global_avg_loss,
                     "loss/global_max": global_max_loss,
+                    "grad/norm": total_grad_norm, # TODO: does this need to be all-reduced?
                     "tps": tps,
                     "mfu(%)": mfu,
                     "time/end_to_end(s)": time_end_to_end,
