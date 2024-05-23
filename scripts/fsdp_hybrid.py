@@ -218,7 +218,9 @@ def main():
     # )
     # data_loader = get_data_loader(cfg, rank=dist.get_rank(), world_size=world_size) # IBM
     data_loader = MosaicDataLoader(dataset=MosaicDataset(dataset_path="/scratch/project_465000670/2024-v2/tokenized/train", batch_size=cfg.train_batch_size), 
-                             batch_size=cfg.train_batch_size, num_workers=1, pin_memory=True, shuffle=False)
+                             batch_size=cfg.train_batch_size, num_workers=1, pin_memory=True, shuffle=False, persistent_workers=True)
+    dataset_num_samples = data_loader.dataset.dataset.size
+    logger.info(f"Dataset contains {dataset_num_samples} samples")
 
     # build optimizer after model parallelization
     optimizer: torch.optim.Optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg)

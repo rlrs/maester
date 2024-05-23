@@ -37,7 +37,7 @@ export WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 echo "Launching on $SLURMD_NODENAME ($SLURM_PROCID/$SLURM_JOB_NUM_NODES)," \
      "NODE_RANK=$NODE_RANK, WORLD_SIZE=$WORLD_SIZE" \
      "master $MASTER_ADDR port $MASTER_PORT," \
-     "GPUs $SLURM_GPUS_ON_NODE,"
+     "GPUs $SLURM_GPUS_ON_NODE"
 
 torchrun \
     --nnodes=$NNODES \
