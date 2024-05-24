@@ -1,3 +1,4 @@
+# This whole thing is a *temporary* Mosaic integration that should only exist until we have our dataloader implementation
 import os
 from typing import List
 from torch.utils.data import DataLoader, IterableDataset
@@ -28,6 +29,7 @@ class MosaicDataset(IterableDataset):
                 label = x[1:]
                 yield input, label
             self._sample_idx = 0
+            data_iter = iter(self.dataset)
             logger.warning(
                 f"Dataset is being re-looped. "
                 "Loss related metrics might be misleading."

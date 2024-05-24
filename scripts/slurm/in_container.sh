@@ -45,6 +45,9 @@ torchrun \
     --rdzv_id=$SLURM_JOB_ID \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+    --local-ranks-filter 0 \
+    --role rank \
+    --tee 3 \
     "$@" \
     > >(tee separate-logs/${SLURMD_NODENAME}-${SLURM_PROCID}.out) \
     2> >(tee separate-logs/${SLURMD_NODENAME}-${SLURM_PROCID}.err)

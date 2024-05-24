@@ -44,8 +44,8 @@ class Config(BaseModel):
     data_parallel_degree: int = -1
     tensor_parallel_degree: int = 1
     pipeline_parallel_degree: int = 1
-    train_batch_size: int = 2
-    train_num_batches: int = 200
+    train_batch_size: int = 2 # per device
+    train_num_epochs: int = 4
     compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
     enable_loss_parallel: bool = True
     init_timeout_seconds: int = 300
@@ -64,7 +64,7 @@ class Config(BaseModel):
     # checkpointing
     enable_checkpoint: bool = True
     checkpoint_folder: str = "checkpoints"
-    checkpoint_interval: int = 100 # steps
+    checkpoint_interval: int = 400 # steps
     model_weights_only: bool = True # just for the final weight export
     export_dtype: str = "bfloat16" # just for the final weight export
 
@@ -219,8 +219,14 @@ def main():
     # data_loader = get_data_loader(cfg, rank=dist.get_rank(), world_size=world_size) # IBM
     data_loader = MosaicDataLoader(dataset=MosaicDataset(dataset_path="/scratch/project_465000670/2024-v2/tokenized/train", batch_size=cfg.train_batch_size), 
                              batch_size=cfg.train_batch_size, num_workers=1, pin_memory=True, shuffle=False, persistent_workers=True)
-    dataset_num_samples = data_loader.dataset.dataset.size
-    logger.info(f"Dataset contains {dataset_num_samples} samples")
+    
+    # TODO: very ugly, temporary hack for epoch calc
+    dataset_num_samples = data_loader.dataset.dataset.size 
+    dataset_samples_per_step = dp_mesh.size() * cfg.train_batch_size # type: ignore (dp_mesh exists)
+    dataset_steps_in_epoch = dataset_num_samples // dataset_samples_per_step
+    logger.info(f"Dataset contains {dataset_num_samples} samples.\n\
+                A step uses {dataset_samples_per_step} samples.\n\
+                There are {dataset_steps_in_epoch} steps in an epoch.")
 
     # build optimizer after model parallelization
     optimizer: torch.optim.Optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg)
@@ -271,7 +277,7 @@ def main():
         time_last_log = timer()
         gpu_memory_monitor.reset_peak_stats()
 
-        while train_state.step < cfg.train_num_batches:
+        while (epoch := train_state.step // dataset_steps_in_epoch) < cfg.train_num_epochs:
             train_state.step += 1
             torch.manual_seed(train_state.step + dp_rank) # seeding with dp_rank to ensure identical inputs for TP groups
             if train_state.step > 1 and train_state.step % cfg.gc_freq == 0:
@@ -331,6 +337,7 @@ def main():
                 gpu_mem_stats = gpu_memory_monitor.get_peak_stats()
 
                 metrics = {
+                    "epoch": epoch,
                     "lr": scheduler.get_last_lr()[0],
                     "loss/global_avg": global_avg_loss,
                     "loss/global_max": global_max_loss,
@@ -350,7 +357,7 @@ def main():
                 metric_logger.log(metrics, step=train_state.step)
 
                 logger.info(
-                    f"Step {train_state.step:2}: "
+                    f"Step {train_state.step:2} (epoch {epoch}): "
                     f"lr={scheduler.get_last_lr()[0]:7.4f}, "
                     f"loss={global_avg_loss:7.4f} (max={global_max_loss:7.4f}), "
                     f"tps={round(tps):}, "
@@ -367,7 +374,7 @@ def main():
                 gpu_memory_monitor.reset_peak_stats()
 
             checkpoint.save(
-                train_state.step, force=(train_state.step == cfg.train_num_batches)
+                train_state.step, force=(epoch == cfg.train_num_epochs) # TODO: not a nice way to force?
             )
             
             # signals the profiler that the next profiling step has started

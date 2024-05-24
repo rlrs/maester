@@ -34,13 +34,13 @@ def linear_warmup_linear_decay(current_step: int) -> float:
 def get_lr_scheduler(optimizer, cfg):
     """Build the selected LR scheduler"""
     global _warmup_steps, _decay_steps
-    _warmup_steps = int(cfg.warmup_steps)
-    _decay_steps = float(max(1, cfg.train_num_batches - _warmup_steps))
+    # _warmup_steps = int(cfg.warmup_steps)
+    # _decay_steps = float(max(1, cfg.train_num_batches - _warmup_steps)) # TODO: this is disabled because we no longer have access to number of training steps here
 
     if cfg.scheduler == "constant":
         warmup_scheduler = ConstantLR(optimizer, factor=1.0)
-    elif cfg.scheduler == "linear":
-        warmup_scheduler = LambdaLR(optimizer, lr_lambda=linear_warmup_linear_decay)
+    # elif cfg.scheduler == "linear":
+    #     warmup_scheduler = LambdaLR(optimizer, lr_lambda=linear_warmup_linear_decay)
     elif cfg.scheduler == "cosine":
         raise NotImplementedError("Cosine LR scheduler not implemented") # a bit annoying...
     else:
