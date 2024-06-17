@@ -300,6 +300,9 @@ def main():
             with loss_parallel_ctx():
                 pred = sharded_model(input_ids)
                 loss = loss_fn(pred, labels)
+                # pred.shape=(bs, seq_len, vocab_size)
+                # need to free to before bwd to avoid peaking memory
+                del pred
                 loss.backward()
 
             total_grad_norm = torch.nn.utils.clip_grad_norm_(
