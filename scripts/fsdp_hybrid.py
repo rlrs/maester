@@ -19,7 +19,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor.parallel import loss_parallel
 
 from maester.checkpoint import CheckpointManager
-from maester.datasets import build_hf_data_loader, create_tokenizer, MosaicDataset
+from maester.datasets import build_hf_data_loader, create_tokenizer, MosaicDataset, build_experimental_data_loader
 from maester.datasets.mosaic_dataset import MosaicDataLoader
 from maester.log_utils import init_logger, logger
 from maester.lr_scheduling import get_lr_scheduler
@@ -52,6 +52,11 @@ class Config(BaseModel):
     train_timeout_seconds: int = 30
 
     # datasets
+    class dataset(BaseModel):
+        data_logical_shards: int = 768
+        dataset_path: str = "./src/maester/datasets/experimental/llama3"
+        datasets: str = "c4_mini"
+        dataset_weights: str = "1"
     
     # logging/metrics
     log_freq: int = 5
@@ -70,7 +75,7 @@ class Config(BaseModel):
 
     # model
     model_name: str = "mistral"
-    flavor: str = "7B"
+    flavor: str = "debugmodel"
     seq_len: int = 8192
     norm_type: str = "rmsnorm"
 
@@ -217,8 +222,9 @@ def main():
     #     dp_rank,
     # )
     # data_loader = get_data_loader(cfg, rank=dist.get_rank(), world_size=world_size) # IBM
-    data_loader = MosaicDataLoader(dataset=MosaicDataset(dataset_path="/scratch/project_465000670/2024-v2/tokenized/train", batch_size=cfg.train_batch_size), 
-                             batch_size=cfg.train_batch_size, num_workers=1, pin_memory=True, shuffle=False, persistent_workers=True)
+    #data_loader = MosaicDataLoader(dataset=MosaicDataset(dataset_path="/scratch/project_465000670/2024-v2/tokenized/train", batch_size=cfg.train_batch_size), 
+    #                         batch_size=cfg.train_batch_size, num_workers=1, pin_memory=True, shuffle=False, persistent_workers=True)
+    data_loader = build_experimental_data_loader(cfg, rank=dp_rank, world_size=dp_degree)
     
     # TODO: very ugly, temporary hack for epoch calc
     dataset_num_samples = data_loader.dataset.dataset.size 
