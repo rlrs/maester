@@ -1172,7 +1172,7 @@ def build_experimental_data_loader(cfg, rank, world_size):
     # Wrap above dataset in packing logic to form constant-length lines.
     data = Buffer_Dataset(
         data,
-        cfg.training.seq_len + 1,
+        cfg.seq_len + 1,
         pack_hard=True,
     )
     # Shuffle outputs in length 10k buffer. Consecutive lines appear 10k steps apart on average.
@@ -1180,18 +1180,15 @@ def build_experimental_data_loader(cfg, rank, world_size):
     # Split line into input and target for the CLM task.
     data = Preprocess_Dataset(data, causal_lm)
     # Enable auto-saving
-    if cfg.checkpoint.enable_checkpoint and not cfg.checkpoint.model_weights_only:
-        assert (
-            cfg.checkpoint.interval_type == "steps"
-        ), "Dataloader checkpointing supports only step-based interval"
+    if cfg.enable_checkpoint and not cfg.model_weights_only:
         data = Checkpoint_Dataset(
             data,
-            os.path.join(cfg.job.dump_folder, cfg.checkpoint.folder),
-            cfg.checkpoint.interval,
-            cfg.training.batch_size,
+            os.path.join(cfg.job_folder, cfg.checkpoint_folder),
+            cfg.checkpoint_interval,
+            cfg.batch_size,
         )
     return torch.utils.data.DataLoader(
-        data, num_workers=1, batch_size=cfg.training.batch_size
+        data, num_workers=1, batch_size=cfg.train_batch_size
     )
 
 

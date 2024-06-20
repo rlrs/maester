@@ -104,7 +104,7 @@ class CheckpointManager:
                     "model": ModelWrapper(model),
                     "optimizer": OptimizerWrapper(model, optimizer),
                     "lr_scheduler": lr_scheduler,
-                    "dataloader": DataLoaderWrapper(dataloader),
+                    # "dataloader": DataLoaderWrapper(dataloader),
                 }
             )
 

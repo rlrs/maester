@@ -16,6 +16,7 @@ from .dataloader import (
     get_data_loader
 )
 from .mosaic_dataset import MosaicDataset, MosaicDataLoader
+from .experimental import *
 
 __all__ = [
     "build_hf_data_loader",
@@ -29,4 +30,5 @@ __all__ = [
     "get_data_loader",
     "MosaicDataset",
     "MosaicDataLoader",
+    "build_experimental_data_loader",
 ]

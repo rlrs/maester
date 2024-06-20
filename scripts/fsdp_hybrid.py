@@ -32,12 +32,20 @@ from maester.profiling import maybe_enable_profiling
 from maester.utils import (dist_max, dist_mean, get_num_flop_per_token, get_num_params, get_peak_flops,
                            init_distributed, set_pg_timeouts)
 
+class DatasetConfig(BaseModel):
+        data_logical_shards: int = 768
+        dataset_path: str = "./src/maester/datasets/experimental/llama3"
+        datasets: str = "test"
+        dataset_weights: str = "1"
+        bos_token: int = 128000
+        eos_token: int = 128001
+        drop_tokens: str = ""
 
 class Config(BaseModel):
     model_config = ConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True)
 
     job_folder: str = "jobs/"
-    job_name: str = "mistral-7b"
+    job_name: str = "mistral-debug"
 
     max_grad_norm: float = 1.0
     gc_freq: int = 4
@@ -52,11 +60,7 @@ class Config(BaseModel):
     train_timeout_seconds: int = 30
 
     # datasets
-    class dataset(BaseModel):
-        data_logical_shards: int = 768
-        dataset_path: str = "./src/maester/datasets/experimental/llama3"
-        datasets: str = "c4_mini"
-        dataset_weights: str = "1"
+    dataset: DatasetConfig = DatasetConfig()
     
     # logging/metrics
     log_freq: int = 5
@@ -76,7 +80,7 @@ class Config(BaseModel):
     # model
     model_name: str = "mistral"
     flavor: str = "debugmodel"
-    seq_len: int = 8192
+    seq_len: int = 2048
     norm_type: str = "rmsnorm"
 
     # optimizer
@@ -120,7 +124,7 @@ class TrainState(Stateful):
 
 
 # TODO: do these do much/anything?
-torch._inductor.config.coordinate_descent_tuning = True # type: ignore
+# torch._inductor.config.coordinate_descent_tuning = True # type: ignore
 torch._inductor.config.triton.unique_kernel_names = True # type: ignore
 torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce compilation times, will be on by default in future # type: ignore
 
@@ -164,7 +168,7 @@ def main():
     # 2. vocab size from tokenizer
     # 3. max_seq_len base on inputs
     model_config.norm_type = cfg.norm_type
-    model_config.vocab_size = 32000 # tokenizer.n_words
+    model_config.vocab_size = 128256 # tokenizer.n_words # TODO
     model_config.max_seq_len = cfg.seq_len
 
     with torch.device("meta"):
@@ -227,12 +231,12 @@ def main():
     data_loader = build_experimental_data_loader(cfg, rank=dp_rank, world_size=dp_degree)
     
     # TODO: very ugly, temporary hack for epoch calc
-    dataset_num_samples = data_loader.dataset.dataset.size 
-    dataset_samples_per_step = dp_mesh.size() * cfg.train_batch_size # type: ignore (dp_mesh exists)
-    dataset_steps_in_epoch = dataset_num_samples // dataset_samples_per_step
-    logger.info(f"Dataset contains {dataset_num_samples} samples.\n\
-                A step uses {dataset_samples_per_step} samples.\n\
-                There are {dataset_steps_in_epoch} steps in an epoch.")
+    # dataset_num_samples = len(data_loader)
+    # dataset_samples_per_step = dp_mesh.size() * cfg.train_batch_size # type: ignore (dp_mesh exists)
+    # dataset_steps_in_epoch = dataset_num_samples // dataset_samples_per_step
+    # logger.info(f"Dataset contains {dataset_num_samples} samples.\n\
+    #             A step uses {dataset_samples_per_step} samples.\n\
+    #             There are {dataset_steps_in_epoch} steps in an epoch.")
 
     # build optimizer after model parallelization
     optimizer: torch.optim.Optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg)
@@ -283,7 +287,8 @@ def main():
         time_last_log = timer()
         gpu_memory_monitor.reset_peak_stats()
 
-        while (epoch := train_state.step // dataset_steps_in_epoch) < cfg.train_num_epochs:
+        # while (epoch := train_state.step // dataset_steps_in_epoch) < cfg.train_num_epochs:
+        while train_state.step < cfg.train_num_epochs * 1000: # TODO: how do we set this?
             train_state.step += 1
             torch.manual_seed(train_state.step + dp_rank) # seeding with dp_rank to ensure identical inputs for TP groups
             if train_state.step > 1 and train_state.step % cfg.gc_freq == 0:
@@ -297,8 +302,6 @@ def main():
 
             input_ids = input_ids.cuda()
             labels = labels.cuda()
-
-            start_time = time.time()
 
             optimizer.zero_grad()
 
@@ -346,7 +349,7 @@ def main():
                 gpu_mem_stats = gpu_memory_monitor.get_peak_stats()
 
                 metrics = {
-                    "epoch": epoch,
+                    # "epoch": epoch,
                     "lr": scheduler.get_last_lr()[0],
                     "loss/global_avg": global_avg_loss,
                     "loss/global_max": global_max_loss,
@@ -366,7 +369,7 @@ def main():
                 metric_logger.log(metrics, step=train_state.step)
 
                 logger.info(
-                    f"Step {train_state.step:2} (epoch {epoch}): "
+                    f"Step {train_state.step:2}: "
                     f"lr={scheduler.get_last_lr()[0]:7.4f}, "
                     f"loss={global_avg_loss:7.4f} (max={global_max_loss:7.4f}), "
                     f"tps={round(tps):}, "
@@ -383,7 +386,7 @@ def main():
                 gpu_memory_monitor.reset_peak_stats()
 
             checkpoint.save(
-                train_state.step, force=(epoch == cfg.train_num_epochs) # TODO: not a nice way to force?
+                train_state.step, force=(train_state.step == cfg.train_num_epochs*1000) # TODO: not a nice way to force?
             )
             
             # signals the profiler that the next profiling step has started
