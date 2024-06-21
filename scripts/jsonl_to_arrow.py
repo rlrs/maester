@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 
 
-def convert_jsonl_gz_to_arrow(input_dir, output_file, tokenizer_name, meta_file):
+def convert_jsonl_gz_to_arrow(input_dir, output_directory, output_name, tokenizer_name):
     # Initialize the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
@@ -16,7 +16,7 @@ def convert_jsonl_gz_to_arrow(input_dir, output_file, tokenizer_name, meta_file)
 
     # Create a PyArrow RecordBatchFileWriter
     schema = pa.schema([('tokens', pa.uint32())])
-    with pa.OSFile(output_file, 'wb') as sink:
+    with pa.OSFile(os.path.join(output_directory, output_name), 'wb') as sink:
         writer = pa.ipc.new_file(sink, schema)
 
         # Iterate through all .jsonl.gz files in the input directory
@@ -46,20 +46,20 @@ def convert_jsonl_gz_to_arrow(input_dir, output_file, tokenizer_name, meta_file)
         writer.close()
 
     # Write metadata to CSV
-    with open(meta_file, 'w', newline='') as csvfile:
+    meta_path = os.path.join(output_directory, 'meta', 'meta.csv')
+    os.makedirs(os.path.dirname(meta_path), exist_ok=True)
+    with open(meta_path, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['Total Documents', 'Total Tokens'])
-        writer.writerow([total_documents, total_tokens])
+        writer.writerow(['dataset/filename', 'documents', 'tokens'])
+        writer.writerow([output_name, total_documents, total_tokens])
 
-    print(f"Processed {total_documents} documents with a total of {total_tokens} tokens.")
-    print(f"Data written to {output_file}")
-    print(f"Metadata written to {meta_file}")
+    print(f"Processed dataset {output_name} with {total_documents} documents with a total of {total_tokens} tokens.")
 
 
 # Usage
 input_directory = 'scripts/'
-output_file = 'src/maester/datasets/experimental/llama3/test/test.arrow'
-meta_file = 'src/maester/datasets/experimental/llama3/meta/meta.csv'
+output_directory = 'src/maester/datasets/experimental/llama3/'
+output_name = '/test/test.arrow'
 tokenizer_name = 'mistralai/Mistral-7B-v0.1'  # Or any other HuggingFace tokenizer
 
-convert_jsonl_gz_to_arrow(input_directory, output_file, tokenizer_name, meta_file)
+convert_jsonl_gz_to_arrow(input_directory, output_directory, output_name, tokenizer_name)
