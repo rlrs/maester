@@ -58,7 +58,7 @@ def _get_latest(targdir, qualifier=lambda x: True):
             ],
             key=lambda path: int(path.split("/")[-1].split("-")[1]),
         )
-        return os.path.join(targdir, latest)
+        return latest
     return None
 
 
@@ -344,7 +344,7 @@ class Checkpoint_Dataset(_Wrapper_Dataset):
             )
             return
         # Grab latest item in path
-        latest = os.path.join(path, _get_latest(path))
+        latest =  _get_latest(path, qualifier=lambda x: "step" in x)
         self.report(f"Dataset checkpoint detected at {latest}")
         # If item is not a folder, exit early
         if os.path.isfile(latest):
@@ -1180,12 +1180,12 @@ def build_experimental_data_loader(cfg, rank, world_size):
     # Split line into input and target for the CLM task.
     data = Preprocess_Dataset(data, causal_lm)
     # Enable auto-saving
-    if cfg.enable_checkpoint and not cfg.model_weights_only:
+    if cfg.enable_checkpoint: # and not cfg.model_weights_only: # model_weights_only is only for final weight export...
         data = Checkpoint_Dataset(
             data,
             os.path.join(cfg.job_folder, cfg.checkpoint_folder),
             cfg.checkpoint_interval,
-            cfg.batch_size,
+            cfg.train_batch_size,
         )
     return torch.utils.data.DataLoader(
         data, num_workers=1, batch_size=cfg.train_batch_size
