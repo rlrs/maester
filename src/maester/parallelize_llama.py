@@ -29,7 +29,8 @@ from torch.distributed.tensor.parallel import (
     SequenceParallel,
 )
 
-from torch.utils.checkpoint import _pt2_selective_checkpoint_context_fn_gen, checkpoint
+from torch.utils.checkpoint import checkpoint
+import torch._dynamo.config
 
 from maester.log_utils import logger
 
@@ -103,22 +104,24 @@ no_recompute_list = {
 # currently selective per op and per layer checkpointing are supported
 def checkpoint_wrapper(module, config):
     if config.ac_mode == "selective" and config.selective_ac_option == "op":
-
+        from torch.utils.checkpoint import create_selective_checkpoint_contexts, CheckpointPolicy
         def _get_custom_policy(meta):
-            def _custom_policy(mode, func, *args, **kwargs):
+            def _custom_policy(ctx, func, *args, **kwargs):
+                mode = "recompute" if ctx.is_recompute else "forward"
                 mm_count_key = f"{mode}_mm_count"
                 if func == torch.ops.aten.mm.default:
                     meta[mm_count_key] += 1
                 # Saves output of all compute ops, except every second mm
-                return func in no_recompute_list and not (
-                    func == torch.ops.aten.mm.default and meta[mm_count_key] % 2 == 0
+                to_save = func in no_recompute_list and not ( 
+                    func == torch.ops.aten.mm.default and meta[mm_count_key] % 2 == 0 
                 )
+                return CheckpointPolicy.MUST_SAVE if to_save else CheckpointPolicy.PREFER_RECOMPUTE
 
             return _custom_policy
 
         def selective_checkpointing_context_fn():
             meta = defaultdict(int)
-            return _pt2_selective_checkpoint_context_fn_gen(_get_custom_policy(meta))
+            return create_selective_checkpoint_contexts(_get_custom_policy(meta))
 
         return ptd_checkpoint_wrapper(
             module,
@@ -144,15 +147,15 @@ def checkpoint_wrapper(module, config):
         1 == checkpointing every one (all).
         2 == checkpoint every 2nd one
         """
-        every_x_layer = int(config.selective_ac_option)
+        ac_freq = int(config.selective_ac_option)
         assert (
-            every_x_layer >= 0
-        ), f"selective layer AC policy (every_x_layer) expects a positive integer, received {every_x_layer}"
+            ac_freq >= 0
+        ), f"selective layer AC policy (ac_freq) expects a positive integer, received {ac_freq}"
 
         checkpoint_wrapper.__dict__.setdefault("_count", 0)
 
         checkpoint_wrapper._count += 1
-        if not every_x_layer or checkpoint_wrapper._count % every_x_layer == 0:
+        if not ac_freq or checkpoint_wrapper._count % ac_freq == 0:
             return ptd_checkpoint_wrapper(
                 module,
                 checkpoint_impl=CheckpointImpl.NO_REENTRANT,
@@ -265,10 +268,11 @@ def parallelize_llama(model, world_mesh: DeviceMesh, parallel_dims, cfg) -> torc
             and cfg.ac_mode == "selective"
             and cfg.selective_ac_option == "op"
         ):
-            # some temp flags for torch.compile enablement + SAC
-            torch._dynamo.config._experimental_support_context_fn_in_torch_utils_checkpoint = (
-                True
-            )
+            # TODO: still needed? some temp flags for torch.compile enablement + SAC
+            pass
+            # torch._dynamo.config._experimental_support_context_fn_in_torch_utils_checkpoint = (
+            #     True
+            # )
     if cfg.compile:
         if cfg.norm_type == "fused_rmsnorm":
             raise NotImplementedError(
