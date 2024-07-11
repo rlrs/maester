@@ -4,7 +4,7 @@ import os
 import queue
 import signal
 import threading
-from ctypes import c_int
+from ctypes import c_uint64
 from multiprocessing import Value
 import time
 from typing import Iterator, Optional
@@ -62,8 +62,8 @@ def convert_hf_dataset_to_arrow(dataset_name: str, output_directory: str, output
     else:
         dataset = load_dataset(dataset_name, split=split, streaming=True)
     
-    total_tokens = Value(c_int, 0)
-    total_documents = Value(c_int, 0)
+    total_tokens = Value(c_uint64, 0)
+    total_documents = Value(c_uint64, 0)
 
     # Create a PyArrow schema
     schema = pa.schema([('tokens', pa.uint32())])
@@ -119,7 +119,7 @@ def convert_hf_dataset_to_arrow(dataset_name: str, output_directory: str, output
 # Usage
 dataset_name = 'HuggingFaceFW/fineweb-edu'  # Replace with your desired dataset
 subset = 'sample-100BT'  # Replace with your desired subset, or set to None if not applicable
-output_directory = '/scratch/project_465000670/fineweb-edu-test'
+output_directory = '/scratch/project_465000670/fineweb-edu'
 output_name = 'fineweb/fineweb_edu_sample-100BT.arrow'
 tokenizer_name = 'meta-llama/Llama-2-7b-hf'  # Or any other HuggingFace tokenizer
 split = 'train'  # Replace with your desired split
