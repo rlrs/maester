@@ -6,6 +6,7 @@ import signal
 import threading
 from ctypes import c_int
 from multiprocessing import Value
+import time
 from typing import Iterator, Optional
 
 import pyarrow as pa
@@ -45,13 +46,13 @@ def finish_metadata(output_directory, output_name, total_documents, total_tokens
     with open(meta_path, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(['dataset/filename', 'documents', 'tokens'])
-        writer.writerow([f"/{output_name}", total_documents, total_tokens])
+        writer.writerow([f"/{output_name}", total_documents.value, total_tokens.value])
 
     print(f"Processed dataset {dataset_name}{f'/{subset}' if subset else ''} "
-        f"({split} split) with {total_documents} documents and a total of {total_tokens} tokens.")
+        f"({split} split) with {total_documents.value} documents and a total of {total_tokens.value} tokens.")
 
 def convert_hf_dataset_to_arrow(dataset_name: str, output_directory: str, output_name: str, tokenizer_name: str, 
-                                subset: Optional[str] = None, split: str = 'train', batch_size: int = 1000):
+                                subset: Optional[str] = None, split: str = 'train', batch_size: int = 10000):
     # Initialize the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
@@ -81,16 +82,16 @@ def convert_hf_dataset_to_arrow(dataset_name: str, output_directory: str, output
         if sink:
             sink.close()
         finish_metadata(output_directory, output_name, total_documents, total_tokens)
-        print(f"Arrow file saved. Processed {total_documents} documents and {total_tokens} tokens before interruption.")
         exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     
     try:
+        start_time = time.time()
         sink = pa.OSFile(output_path, 'wb')
         writer = pa.ipc.new_file(sink, schema)
 
-        write_queue = queue.Queue(maxsize=5000)
+        write_queue = queue.Queue(maxsize=50000)
         writer_thread_instance = threading.Thread(target=writer_thread, args=(write_queue, writer, total_tokens, total_documents))
         writer_thread_instance.start()
 
@@ -101,7 +102,7 @@ def convert_hf_dataset_to_arrow(dataset_name: str, output_directory: str, output
             for tokens in tokenized_batch:
                 write_queue.put(tokens)
                 pbar.update(1)
-                pbar.set_postfix({'docs': total_documents.value, 'tokens': total_tokens.value}, refresh=True)
+                pbar.set_postfix({'docs': total_documents.value, 'tokens': total_tokens.value, 'tokens/s': total_tokens.value / (time.time() - start_time)}, refresh=True)
 
         write_queue.put(None)  # Signal end of dataset
         pbar.close()
@@ -118,7 +119,7 @@ def convert_hf_dataset_to_arrow(dataset_name: str, output_directory: str, output
 # Usage
 dataset_name = 'HuggingFaceFW/fineweb-edu'  # Replace with your desired dataset
 subset = 'sample-100BT'  # Replace with your desired subset, or set to None if not applicable
-output_directory = '/scratch/project_465000670/fineweb-edu'
+output_directory = '/scratch/project_465000670/fineweb-edu-test'
 output_name = 'fineweb/fineweb_edu_sample-100BT.arrow'
 tokenizer_name = 'meta-llama/Llama-2-7b-hf'  # Or any other HuggingFace tokenizer
 split = 'train'  # Replace with your desired split
