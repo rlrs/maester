@@ -60,7 +60,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("src", type=str, help="Path to the source DCP model")
     parser.add_argument("dst", type=str, help="Path to the destination model")
-    parser.add_argument("--base", type=str, default=None, help="Path to HF model this is based on, for getting the config and tokenizer") # TODO: can we not do this??
+    parser.add_argument("--base", type=str, default=None, help="Path to HF model this is based on, also uses tokenizer unless --tokenizer is specified") # TODO: can we not do this??
+    parser.add_argument("--tokenizer", type=str, default=None, help="Path to HF tokenizer this is based on") # TODO: can we not do this??
     parser.add_argument("--name", type=str, required=True, help="Name (variant) of the model checkpoint to load, e.g. step-1000")
     parser.add_argument("--type", type=str, default="hf", choices=["hf", "pt"], help="Type of the destination model")
     parser.add_argument("--upload", type=str, default=None, help="HF repo to upload to (name gets appended)")
@@ -84,16 +85,24 @@ if __name__ == "__main__":
         # Build and save HF Config
         print('#' * 30)
         print('Saving HF Model Config...')
+        hf_tokenizer = AutoTokenizer.from_pretrained(args.tokenizer if args.tokenizer else args.base)
         dtype = torch.bfloat16
         hf_config = AutoConfig.from_pretrained(args.base)
         hf_config.torch_dtype = dtype
+        print(sd['model'])
+        hf_config.num_hidden_layers = max([int(re.search(r'layers.(\d+)', k).group(1)) for k in sd['model'].keys() if 'layers' in k]) + 1
+        hf_config.hidden_size = sd['model']['layers.0.attention.wq.weight'].shape[0]
+        hf_config.num_attention_heads = 32 # TODO: read all these from a config
+        hf_config.intermediate_size = sd['model']['layers.0.feed_forward.w1.weight'].shape[0]
+        hf_config.vocab_size = sd['model']['tok_embeddings.weight'].shape[0]
+        hf_config.bos_token_id = hf_tokenizer.bos_token_id
+        hf_config.eos_token_id = hf_tokenizer.eos_token_id
         hf_config.save_pretrained(dst_dir)
         print(hf_config)
 
         # Extract and save the HF tokenizer
         print('#' * 30)
         print('Saving HF Tokenizer...')
-        hf_tokenizer = AutoTokenizer.from_pretrained(args.base)
         if hf_tokenizer is not None:
             hf_tokenizer.save_pretrained(dst_dir)
             print(hf_tokenizer)
@@ -146,7 +155,7 @@ if __name__ == "__main__":
 
         # Save weights
         # torch.save(weights_state_dict, os.path.join(args.dst, 'pytorch_model.bin'))
-        safetensors.torch.save_file(final_result, os.path.join(dst_dir, 'model.safetensors'))
+        safetensors.torch.save_file(final_result, os.path.join(dst_dir, 'model.safetensors'), metadata={"format": "pt"})
 
         print('#' * 30)
         print(f'HF checkpoint folder successfully created at {args.dst}.')
