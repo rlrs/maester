@@ -4,9 +4,11 @@ import math
 import os
 import random
 import time
-from typing import Any, Callable, List, Optional, Set, Type, Union
+from typing import Any, Callable, List, Optional, Set
 
+import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 import torch.utils.data as data
 from transformers import AutoTokenizer
@@ -851,12 +853,6 @@ class Streaming_Doc_Dataset(_Stateful_Dataset):
         ), f"Dataset mismatch: checkpoint contains {self.dataset}, expected {d}"
         return out
 
-import os
-import pyarrow.parquet as pq
-import pyarrow as pa
-import numpy as np
-from typing import List, Optional, Any
-
 class ParquetDataset(_Stateful_Dataset):
     def __init__(
         self,
@@ -866,106 +862,231 @@ class ParquetDataset(_Stateful_Dataset):
         tokenizer,
         delimiter_token: Any,
         bos_token: Optional[Any] = None,
-        eos_token: Optional[Any] = None,
+        strip_tokens: Optional[Set[Any]] = set(),
         seed: int = 42,
         min_length: int = 1,
         max_chunksize: int = 1024,
         verbose: bool = False,
+        shuffle: bool = True,
     ):
         super(ParquetDataset, self).__init__(rank, worldsize)
+        self.seed = seed
+        self.data = data_dir
         self.tokenizer = tokenizer
-        self.delimiter_token = delimiter_token
-        self.bos_token = bos_token
-        self.eos_token = eos_token
         self.min_length = min_length
-        self.max_chunksize = max_chunksize
+        assert max_chunksize > 0, f"Max chunksize must be a nonzero positive integer"
+        self.chunksize = max_chunksize
+        self.eos = delimiter_token
+        self.bos = bos_token
+        self.drop = strip_tokens
         self.verbose = verbose
+        self.docset: List[Any] = []  # map of doc indices to (file_path, min docid, max docid)
+        self.docs_per_file = {}
 
-        # Get all Parquet files in the directory
-        self.parquet_files = [f for f in os.listdir(data_dir) if f.endswith('.parquet')]
-        self.parquet_files = [os.path.join(data_dir, f) for f in self.parquet_files]
+        # Guaranteed inconsistent shuffling across workers
+        random.seed(self.seed + rank)
 
-        # Create an index of files and their row counts
-        self.file_index = []
-        total_rows = 0
+        # Get all Parquet files in the directory recursively
+        self.parquet_files = [os.path.join(root, f) for root, _, files in os.walk(data_dir) for f in files if f.endswith('.parquet')]
+        self.parquet_files.sort()  # Ensure consistent sharding across machines
+
+        # Gather per-file document counts
         for file in self.parquet_files:
             parquet_file = pq.ParquetFile(file)
-            num_rows = parquet_file.metadata.num_rows
-            self.file_index.append((file, total_rows, total_rows + num_rows))
-            total_rows += num_rows
+            self.docs_per_file[file] = parquet_file.metadata.num_rows
 
-        # Shard the total rows
-        self.start_row = (total_rows * rank) // worldsize
-        self.end_row = (total_rows * (rank + 1)) // worldsize
+        # Assemble document set owned by this worker
+        start_frag = (rank * worldsize * len(self.parquet_files)) // worldsize
+        end_frag = ((rank + 1) * worldsize * len(self.parquet_files)) // worldsize
+        file_frags = [(self.parquet_files[i // worldsize], i % worldsize) for i in range(start_frag, end_frag)]
 
+        # Read file fragments, assemble doc list for each file (aggregating over fragments)
+        docset = {}  # file_path -> (min docid, max docid)
+        for file_path, frag in file_frags:
+            ndocs = self.docs_per_file[file_path]
+            doc_start = (ndocs * frag) // worldsize
+            doc_end = (ndocs * (frag + 1)) // worldsize - 1  # Inclusive upper bound
+            if file_path not in docset:
+                docset[file_path] = [doc_start, doc_end]
+            else:
+                min_d, max_d = docset[file_path]
+                docset[file_path] = [min(min_d, doc_start), max(max_d, doc_end)]
+
+        # Add all of this dataset's file entries to self.docset
+        doccount = 0
+        for file_path in docset:
+            min_d, max_d = docset[file_path]
+            self.docset.append((file_path, min_d, max_d))
+            doccount += max_d - min_d + 1
+        self._len = doccount
+
+        if verbose:
+            logging.info(f"Worker {rank} ingested {len(file_frags)} file fragments")
+
+        # Shuffle files
+        if shuffle:
+            random.shuffle(self.docset)
+
+        self.docset_index = 0
+        self.chunk_index = -1
+
+        # Stats
+        self.epochs_seen = -1
         self.tokens_seen = 0
         self.docs_seen = 0
-        
-        self.rng = np.random.default_rng(seed + rank)
-        
-        self.state_params = ["tokens_seen", "docs_seen"]
+        self.percent_seen = 0
+        self.lcg_state = seed + rank
+
+        self.state_params = [
+            "docset_index",
+            "chunk_index",
+            "epochs_seen",
+            "tokens_seen",
+            "docs_seen",
+            "percent_seen",
+            "lcg_state",
+        ]
+
+    def _get_docid(self, i):
+        cur = 0
+        assert i <= self._len, f"You have requested an illegal doc index {i}, docset length is {self._len}"
+        for file_path, min_d, max_d in self.docset:
+            docrange = max_d - min_d + 1
+            cur += docrange
+            if cur > i:
+                return file_path, docrange, min_d
+
+    def _get_reader(self, path, newpath, reader):
+        if newpath != path:
+            del reader
+            if self.verbose:
+                logging.info(f"Worker {self.rank} opening new file {newpath}")
+            reader = pq.ParquetFile(newpath)
+            path = newpath
+        return path, reader
+
+    def _construct_chunk(self, j, doc, n_chunks):
+        """
+        Construct the jth chunk of doc
+        """
+        start_index = j * self.chunksize
+        n_pull = self.chunksize
+        if self.bos is not None:
+            if j == 0:
+                n_pull -= 1
+            else:
+                start_index -= 1
+        chunk = doc[start_index:start_index + n_pull]
+        self.tokens_seen += len(chunk)
+        if self.bos is not None and j == 0:
+            chunk = [self.bos] + chunk
+        if j == n_chunks - 1:
+            chunk = chunk + [self.eos]
+        return chunk
+
+    def _random_map_docid(self, size):
+        """
+        Given size of document pool, use saved state (prior index) to generate the next index via LCG.
+        Implements within-shard document shuffling without materializing any large doc lists.
+        """
+        m = 2 ** math.ceil(math.log2(size))  # Round up to nearest power of 2
+        a = 5  # A,C values known to work well with powers of 2 (Knuth, 1997, 3.2.1.3)
+        c = (self.rank + self.seed) * 2 + 1
+        state = self.lcg_state
+        while True:
+            state = (a * state + c) % m
+            if state < size:
+                return state
+            
+    def _read_specific_row(self, reader, row_index):
+        row_group_index = 0
+        rows_seen = 0
+        for i in range(reader.num_row_groups):
+            num_rows = reader.metadata.row_group(i).num_rows
+            if rows_seen + num_rows > row_index:
+                row_group_index = i
+                break
+            rows_seen += num_rows
+
+        row_offset = row_index - rows_seen
+        table = reader.read_row_group(row_group_index)
+        row = table.slice(row_offset, 1)
+        return row
 
     def __iter__(self):
+        docset_offset = self.docset_index
+        lcg_offset = self.lcg_state
+        residual_chunks = self.chunk_index + 1
+        ndocs = self._len
+        path = ""
+        reader = None
         while True:
-            # Randomly select a row within our shard TODO: replace this with the lcg
-            global_row = self.rng.integers(self.start_row, self.end_row)
-            
-            # Find which file this row belongs to
-            for file, start, end in self.file_index:
-                if start <= global_row < end:
-                    local_row = global_row - start
-                    break
-            
-            # Read the specific row from the file
-            parquet_file = pq.ParquetFile(file)
-            row_group_index = 0
-            row_count = 0
-            for i in range(parquet_file.num_row_groups):
-                num_rows = parquet_file.metadata.row_group(i).num_rows
-                if row_count + num_rows > local_row:
-                    row_group_index = i
-                    break
-                row_count += num_rows
-            
-            row_offset = local_row - row_count
-            # if self.verbose:
-            #     print(f"  Row group: {row_group_index}")
-            #     print(f"  Row offset in group: {row_offset}")
-            
-            table = parquet_file.read_row_group(row_group_index)
+            for i in range(ndocs):
+                doc_index = (docset_offset + i) % ndocs
+
+                if doc_index == 0:
+                    self.epochs_seen += 1
+                self.docset_index = doc_index
+
+                file_path, docrange, mindoc = self._get_docid(doc_index)
+
+                newpath = file_path
+                path, reader = self._get_reader(path, newpath, reader)
+
+                doclcg = self._random_map_docid(docrange)
+                docid = doclcg + mindoc
+
+                table = self._read_specific_row(reader, docid)
+                text = table['text'][0].as_py()
+                doc = self.tokenizer.encode(text, add_special_tokens=False, padding=False, truncation=False)
+
+                if doc[0] in self.drop:
+                    doc = doc[1:]
+                if doc[-1] in self.drop:
+                    doc = doc[:-1]
+
+                doclen = len(doc) + 1 if self.bos is None else len(doc) + 2
+                if doclen >= self.min_length:
+                    n_chunks = math.ceil(doclen / self.chunksize)
+                    for j in range(n_chunks):
+                        if i == 0 and j < residual_chunks:
+                            pass
+                        else:
+                            self.chunk_index = j
+                            if j == n_chunks - 1:
+                                self.docs_seen += 1
+                                self.percent_seen = (self.docs_seen * 100 / (self._len + 1e-9))
+                            yield self._construct_chunk(j, doc, n_chunks)
+
+                self.lcg_state = doclcg
+
+            # Handle residual chunks from the first document
+            self.docset_index = docset_offset
+            self.lcg_state = lcg_offset
+            file_path, docrange, mindoc = self._get_docid(docset_offset)
+            docid = self._random_map_docid(docrange) + mindoc
+            newpath = file_path
+            path, reader = self._get_reader(path, newpath, reader)
+            table = self._read_specific_row(reader, docid)
             text = table['text'][0].as_py()
+            doc = self.tokenizer.encode(text, add_special_tokens=False, padding=False, truncation=False)
 
-            tokens = self.tokenizer.encode(text, add_special_tokens=False, padding=False, truncation=False)
-            
-            if len(tokens) < self.min_length:
-                continue
-            
-            if self.bos_token is not None:
-                tokens = [self.bos_token] + tokens
-            if self.eos_token is not None:
-                tokens = tokens + [self.eos_token]
-            
-            chunks = [tokens[i:i+self.max_chunksize] for i in range(0, len(tokens), self.max_chunksize)]
-            
-            for chunk in chunks:
-                self.tokens_seen += len(chunk)
-                yield chunk
-            
-            self.docs_seen += 1
-            yield [self.delimiter_token]  # Yield delimiter after each document
+            if doc[0] in self.drop:
+                doc = doc[1:]
+            if doc[-1] in self.drop:
+                doc = doc[:-1]
 
-    def get_state_dict(self):
-        return {
-            'tokens_seen': self.tokens_seen,
-            'docs_seen': self.docs_seen,
-            'rng_state': self.rng.bit_generator.state
-        }
+            doclen = len(doc) + 1 if self.bos is None else len(doc) + 2
+            if doclen >= self.min_length:
+                n_chunks = math.ceil(doclen / self.chunksize)
+                for j in range(residual_chunks):
+                    self.chunk_index = j
+                    yield self._construct_chunk(j, doc, n_chunks)
 
-    def set_state_dict(self, state_dict):
-        self.tokens_seen = state_dict['tokens_seen']
-        self.docs_seen = state_dict['docs_seen']
-        self.rng.bit_generator.state = state_dict['rng_state']
-
+    def load_state_dict(self, state_dicts, sharded_input=False):
+        assert self.load_worldsize == self.worldsize, "ParquetDataset does not support rescaling."
+        return super().load_state_dict(state_dicts, sharded_input)
+    
 class Sampling_Dataset(_Stateful_Dataset):
     """
     A _Stateful_Dataset implementing percentage-based sampling: weights can be floats, and the
