@@ -891,37 +891,22 @@ class ParquetDataset(_Stateful_Dataset):
         self.parquet_files.sort()  # Ensure consistent sharding across machines
 
         # Gather per-file document counts
+        total_rows = 0
         for file in self.parquet_files:
             parquet_file = pq.ParquetFile(file)
-            self.docs_per_file[file] = parquet_file.metadata.num_rows
+            num_rows = parquet_file.metadata.num_rows
+            self.docs_per_file[file] = num_rows
+            self.docset.append((file, total_rows, total_rows + num_rows))
+            total_rows += num_rows
 
-        # Assemble document set owned by this worker
-        start_frag = (rank * worldsize * len(self.parquet_files)) // worldsize
-        end_frag = ((rank + 1) * worldsize * len(self.parquet_files)) // worldsize
-        file_frags = [(self.parquet_files[i // worldsize], i % worldsize) for i in range(start_frag, end_frag)]
-
-        # Read file fragments, assemble doc list for each file (aggregating over fragments)
-        docset = {}  # file_path -> (min docid, max docid)
-        for file_path, frag in file_frags:
-            ndocs = self.docs_per_file[file_path]
-            doc_start = (ndocs * frag) // worldsize
-            doc_end = (ndocs * (frag + 1)) // worldsize - 1  # Inclusive upper bound
-            if file_path not in docset:
-                docset[file_path] = [doc_start, doc_end]
-            else:
-                min_d, max_d = docset[file_path]
-                docset[file_path] = [min(min_d, doc_start), max(max_d, doc_end)]
-
-        # Add all of this dataset's file entries to self.docset
-        doccount = 0
-        for file_path in docset:
-            min_d, max_d = docset[file_path]
-            self.docset.append((file_path, min_d, max_d))
-            doccount += max_d - min_d + 1
-        self._len = doccount
+        # Shard the total rows
+        self.start_row = (total_rows * rank) // worldsize
+        self.end_row = (total_rows * (rank + 1)) // worldsize
+        self._len = self.end_row - self.start_row
 
         if verbose:
-            logging.info(f"Worker {rank} ingested {len(file_frags)} file fragments")
+            logging.info(f"Worker {rank} responsible for docs: {self.docset}")
+            logging.info(f"Total docs: {total_rows}")
 
         # Shuffle files
         if shuffle:
@@ -948,13 +933,10 @@ class ParquetDataset(_Stateful_Dataset):
         ]
 
     def _get_docid(self, i):
-        cur = 0
         assert i <= self._len, f"You have requested an illegal doc index {i}, docset length is {self._len}"
-        for file_path, min_d, max_d in self.docset:
-            docrange = max_d - min_d + 1
-            cur += docrange
-            if cur > i:
-                return file_path, docrange, min_d
+        for file_path, start, end in self.docset:
+            if start <= i < end:
+                return file_path, i - start
 
     def _get_reader(self, path, newpath, reader):
         if newpath != path:
@@ -1022,23 +1004,25 @@ class ParquetDataset(_Stateful_Dataset):
         reader = None
         while True:
             for i in range(ndocs):
-                doc_index = (docset_offset + i) % ndocs
+                docset_row = self._random_map_docid(self._len)
 
-                if doc_index == 0:
+                if i == 0:
                     self.epochs_seen += 1
-                self.docset_index = doc_index
+                self.docset_index = i
+                
+                self.lcg_state = docset_row
 
-                file_path, docrange, mindoc = self._get_docid(doc_index)
-
+                file_path, local_row = self._get_docid(docset_row)
+                
                 newpath = file_path
                 path, reader = self._get_reader(path, newpath, reader)
-
-                doclcg = self._random_map_docid(docrange)
-                docid = doclcg + mindoc
-
-                table = self._read_specific_row(reader, docid)
+                
+                table = self._read_specific_row(reader, local_row)
                 text = table['text'][0].as_py()
                 doc = self.tokenizer.encode(text, add_special_tokens=False, padding=False, truncation=False)
+
+                if self.verbose:
+                    logging.info(f"Worker {self.rank} processing document {i} (row {docset_row}), file: {file_path}")
 
                 if doc[0] in self.drop:
                     doc = doc[1:]
@@ -1058,16 +1042,14 @@ class ParquetDataset(_Stateful_Dataset):
                                 self.percent_seen = (self.docs_seen * 100 / (self._len + 1e-9))
                             yield self._construct_chunk(j, doc, n_chunks)
 
-                self.lcg_state = doclcg
-
             # Handle residual chunks from the first document
             self.docset_index = docset_offset
             self.lcg_state = lcg_offset
-            file_path, docrange, mindoc = self._get_docid(docset_offset)
-            docid = self._random_map_docid(docrange) + mindoc
+            docset_row = self._random_map_docid(self._len)
+            file_path, local_row = self._get_docid(docset_row)
             newpath = file_path
             path, reader = self._get_reader(path, newpath, reader)
-            table = self._read_specific_row(reader, docid)
+            table = self._read_specific_row(reader, local_row)
             text = table['text'][0].as_py()
             doc = self.tokenizer.encode(text, add_special_tokens=False, padding=False, truncation=False)
 
@@ -1413,8 +1395,9 @@ def build_experimental_data_loader(cfg, rank, world_size):
             cfg.checkpoint_interval,
             cfg.train_batch_size,
         )
+    # warning: things *will* break with num_workers > 1
     return torch.utils.data.DataLoader(
-        data, num_workers=2, prefetch_factor=2, batch_size=cfg.train_batch_size, pin_memory=True, persistent_workers=True
+        data, num_workers=1, prefetch_factor=2, batch_size=cfg.train_batch_size, pin_memory=True, persistent_workers=True
     )
 
 
