@@ -8,12 +8,20 @@ import os
 from collections import namedtuple
 from datetime import datetime
 from typing import Any, Dict, Optional
+import json
 
 import torch
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 import wandb
 from maester.log_utils import logger
+
+def is_serializable(obj):
+    try:
+        json.dumps(obj)
+        return True
+    except (TypeError, OverflowError):
+        return False
 
 
 # named tuple for passing GPU memory stats for logging
@@ -115,6 +123,7 @@ class WandbMetricLogger:
             wandb.init(
                 project=config.job_name,
                 entity=config.wandb_entity,
+                config={k:v for k, v in config.dict().items() if is_serializable(v)},
                 # group="FSDP-group",
                 # id="fsdp-id",
                 # reinit=True, # necessary for multi-process?
@@ -143,7 +152,7 @@ def build_metric_logger(config, tag: Optional[str] = None):
         logger.info(
             f"Tensorboard metrics logging active. Tensorboard logs will be saved at {log_dir}"
         )
-        rank_str = f"rank_{torch.distributed.get_rank()}"
+        rank_str = f"rank_{dist.get_rank()}"
         return TBMetricLogger(os.path.join(log_dir, rank_str), tag)
     elif config.enable_wandb:
         logger.info(
