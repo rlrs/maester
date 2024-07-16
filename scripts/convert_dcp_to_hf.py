@@ -81,6 +81,8 @@ if __name__ == "__main__":
         planner=_EmptyStateDictLoadPlanner(),
         no_dist=True,
     )
+    if 'model' in sd: # model-only checkpoints do not have this
+        sd = sd['model']
     if args.type == "hf":
         # Build and save HF Config
         print('#' * 30)
@@ -89,12 +91,11 @@ if __name__ == "__main__":
         dtype = torch.bfloat16
         hf_config = AutoConfig.from_pretrained(args.base)
         hf_config.torch_dtype = dtype
-        print(sd['model'])
-        hf_config.num_hidden_layers = max([int(re.search(r'layers.(\d+)', k).group(1)) for k in sd['model'].keys() if 'layers' in k]) + 1
-        hf_config.hidden_size = sd['model']['layers.0.attention.wq.weight'].shape[0]
+        hf_config.num_hidden_layers = max([int(re.search(r'layers.(\d+)', k).group(1)) for k in sd.keys() if 'layers' in k]) + 1
+        hf_config.hidden_size = sd['layers.0.attention.wq.weight'].shape[0]
         hf_config.num_attention_heads = 32 # TODO: read all these from a config
-        hf_config.intermediate_size = sd['model']['layers.0.feed_forward.w1.weight'].shape[0]
-        hf_config.vocab_size = sd['model']['tok_embeddings.weight'].shape[0]
+        hf_config.intermediate_size = sd['layers.0.feed_forward.w1.weight'].shape[0]
+        hf_config.vocab_size = sd['tok_embeddings.weight'].shape[0]
         hf_config.bos_token_id = hf_tokenizer.bos_token_id
         hf_config.eos_token_id = hf_tokenizer.eos_token_id
         hf_config.save_pretrained(dst_dir)
@@ -112,7 +113,7 @@ if __name__ == "__main__":
         # Extract the HF model weights
         print('#' * 30)
         print('Saving HF Model Weights...')
-        weights_state_dict = sd['model']
+        weights_state_dict = sd
 
         # Convert weights to desired dtype
         for k, v in weights_state_dict.items():
