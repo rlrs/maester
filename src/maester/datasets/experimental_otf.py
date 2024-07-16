@@ -1204,12 +1204,14 @@ class Scalable_Shard_Dataset(_Stateful_Dataset):
     ...
     Args
     ----
-    datapath : str
-        Absolute path to the dataset directory. Expects folder containing pyarrow shardfiles.
+    datadir : str
+        Absolute path to the dataset directory. Expects folder containing (folders of) parquet files.
     rank : int
         Current worker index
     worldsize : int
         Total number of workers
+    tokenizer : AutoTokenizer
+        Tokenizer used to tokenize text
     delimiter_token : Any
         Token used to indicate sequence/document breaks. Type should match data type.
     n_logical_shards : int
@@ -1220,9 +1222,10 @@ class Scalable_Shard_Dataset(_Stateful_Dataset):
 
     def __init__(
         self,
-        datapath: str,
+        data_dir: str,
         rank: int,
         worldsize: int,
+        tokenizer,
         delimiter_token: Any,
         n_logical_shards: int = 2048,
         verbose=False,
@@ -1248,10 +1251,11 @@ class Scalable_Shard_Dataset(_Stateful_Dataset):
         # Build logical shards
         for i in range(self.n_logicals):
             self.data.append(
-                Streaming_Doc_Dataset(
-                    datapath=datapath,
-                    worldsize=n_logical_shards,
+                ParquetDataset(
+                    data_dir=data_dir,
                     rank=self.logicals_owned[i],
+                    worldsize=n_logical_shards,
+                    tokenizer=tokenizer,
                     delimiter_token=delimiter_token,
                     verbose=(rank == 0),
                     **kwargs,
