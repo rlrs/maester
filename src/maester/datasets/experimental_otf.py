@@ -203,6 +203,15 @@ class _Stateful_Dataset(data.IterableDataset):
         """
         os.makedirs(path, exist_ok=True)
         state = self.state_dict()
+
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            print(f"single process: {worker_info.id}, {worker_info.num_workers}")
+            print(state)
+        else:
+            print(f"worker process: {worker_info.id}, {worker_info.num_workers}")
+            print(state)
+        
         torch.save(state, os.path.join(path, f"loader_state_{self.rank}.pth"))
 
 
@@ -323,6 +332,7 @@ class Checkpoint_Dataset(_Wrapper_Dataset):
             if self.ministep == self.spb:
                 self.ministep = 0
                 self.step += 1
+                print(f"Checkpoint_Dataset: step {self.step} completed")
                 if self.step % self.interval == 0:
                     newpath = os.path.join(self.path, "step-" + str(self.step))
                     self.save_to_path(newpath)
@@ -408,6 +418,7 @@ class Preload_Buffer_Dataset(_Wrapper_Dataset):
             i = torch.randint(self.buffer_size, (1,), generator=self.generator).item()
             out = self.buffer[i]
             self.buffer[i] = next(dataset)
+            print(f"Preload_Buffer_Dataset: yielding from position {i}, first tokens: {out[:5]}...")
             yield out
 
     def _pad_buffer(self):
@@ -531,8 +542,10 @@ class Buffer_Dataset(_Wrapper_Dataset):
     def __iter__(self):
         dataset = iter(self.dataset)
         while True:
+            print(f"Buffer_Dataset: in the buffer before: {self.buffer}", flush=True)
             out, buffer = self._get_buffer(dataset, self.len, self.buffer)
             self.buffer = buffer
+            print(f"Buffer_Dataset: yielding (remaining buffer: {buffer}), first tokens: {out[:10]}...", flush=True)
             yield out
 
 
@@ -891,24 +904,50 @@ class ParquetDataset(_Stateful_Dataset):
         self.parquet_files.sort()  # Ensure consistent sharding across machines
         assert len(self.parquet_files) > 0, "No parquet files found in data directory"
 
-        # Gather per-file document counts
+        # Gather per-file document counts (TODO: cache for faster init?)
         total_rows = 0
         for file in self.parquet_files:
             parquet_file = pq.ParquetFile(file)
             num_rows = parquet_file.metadata.num_rows
             self.docs_per_file[file] = num_rows
-            self.docset.append((file, total_rows, total_rows + num_rows))
+            # self.docset.append((file, total_rows, total_rows + num_rows))
             total_rows += num_rows
         assert total_rows > 0, "No rows found in parquet files"
 
-        # Shard the total rows
-        self.start_row = (total_rows * rank) // worldsize
-        self.end_row = (total_rows * (rank + 1)) // worldsize
-        self._len = self.end_row - self.start_row
+        # Fragment the files
+        start_frag = (rank * worldsize * len(self.parquet_files)) // worldsize
+        end_frag = ((rank + 1) * worldsize * len(self.parquet_files)) // worldsize
+        shardfrags = [
+            (self.parquet_files[i // worldsize], i % worldsize) for i in range(start_frag, end_frag)
+        ]
+
+        # Read shardfrags, assemble doc list for each file shard (aggregating over fragments):
+        ndocs = -1
+        docset = {}  # shardid -> (min docid, max docid)
+        for i, (shard, frag) in enumerate(shardfrags):
+            ndocs = self.docs_per_file[shard]
+            doc_start = (ndocs * frag) // worldsize
+            doc_end = (ndocs * frag + ndocs) // worldsize - 1  # Inclusive upper bound
+            if shard not in docset:
+                docset[shard] = [doc_start, doc_end]
+            min_d, max_d = docset[shard]
+            if doc_start < min_d:
+                docset[shard][0] = doc_start
+            if doc_end > max_d:
+                docset[shard][1] = doc_end
+
+        # Add all of this dataset's shard entries to self.docset
+        doccount = 0
+        for shardid in docset:
+            min_d = docset[shardid][0]
+            max_d = docset[shardid][1]
+            self.docset.append((shardid, min_d, max_d))
+            doccount += max_d - min_d + 1
+        self._len = doccount
 
         if verbose:
             logging.info(f"Worker {rank} responsible for docs: {self.docset}")
-            logging.info(f"Total docs: {total_rows}")
+            logging.info(f"Total docs: {doccount}")
 
         # Shuffle files
         if shuffle:
@@ -935,10 +974,18 @@ class ParquetDataset(_Stateful_Dataset):
         ]
 
     def _get_docid(self, i):
+        """
+        Given a global doc index over the set of docs owned by this worker,
+        return the corresponding path, num rows
+        """
+        cur = 0
         assert i <= self._len, f"You have requested an illegal doc index {i}, docset length is {self._len}"
-        for file_path, start, end in self.docset:
-            if start <= i < end:
-                return file_path, i - start
+        for shardid, min_d, max_d in self.docset:
+            docrange = max_d - min_d + 1
+            cur += docrange
+            if cur > i:
+                return shardid, docrange, min_d
+        raise RuntimeError("This should be unreachable")
 
     def _get_reader(self, path, newpath, reader):
         if newpath != path:
@@ -962,6 +1009,7 @@ class ParquetDataset(_Stateful_Dataset):
                 start_index -= 1
         chunk = doc[start_index:start_index + n_pull]
         self.tokens_seen += len(chunk)
+        # Add bos/eos tokens if needed
         if self.bos is not None and j == 0:
             chunk = [self.bos] + chunk
         if j == n_chunks - 1:
@@ -1000,23 +1048,30 @@ class ParquetDataset(_Stateful_Dataset):
     def __iter__(self):
         docset_offset = self.docset_index
         lcg_offset = self.lcg_state
-        residual_chunks = self.chunk_index + 1
+        residual_chunks = self.chunk_index + 1 # pick up AFTER where the ckp left off
         ndocs = self._len
         path = ""
         reader = None
         while True:
             for i in range(ndocs):
-                docset_row = self._random_map_docid(self._len)
+                doc_index = (docset_offset + i) % ndocs
 
-                if i == 0:
+                # Update stats
+                if doc_index == 0:
                     self.epochs_seen += 1
                     if self.verbose:
-                        logging.info(f"Dataset entering epoch {self.epochs_seen}")
-                self.docset_index = i
-                
-                self.lcg_state = docset_row
+                        logging.info(f"ParquetDataset: entering epoch {self.epochs_seen}")
+                self.docset_index = doc_index
 
-                file_path, local_row = self._get_docid(docset_row)
+                # Map docset id to file, owned size and in-doc owned start idx
+                # This should be the same value many iters in a row, processing each shard
+                file_path, docrange, mindoc = self._get_docid(doc_index)
+
+                # Map docset ids to consistently shuffled ids
+                doclcg = self._random_map_docid(docrange) # shuffled in-doc range
+                local_row = doclcg + mindoc # map docid to local row
+                print(f"ParquetDataset: reading local_row {local_row} of {docrange}")
+                self.lcg_state = doclcg # update lcg state
                 
                 newpath = file_path
                 path, reader = self._get_reader(path, newpath, reader)
@@ -1038,16 +1093,19 @@ class ParquetDataset(_Stateful_Dataset):
                             pass
                         else:
                             self.chunk_index = j
+                            # Document complete, update stats
                             if j == n_chunks - 1:
                                 self.docs_seen += 1
                                 self.percent_seen = (self.docs_seen * 100 / (self._len + 1e-9))
-                            yield self._construct_chunk(j, doc, n_chunks)
+                            out = self._construct_chunk(j, doc, n_chunks)
+                            print(f"ParquetDataset: yielding chunk {j}/{n_chunks}, first tokens: {out[:5]}...")
+                            yield out
 
-            # Handle residual chunks from the first document
+            # Load any chunks initially skipped in first doc
             self.docset_index = docset_offset
             self.lcg_state = lcg_offset
-            docset_row = self._random_map_docid(self._len)
-            file_path, local_row = self._get_docid(docset_row)
+            file_path, docrange, mindoc = self._get_docid(docset_offset)
+            local_row = self._random_map_docid(docrange) + mindoc
             newpath = file_path
             path, reader = self._get_reader(path, newpath, reader)
             table = self._read_specific_row(reader, local_row)
@@ -1064,7 +1122,9 @@ class ParquetDataset(_Stateful_Dataset):
                 n_chunks = math.ceil(doclen / self.chunksize)
                 for j in range(residual_chunks):
                     self.chunk_index = j
-                    yield self._construct_chunk(j, doc, n_chunks)
+                    out = self._construct_chunk(j, doc, n_chunks)
+                    print(f"ParquetDataset: yielding chunk {j}/{n_chunks}, first tokens: {out[:5]}...")
+                    yield out
 
     def load_state_dict(self, state_dicts, sharded_input=False):
         assert self.load_worldsize == self.worldsize, f"ParquetDataset does not support rescaling: from {self.load_worldsize} to {self.worldsize}"
@@ -1152,6 +1212,7 @@ class Sampling_Dataset(_Stateful_Dataset):
                 # Finish current document
                 out = next(self.iterators[self.current_iterator])
                 self.tokens_seen[self.current_iterator] += len(out)
+                print(f"Sampling_Dataset: yielding from iterator {self.current_iterator}, tokens: {out[:5]}...")
                 if out[-1] == self.delimiter:
                     self.current_iterator = -1
                 yield out
@@ -1165,6 +1226,7 @@ class Sampling_Dataset(_Stateful_Dataset):
                 ]
                 offset_argmax = max((diff, i) for i, diff in enumerate(offset))[1]
                 self.current_iterator = offset_argmax
+                print(f"Sampling_Dataset: switched to iterator {self.current_iterator}")
 
     def state_dict(self):
         # Manually add state of all subloaders to self state
