@@ -889,6 +889,7 @@ class ParquetDataset(_Stateful_Dataset):
         # Get all Parquet files in the directory recursively
         self.parquet_files = [os.path.join(root, f) for root, _, files in os.walk(data_dir) for f in files if f.endswith('.parquet')]
         self.parquet_files.sort()  # Ensure consistent sharding across machines
+        assert len(self.parquet_files) > 0, "No parquet files found in data directory"
 
         # Gather per-file document counts
         total_rows = 0
@@ -898,6 +899,7 @@ class ParquetDataset(_Stateful_Dataset):
             self.docs_per_file[file] = num_rows
             self.docset.append((file, total_rows, total_rows + num_rows))
             total_rows += num_rows
+        assert total_rows > 0, "No rows found in parquet files"
 
         # Shard the total rows
         self.start_row = (total_rows * rank) // worldsize
@@ -1008,6 +1010,8 @@ class ParquetDataset(_Stateful_Dataset):
 
                 if i == 0:
                     self.epochs_seen += 1
+                    if self.verbose:
+                        logging.info(f"Dataset entering epoch {self.epochs_seen}")
                 self.docset_index = i
                 
                 self.lcg_state = docset_row
@@ -1020,9 +1024,6 @@ class ParquetDataset(_Stateful_Dataset):
                 table = self._read_specific_row(reader, local_row)
                 text = table['text'][0].as_py()
                 doc = self.tokenizer.encode(text, add_special_tokens=False, padding=False, truncation=False)
-
-                if self.verbose:
-                    logging.info(f"Worker {self.rank} processing document {i} (row {docset_row}), file: {file_path}")
 
                 if doc[0] in self.drop:
                     doc = doc[1:]
@@ -1066,7 +1067,7 @@ class ParquetDataset(_Stateful_Dataset):
                     yield self._construct_chunk(j, doc, n_chunks)
 
     def load_state_dict(self, state_dicts, sharded_input=False):
-        assert self.load_worldsize == self.worldsize, "ParquetDataset does not support rescaling."
+        assert self.load_worldsize == self.worldsize, f"ParquetDataset does not support rescaling: from {self.load_worldsize} to {self.worldsize}"
         return super().load_state_dict(state_dicts, sharded_input)
     
 class Sampling_Dataset(_Stateful_Dataset):

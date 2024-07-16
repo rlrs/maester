@@ -17,9 +17,11 @@ from torch.distributed._composable.fsdp import MixedPrecisionPolicy
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor.parallel import loss_parallel
+from transformers import AutoConfig
 
 from maester.checkpoint import CheckpointManager
-from maester.datasets import build_hf_data_loader, create_tokenizer, MosaicDataset, build_experimental_data_loader
+from maester.datasets import build_hf_data_loader, create_tokenizer, MosaicDataset
+from maester.datasets.experimental_otf import build_experimental_data_loader
 from maester.datasets.mosaic_dataset import MosaicDataLoader
 from maester.log_utils import init_logger, logger
 from maester.lr_scheduling import get_lr_scheduler
@@ -33,37 +35,39 @@ from maester.utils import (dist_max, dist_mean, get_num_flop_per_token, get_num_
                            init_distributed, set_pg_timeouts)
 
 class DatasetConfig(BaseModel):
-        data_logical_shards: int = 768
-        dataset_path: str = "./src/maester/datasets/experimental/llama3"
-        datasets: str = "test"
+        data_logical_shards: int = 1024
+        # dataset_path: str = "../fineweb-edu"
+        # datasets: str = "fineweb"
+        data_dirs: list[str] = ["../.cache/huggingface/hub/datasets--HuggingFaceFW--fineweb-edu/snapshots/5b89d1ea9319fe101b3cbdacd89a903aca1d6052/data/"]
         dataset_weights: str = "1"
-        bos_token: int = 128000
-        eos_token: int = 128001
+        bos_token: int = 1
+        eos_token: int = 2
         drop_tokens: str = ""
 
 class Config(BaseModel):
     model_config = ConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True)
 
     job_folder: str = "jobs/"
-    job_name: str = "mistral-debug"
+    job_name: str = "fineweb-1B-llama2"
 
     max_grad_norm: float = 1.0
     gc_freq: int = 4
     data_parallel_degree: int = -1
     tensor_parallel_degree: int = 1
     pipeline_parallel_degree: int = 1
-    train_batch_size: int = 2 # per device
-    train_num_epochs: int = 4
+    train_batch_size: int = 8 # per device; 4 * 8 gpus * 16 nodes * 4096 seqlen = 2.1M tokens per batch
+    train_num_steps: int = 25000
     compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
     enable_loss_parallel: bool = True
-    init_timeout_seconds: int = 300
-    train_timeout_seconds: int = 30
+    init_timeout_seconds: int = 120
+    train_timeout_seconds: int = 30 
 
     # datasets
     dataset: DatasetConfig = DatasetConfig()
+    tokenizer_name: str = "meta-llama/Llama-2-7b-hf"
     
     # logging/metrics
-    log_freq: int = 5
+    log_freq: int = 20
     log_rank0_only: bool = True
     save_tb_folder: str = "tb"
     enable_tensorboard: bool = False
@@ -73,34 +77,35 @@ class Config(BaseModel):
     # checkpointing
     enable_checkpoint: bool = True
     checkpoint_folder: str = "checkpoints"
-    checkpoint_interval: int = 400 # steps
+    checkpoint_interval: int = 5000 # steps
     model_weights_only: bool = True # just for the final weight export
     export_dtype: str = "bfloat16" # just for the final weight export
 
     # model
-    model_name: str = "mistral"
-    flavor: str = "debugmodel"
-    seq_len: int = 2048
+    model_name: str = "llama3"
+    flavor: str = "1B"
+    seq_len: int = 4096
     norm_type: str = "rmsnorm"
 
     # optimizer
     opt_class: Type[Any] = torch.optim.AdamW
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
-        lr = 1e-5, # initial lr
+        lr = 3e-4, # max lr, schedule reduces it at points
         betas = (0.9, 0.95),
-        foreach=True, # must be false for schedulefree, for some reason (this hurts performance)
-        # fused=False # can't get fused to work with FSDP2, would be fastest
+        # foreach=True, # foreach might work where fused doesn't
+        fused=True
     )
 
     # lr schedule
-    scheduler: str = "constant"
-    warmup_steps: int = 0
+    scheduler: str = "linear_warmup_constant_sqrt_decay"
+    warmup_steps: int = 200
+    cooldown_steps: int = 5000
 
     # fsdp
     mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
 
     # activation checkpointing
-    ac_mode: str = "selective" # "full" | "selective" | "none"
+    ac_mode: str = "none" # "full" | "selective" | "none"
     selective_ac_option: str | int = "op"
 
     # profiling
@@ -155,10 +160,7 @@ def main():
 
     world_mesh = parallel_dims.build_mesh(device_type="cuda")
 
-    # build tokenizer
-    tokenizer_type = model_name_to_tokenizer[cfg.model_name]
-    # tokenizer = create_tokenizer(tokenizer_type, job_config.model.tokenizer_path) # TODO: path
-    # tokenizer = create_tokenizer(tokenizer_type, "src/maester/datasets/tokenizer/original/tokenizer.model")
+    # hf_config = AutoConfig.from_pretrained(cfg.tokenizer_name) # for vocab size below TODO: fails on LUMI?
 
     # build model w/ meta init
     model_cls = model_name_to_cls[cfg.model_name]
@@ -168,8 +170,9 @@ def main():
     # 2. vocab size from tokenizer
     # 3. max_seq_len base on inputs
     model_config.norm_type = cfg.norm_type
-    model_config.vocab_size = 128256 # tokenizer.n_words # TODO
+    model_config.vocab_size = 32000 # hf_config.vocab_size
     model_config.max_seq_len = cfg.seq_len
+    # del hf_config # only needed for vocab size
 
     with torch.device("meta"):
         logger.info(
@@ -283,12 +286,13 @@ def main():
         # variables for metric logging
         losses_since_last_log: list[torch.Tensor] = []
         ntokens_since_last_log = 0
+        total_tokens = 0
         data_loading_times: list[float] = []
         time_last_log = timer()
         gpu_memory_monitor.reset_peak_stats()
 
         # while (epoch := train_state.step // dataset_steps_in_epoch) < cfg.train_num_epochs:
-        while train_state.step < cfg.train_num_epochs * 1000: # TODO: how do we set this?
+        while train_state.step < cfg.train_num_steps:
             train_state.step += 1
             torch.manual_seed(train_state.step + dp_rank) # seeding with dp_rank to ensure identical inputs for TP groups
             if train_state.step > 1 and train_state.step % cfg.gc_freq == 0:
@@ -339,6 +343,7 @@ def main():
                 
                 time_delta = timer() - time_last_log
 
+                total_tokens += ntokens_since_last_log
                 tps = ntokens_since_last_log / (time_delta * parallel_dims.model_parallel_size)
                 mfu = 100 * num_flop_per_token * tps / gpu_peak_flops
 
@@ -348,6 +353,7 @@ def main():
 
                 gpu_mem_stats = gpu_memory_monitor.get_peak_stats()
 
+                # TODO: add data metrics?
                 metrics = {
                     # "epoch": epoch,
                     "lr": scheduler.get_last_lr()[0],
@@ -356,6 +362,7 @@ def main():
                     "grad/norm": total_grad_norm, # TODO: does this need to be all-reduced?
                     "tps": tps,
                     "mfu(%)": mfu,
+                    "data/total_tokens": total_tokens * parallel_dims.model_parallel_size,
                     "time/end_to_end(s)": time_end_to_end,
                     "time/data_loading(s)": time_data_loading,
                     "time/data_loading(%)": time_data_loading_pct,
@@ -386,7 +393,7 @@ def main():
                 gpu_memory_monitor.reset_peak_stats()
 
             checkpoint.save(
-                train_state.step, force=(train_state.step == cfg.train_num_epochs*1000) # TODO: not a nice way to force?
+                train_state.step, force=(train_state.step == cfg.train_num_steps)
             )
             
             # signals the profiler that the next profiling step has started
