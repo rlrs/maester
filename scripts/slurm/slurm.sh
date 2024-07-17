@@ -2,13 +2,13 @@
 
 ##SBATCH --exclude=nid006865,nid005613,nid005988
 #SBATCH --job-name=maester
-#SBATCH --nodes=2
+#SBATCH --nodes=32
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=56
 #SBATCH --mem=0
 #SBATCH --partition=standard-g
-#SBATCH --time=0-01:00:00
-#SBATCH --gpus-per-node=mi250:8
+#SBATCH --time=2-00:00:00
+#SBATCH --gpus-per-node=8
 #SBATCH --exclusive=user
 #SBATCH --hint=nomultithread
 #SBATCH --account=project_465000670
@@ -35,11 +35,11 @@ export SINGULARITY_BIND="/opt/cray,/usr/lib64/libbrotlidec.so.1,/usr/lib64/libbr
 # These are some more custom exports
 export PROJECT_SCRATCH="/scratch/project_465000670"
 export PROJECT_FLASH="/flash/project_465000670"
-export SINGULARITY_BIND=/users/larsenra/aws-ofi-rccl/install:/opt/aws-ofi-rccl,/usr/lib64/libjitterentropy.so.3,${SINGULARITY_BIND}
+export SINGULARITY_BIND=${PROJECT_SCRATCH}/aws-ofi-rccl/install:/opt/aws-ofi-rccl,/usr/lib64/libjitterentropy.so.3,${SINGULARITY_BIND}
 export SINGULARITYENV_LD_LIBRARY_PATH=/opt/ompi/lib:${EBROOTAWSMINOFIMINRCCL}/lib:/opt/cray/xpmem/2.5.2-2.4_3.47__gd0f7936.shasta/lib64:/opt/aws-ofi-rccl/lib:${SINGULARITYENV_LD_LIBRARY_PATH}
 export SINGULARITY_BIND=$(echo $SINGULARITY_BIND | sed 's|,/usr/lib64/libssh.so.4||g') # do not bind host libssh which is built against a wrong libssl for some reason
 export LC_ALL=C
-# export HF_HOME="${PROJECT_SCRATCH}/.cache/huggingface"  # not using HF, hopefully
+export HF_HOME="${PROJECT_SCRATCH}/.cache/huggingface" 
 
 # values for distributed setup 
 GPUS_PER_NODE=$SLURM_GPUS_PER_NODE

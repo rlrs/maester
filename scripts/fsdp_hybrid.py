@@ -48,18 +48,18 @@ class Config(BaseModel):
     model_config = ConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True)
 
     job_folder: str = "jobs/"
-    job_name: str = "fineweb-1B-llama2"
+    job_name: str = "fineweb-1B-llama2-v2"
 
     max_grad_norm: float = 1.0
     gc_freq: int = 4
     data_parallel_degree: int = -1
     tensor_parallel_degree: int = 1
     pipeline_parallel_degree: int = 1
-    train_batch_size: int = 8 # per device; 4 * 8 gpus * 16 nodes * 4096 seqlen = 2.1M tokens per batch
-    train_num_steps: int = 25000
+    train_batch_size: int = 2 # per device; 2 * 8 gpus * 32 nodes * 4096 seqlen = 2.1M tokens per batch
+    train_num_steps: int = 50000  # 100B tokens
     compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
     enable_loss_parallel: bool = True
-    init_timeout_seconds: int = 120
+    init_timeout_seconds: int = 120 
     train_timeout_seconds: int = 30 
 
     # datasets
@@ -67,7 +67,7 @@ class Config(BaseModel):
     tokenizer_name: str = "meta-llama/Llama-2-7b-hf"
     
     # logging/metrics
-    log_freq: int = 20
+    log_freq: int = 5
     log_rank0_only: bool = True
     save_tb_folder: str = "tb"
     enable_tensorboard: bool = False
@@ -77,20 +77,20 @@ class Config(BaseModel):
     # checkpointing
     enable_checkpoint: bool = True
     checkpoint_folder: str = "checkpoints"
-    checkpoint_interval: int = 5000 # steps
+    checkpoint_interval: int = 5000 # ~10B tokens 
     model_weights_only: bool = True # just for the final weight export
     export_dtype: str = "bfloat16" # just for the final weight export
 
     # model
     model_name: str = "llama3"
-    flavor: str = "1B"
+    flavor: str = "1B-v2"
     seq_len: int = 4096
     norm_type: str = "rmsnorm"
 
     # optimizer
     opt_class: Type[Any] = torch.optim.AdamW
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
-        lr = 3e-4, # max lr, schedule reduces it at points
+        lr = 4e-4, # max lr, schedule reduces it at points
         betas = (0.9, 0.95),
         # foreach=True, # foreach might work where fused doesn't
         fused=True
@@ -301,6 +301,7 @@ def main():
             data_load_start = timer()
             batch = next(data_iterator)
             input_ids, labels = batch
+            # logger.info(f"step {train_state.step} training on input_ids (element 0) {input_ids[0, :]}")
             ntokens_since_last_log += labels.numel()
             data_loading_times.append(timer() - data_load_start)
 
@@ -362,7 +363,7 @@ def main():
                     "grad/norm": total_grad_norm, # TODO: does this need to be all-reduced?
                     "tps": tps,
                     "mfu(%)": mfu,
-                    "data/total_tokens": total_tokens * parallel_dims.model_parallel_size,
+                    "data/total_tokens": total_tokens * parallel_dims.dp,
                     "time/end_to_end(s)": time_end_to_end,
                     "time/data_loading(s)": time_data_loading,
                     "time/data_loading(%)": time_data_loading_pct,

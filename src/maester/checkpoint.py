@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections import OrderedDict
 import enum
 import os
 import pickle
@@ -109,7 +110,7 @@ class CheckpointManager:
             )
 
             self.folder = os.path.join(cfg.job_folder, cfg.job_name, cfg.checkpoint_folder)
-            self.interval_type = IntervalType.STEPS # really don't wanna save by seconds...
+            self.interval_type = IntervalType.STEPS
             self.interval = cfg.checkpoint_interval
             self.model_weights_only = cfg.model_weights_only
             self.export_dtype = DTYPE_MAP[cfg.export_dtype]
@@ -170,7 +171,13 @@ class CheckpointManager:
         if force and self.model_weights_only:
             # We update self.states to keep the model only.
             # After this update, self.states = {'tok_embeddings.weight':...,''layers.0.attention.wq.weight': ...}.
-            self.states = self.states["model"].state_dict()
+            # TODO: check what's going on here, I've seen self.states["model"] already being an OrderedDict...
+            if "model" in self.states:
+                if isinstance(self.states["model"], OrderedDict):
+                    logger.warning("CheckpointManager: For some reason, self.states['model'] is an OrderedDict...")
+                    self.states = self.states["model"]
+                else:
+                    self.states = self.states["model"].state_dict()
 
             if self.export_dtype != torch.float32:
                 self.states = {
@@ -211,8 +218,7 @@ class CheckpointManager:
         # We won't have optimizer states to load, if we are loading a seed checkpoint
         states = {"model": self.states["model"]} if step == 0 else self.states
         logger.info(f"Loading the checkpoint at step {step}, containing keys {states.keys()}")
-        # if "dataloader" in states:
-        #     next(iter(self.states["dataloader"].dataloader)) # FIXME: this is a hack to make sure the dataloader is initialized
+
         begin = time.monotonic()
         dcp.load(
             states,

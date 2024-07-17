@@ -8,12 +8,12 @@ cd /scratch/project_465000670/maester
 source .venv/bin/activate
 
 # Samuel's fix for apparent error in SLURM initialization 
-if [ $SLURM_LOCALID -eq 0 ]; then
-    rm -rf /dev/shm/*
-    rocm-smi || true
-else
-    sleep 2
-fi
+# if [ $SLURM_LOCALID -eq 0 ]; then
+#     rm -rf /dev/shm/*
+#     rocm-smi || true
+# else
+#     sleep 2
+# fi
 
 export NCCL_SOCKET_IFNAME=hsn0,hsn1,hsn2,hsn3
 export OMP_NUM_THREADS=1

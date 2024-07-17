@@ -10,7 +10,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
-import torch.utils.data as data
+import torch.utils.data
+
 from transformers import AutoTokenizer
 
 """
@@ -84,7 +85,7 @@ def _shard_inclusive(itemlist: List[Any], rank: int, worldsize: int) -> List[Any
     return itemlist[start:end]
 
 
-class _Stateful_Dataset(data.IterableDataset):
+class _Stateful_Dataset(torch.utils.data.IterableDataset):
     """
     Stub for stateful datasets, extends data.IterableDataset with state_dict methods.
     All subclasses should specify the params to be considered stateful or reshardable in the
@@ -204,13 +205,13 @@ class _Stateful_Dataset(data.IterableDataset):
         os.makedirs(path, exist_ok=True)
         state = self.state_dict()
 
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is None:
-            print(f"single process: {worker_info.id}, {worker_info.num_workers}")
-            print(state)
-        else:
-            print(f"worker process: {worker_info.id}, {worker_info.num_workers}")
-            print(state)
+        # worker_info = torch.utils.data.get_worker_info()
+        # if worker_info is None:
+        #     print(f"single process: {worker_info.id}, {worker_info.num_workers}")
+        #     print(state)
+        # else:
+        #     print(f"worker process: {worker_info.id}, {worker_info.num_workers}")
+        #     print(state)
         
         torch.save(state, os.path.join(path, f"loader_state_{self.rank}.pth"))
 
@@ -332,7 +333,7 @@ class Checkpoint_Dataset(_Wrapper_Dataset):
             if self.ministep == self.spb:
                 self.ministep = 0
                 self.step += 1
-                print(f"Checkpoint_Dataset: step {self.step} completed")
+                # print(f"Checkpoint_Dataset: step {self.step} completed")
                 if self.step % self.interval == 0:
                     newpath = os.path.join(self.path, "step-" + str(self.step))
                     self.save_to_path(newpath)
@@ -418,7 +419,7 @@ class Preload_Buffer_Dataset(_Wrapper_Dataset):
             i = torch.randint(self.buffer_size, (1,), generator=self.generator).item()
             out = self.buffer[i]
             self.buffer[i] = next(dataset)
-            print(f"Preload_Buffer_Dataset: yielding from position {i}, first tokens: {out[:5]}...")
+            # print(f"Preload_Buffer_Dataset: yielding from position {i}, first tokens: {out[:5]}...")
             yield out
 
     def _pad_buffer(self):
@@ -542,10 +543,10 @@ class Buffer_Dataset(_Wrapper_Dataset):
     def __iter__(self):
         dataset = iter(self.dataset)
         while True:
-            print(f"Buffer_Dataset: in the buffer before: {self.buffer}", flush=True)
+            # print(f"Buffer_Dataset: in the buffer before: {self.buffer}", flush=True)
             out, buffer = self._get_buffer(dataset, self.len, self.buffer)
             self.buffer = buffer
-            print(f"Buffer_Dataset: yielding (remaining buffer: {buffer}), first tokens: {out[:10]}...", flush=True)
+            # print(f"Buffer_Dataset: yielding (remaining buffer: {buffer}), first tokens: {out[:10]}...", flush=True)
             yield out
 
 
@@ -1048,7 +1049,7 @@ class ParquetDataset(_Stateful_Dataset):
     def __iter__(self):
         docset_offset = self.docset_index
         lcg_offset = self.lcg_state
-        residual_chunks = self.chunk_index + 1 # pick up AFTER where the ckp left off
+        residual_chunks = self.chunk_index # + 1 TODO: +1 was likely wrong here...
         ndocs = self._len
         path = ""
         reader = None
@@ -1070,7 +1071,7 @@ class ParquetDataset(_Stateful_Dataset):
                 # Map docset ids to consistently shuffled ids
                 doclcg = self._random_map_docid(docrange) # shuffled in-doc range
                 local_row = doclcg + mindoc # map docid to local row
-                print(f"ParquetDataset: reading local_row {local_row} of {docrange}")
+                # print(f"ParquetDataset: reading local_row {local_row} of {docrange}")
                 self.lcg_state = doclcg # update lcg state
                 
                 newpath = file_path
@@ -1098,7 +1099,7 @@ class ParquetDataset(_Stateful_Dataset):
                                 self.docs_seen += 1
                                 self.percent_seen = (self.docs_seen * 100 / (self._len + 1e-9))
                             out = self._construct_chunk(j, doc, n_chunks)
-                            print(f"ParquetDataset: yielding chunk {j}/{n_chunks}, first tokens: {out[:5]}...")
+                            # print(f"ParquetDataset: yielding chunk {j}/{n_chunks}, first tokens: {out[:5]}...")
                             yield out
 
             # Load any chunks initially skipped in first doc
@@ -1123,7 +1124,7 @@ class ParquetDataset(_Stateful_Dataset):
                 for j in range(residual_chunks):
                     self.chunk_index = j
                     out = self._construct_chunk(j, doc, n_chunks)
-                    print(f"ParquetDataset: yielding chunk {j}/{n_chunks}, first tokens: {out[:5]}...")
+                    # print(f"ParquetDataset: yielding chunk {j}/{n_chunks}, first tokens: {out[:5]}...")
                     yield out
 
     def load_state_dict(self, state_dicts, sharded_input=False):
@@ -1212,7 +1213,7 @@ class Sampling_Dataset(_Stateful_Dataset):
                 # Finish current document
                 out = next(self.iterators[self.current_iterator])
                 self.tokens_seen[self.current_iterator] += len(out)
-                print(f"Sampling_Dataset: yielding from iterator {self.current_iterator}, tokens: {out[:5]}...")
+                # print(f"Sampling_Dataset: yielding from iterator {self.current_iterator}, tokens: {out[:5]}...")
                 if out[-1] == self.delimiter:
                     self.current_iterator = -1
                 yield out
@@ -1226,7 +1227,7 @@ class Sampling_Dataset(_Stateful_Dataset):
                 ]
                 offset_argmax = max((diff, i) for i, diff in enumerate(offset))[1]
                 self.current_iterator = offset_argmax
-                print(f"Sampling_Dataset: switched to iterator {self.current_iterator}")
+                # print(f"Sampling_Dataset: switched to iterator {self.current_iterator}")
 
     def state_dict(self):
         # Manually add state of all subloaders to self state
