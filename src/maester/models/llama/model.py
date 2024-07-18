@@ -9,6 +9,7 @@
 
 
 from dataclasses import dataclass
+import itertools
 from typing import Optional, Tuple
 
 import torch
@@ -23,6 +24,7 @@ from maester.models.norms import create_norm
 class ModelArgs:
     dim: int = 4096
     n_layers: int = 32
+    n_future_tokens: int = 1
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
     vocab_size: int = -1  # defined later by tokenizer
@@ -361,8 +363,11 @@ class Transformer(nn.Module):
         model_args (ModelArgs): Model configuration arguments.
         vocab_size (int): Vocabulary size.
         n_layers (int): Number of layers in the model.
+        n_future_tokens (int): Number of prediction heads in the model (= 1 + `len(extra_heads)`).
         tok_embeddings (ParallelEmbedding): Token embeddings.
         layers (torch.nn.ModuleList): List of Transformer blocks.
+        extra_heads (torch.nn.ModuleList): List of Transformer blocks
+          (additional prediction heads for multi-token prediction).
         norm (RMSNorm): Layer normalization for the model output.
         output (ColumnParallelLinear): Linear layer for final output.
         freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
@@ -374,6 +379,7 @@ class Transformer(nn.Module):
         self.model_args = model_args
         self.vocab_size = model_args.vocab_size
         self.n_layers = model_args.n_layers
+        self.n_future_tokens = model_args.n_future_tokens
 
         self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
 
@@ -387,8 +393,14 @@ class Transformer(nn.Module):
         self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=False)
 
         self.layers = torch.nn.ModuleDict()
-        for layer_id in range(model_args.n_layers):
+        for layer_id in range(model_args.n_layers - model_args.n_future_tokens + 1):
             self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
+
+        # Additional prediction heads for multi-token prediction.
+        # `layer_id` counts contiguously from the first Transformer block.
+        self.extra_heads = torch.nn.ModuleDict()
+        for layer_id in range(self.n_layers - self.n_future_tokens + 1, self.n_layers):
+            self.extra_heads[str(layer_id)] = TransformerBlock(layer_id, model_args)
 
         self.norm = create_norm(
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
@@ -412,7 +424,7 @@ class Transformer(nn.Module):
         with torch.device(self.freqs_cis.device):
             self.freqs_cis = self._precompute_freqs_cis()
         nn.init.normal_(self.tok_embeddings.weight)
-        for layer in self.layers.values():
+        for layer in itertools.chain(self.layers.values(), self.extra_heads.values()):
             layer.init_weights()
         self.norm.reset_parameters()
         final_out_std = self.model_args.dim**-0.5
@@ -434,22 +446,55 @@ class Transformer(nn.Module):
             self.model_args.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor):
-        """
-        Perform a forward pass through the Transformer model.
-
-        Args:
-            tokens (torch.Tensor): Input token indices.
-
-        Returns:
-            torch.Tensor: Output logits after applying the Transformer model.
-
-        """
+    def trunk(self, tokens: torch.Tensor):
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
-        for layer in self.layers.values():
+        # Model trunk
+        for layer in list(self.layers.values())[:-1]:
             h = layer(h, self.freqs_cis)
+        return h
+
+    def head(self, idx: int, h_trunk: torch.Tensor):
+        # Prediction heads (both the last layer and all extras)
+        prediction_heads = [list(self.layers.values())[-1]] + list(self.extra_heads.values())
+        layer = prediction_heads[idx]
+        h = layer(h_trunk, self.freqs_cis) # (_bsz, seqlen, dim)
+        h = self.norm(h) if self.norm else h
+        output = self.output(h).float() if self.output else h
+        return output
+
+    def forward(self, tokens: torch.Tensor, return_all_heads: bool = False):
+        """
+        Perform a forward pass through the Transformer model.
+        It is not efficient to call this for training with return_all_heads=True.
+        Use `trunk` and `head` instead.
+
+        Args:
+            tokens (torch.Tensor): Input token indices.
+            return_all_heads (bool, optional): Whether to return logits
+              for all prediction heads. Defaults to False.
+
+        Returns:
+            torch.Tensor: Output logits after applying the Transformer model
+              of shape (batch_size, seq_len, n_future_tokens, vocab_size).
+
+        Note:
+            If return_all_heads is False, the output logits broadcast to
+            (batch_size, seq_len, vocab_size) and are compatible with standard
+            decoding.
+        """
+        h = self.trunk(tokens)
+        
+        # Prediction heads (both the last layer and all extras)
+        latents = []
+        prediction_heads = [list(self.layers.values())[-1]] + list(self.extra_heads.values())
+        n_heads_to_use = self.n_future_tokens if return_all_heads else 1
+        for layer in prediction_heads[:n_heads_to_use]:
+            h = layer(h, self.freqs_cis)
+            latents.append(h)
+        
+        h = torch.stack(latents, dim=-2) # (_bsz, seqlen, n_heads_to_use, dim)
         h = self.norm(h) if self.norm else h
         output = self.output(h).float() if self.output else h
         return output

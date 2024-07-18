@@ -228,3 +228,9 @@ class CheckpointManager:
             f"Finished loading the checkpoint in {time.monotonic() - begin:.2f} seconds"
         )
         return True
+    
+    def wait_for_staging(self) -> None:
+        """
+        To be implemented as part of async checkpointing.
+        """
+        pass
