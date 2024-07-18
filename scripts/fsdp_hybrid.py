@@ -441,15 +441,29 @@ def main():
 
                 # non-pp loss parallel, pp is not implemented
                 with loss_parallel_ctx():
-                    z = sharded_model.trunk(input_ids) # (bsz, seq_len, dim)
+                    z = sharded_model.trunk(input_ids, sharded_model.freqs_cis) # (bsz, seq_len, dim)
                     d = z.detach()
-                    for i in range(cfg.num_future_tokens):
-                        pred = sharded_model.head(i, input_ids)
+                    d.requires_grad_(True)
+                    # print(f"d shape: {d.shape}, requires_grad: {d.requires_grad}")
+
+                    for i, head in enumerate(sharded_model.heads.values()):
+                        h = head(d, sharded_model.freqs_cis)
+                        # print(f"h shape after head {i}: {h.shape}, requires_grad: {h.requires_grad}")
+                        h = sharded_model.norm(h)
+                        # print(f"h shape after norm {i}: {h.shape}, requires_grad: {h.requires_grad}")
+                        pred = sharded_model.output(h)
+                        # print(f"pred shape for head {i}: {pred.shape}, requires_grad: {pred.requires_grad}")
                         loss = loss_fn(pred, labels) # TODO: labels for num_future_tokens > 1
+                        # print(f"loss for head {i}: {loss.item()}, requires_grad: {loss.requires_grad}")
+
                         # pred.shape=(bs, seq_len, vocab_size)
                         # need to free before bwd to avoid peaking memory
-                        del pred
+                        del h, pred
                         loss.backward()
+                        # print(f"d.grad after head {i}: {d.grad is not None}, shape: {d.grad.shape if d.grad is not None else None}")
+
+                    # print(f"Final d.grad shape: {d.grad.shape if d.grad is not None else None}")
+                    # print(f"z grad_fn: {z.grad_fn}")
                     z.backward(gradient=d.grad)
 
 

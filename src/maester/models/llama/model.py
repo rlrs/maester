@@ -351,6 +351,33 @@ class TransformerBlock(nn.Module):
         self.attention.init_weights(self.weight_init_std)
         self.feed_forward.init_weights(self.weight_init_std)
 
+class TransformerTrunk(nn.Module):
+    def __init__(self, model_args: ModelArgs):
+        super().__init__()
+        self.model_args = model_args
+        self.vocab_size = model_args.vocab_size
+        self.n_layers = model_args.n_layers
+        self.n_future_tokens = model_args.n_future_tokens
+
+        self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
+
+        self.layers = torch.nn.ModuleDict()
+        for layer_id in range(model_args.n_layers - model_args.n_future_tokens): # do not build last layers
+            self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
+
+    def init_weights(self):
+        nn.init.normal_(self.tok_embeddings.weight)
+        for layer in self.layers.values():
+            layer.init_weights()
+
+    def forward(self, tokens: torch.Tensor, freqs_cis: torch.Tensor):
+        # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
+        h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
+
+        # Model trunk
+        for layer in self.layers.values():
+            h = layer(h, freqs_cis)
+        return h
 
 class Transformer(nn.Module):
     """
@@ -381,8 +408,6 @@ class Transformer(nn.Module):
         self.n_layers = model_args.n_layers
         self.n_future_tokens = model_args.n_future_tokens
 
-        self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
-
         # TODO persistent should be set to false, since this buffer can be recomputed.
         # however, we set it to true for 2 reasons.  (1) due to pytorch/pytorch#123411,
         # compile or pipeline-tracer will not correctly handle non-persistent buffers,
@@ -392,15 +417,13 @@ class Transformer(nn.Module):
         # just the non-persistent buffers that is called after loading checkpoints.
         self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=False)
 
-        self.layers = torch.nn.ModuleDict()
-        for layer_id in range(model_args.n_layers - model_args.n_future_tokens + 1):
-            self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
+        self.trunk = TransformerTrunk(model_args)
 
-        # Additional prediction heads for multi-token prediction.
+        # Prediction heads (both the last layer and all extras)
         # `layer_id` counts contiguously from the first Transformer block.
-        self.extra_heads = torch.nn.ModuleDict()
-        for layer_id in range(self.n_layers - self.n_future_tokens + 1, self.n_layers):
-            self.extra_heads[str(layer_id)] = TransformerBlock(layer_id, model_args)
+        self.heads = torch.nn.ModuleDict()
+        for layer_id in range(self.n_layers - self.n_future_tokens, self.n_layers):
+            self.heads[str(layer_id)] = TransformerBlock(layer_id, model_args)
 
         self.norm = create_norm(
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
@@ -423,8 +446,9 @@ class Transformer(nn.Module):
         """
         with torch.device(self.freqs_cis.device):
             self.freqs_cis = self._precompute_freqs_cis()
-        nn.init.normal_(self.tok_embeddings.weight)
-        for layer in itertools.chain(self.layers.values(), self.extra_heads.values()):
+        
+        self.trunk.init_weights()
+        for layer in self.heads.values():
             layer.init_weights()
         self.norm.reset_parameters()
         final_out_std = self.model_args.dim**-0.5
@@ -445,24 +469,6 @@ class Transformer(nn.Module):
             self.model_args.max_seq_len * 2,
             self.model_args.rope_theta,
         )
-
-    def trunk(self, tokens: torch.Tensor):
-        # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
-        h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
-
-        # Model trunk
-        for layer in list(self.layers.values())[:-1]:
-            h = layer(h, self.freqs_cis)
-        return h
-
-    def head(self, idx: int, h_trunk: torch.Tensor):
-        # Prediction heads (both the last layer and all extras)
-        prediction_heads = [list(self.layers.values())[-1]] + list(self.extra_heads.values())
-        layer = prediction_heads[idx]
-        h = layer(h_trunk, self.freqs_cis) # (_bsz, seqlen, dim)
-        h = self.norm(h) if self.norm else h
-        output = self.output(h).float() if self.output else h
-        return output
 
     def forward(self, tokens: torch.Tensor, return_all_heads: bool = False):
         """
