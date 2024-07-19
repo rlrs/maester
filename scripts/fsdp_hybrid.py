@@ -20,7 +20,8 @@ from torch.distributed.tensor.parallel import loss_parallel
 from transformers import AutoConfig
 
 from maester.checkpoint import CheckpointManager
-from maester.datasets import build_hf_data_loader, create_tokenizer, MosaicDataset
+from maester.datasets import (MosaicDataset, build_hf_data_loader,
+                              create_tokenizer)
 from maester.datasets.experimental_otf import build_experimental_data_loader
 from maester.datasets.mosaic_dataset import MosaicDataLoader
 from maester.log_utils import init_logger, logger
@@ -29,10 +30,12 @@ from maester.memory import cleanup_before_training
 from maester.metrics import build_gpu_memory_monitor, build_metric_logger
 from maester.models import (model_name_to_cls, model_name_to_tokenizer,
                             models_config)
-from maester.parallelize_llama import ParallelDims, parallelize_llama
+from maester.parallelisms import ParallelDims, parallelize_llama
 from maester.profiling import maybe_enable_profiling
-from maester.utils import (dist_max, dist_mean, get_num_flop_per_token, get_num_params, get_peak_flops,
-                           init_distributed, set_pg_timeouts)
+from maester.utils import (dist_max, dist_mean, get_num_flop_per_token,
+                           get_num_params, get_peak_flops, init_distributed,
+                           set_pg_timeouts)
+
 
 class DatasetConfig(BaseModel):
         data_logical_shards: int = 1024
@@ -52,6 +55,7 @@ class Config(BaseModel):
 
     max_grad_norm: float = 1.0
     gc_freq: int = 4
+    data_parallel_type: str = "fsdp"
     data_parallel_degree: int = -1
     tensor_parallel_degree: int = 1
     pipeline_parallel_degree: int = 1
@@ -92,6 +96,7 @@ class Config(BaseModel):
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
         lr = 4e-4, # max lr, schedule reduces it at points
         betas = (0.9, 0.95),
+        weight_decay=0.1,
         # foreach=True, # foreach might work where fused doesn't
         fused=True
     )
@@ -107,6 +112,10 @@ class Config(BaseModel):
     # activation checkpointing
     ac_mode: str = "none" # "full" | "selective" | "none"
     selective_ac_option: str | int = "op"
+
+    # experimental
+    enable_async_tensor_parallel: bool = False
+    enable_compiled_autograd: bool = False
 
     # profiling
     enable_profiling: bool = False
@@ -154,11 +163,19 @@ def main():
         pp=cfg.pipeline_parallel_degree,
         world_size=world_size,
         enable_loss_parallel=cfg.enable_loss_parallel,
+        dp_type=cfg.data_parallel_type,
     )
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     init_distributed(cfg)
 
+    # build meshes
     world_mesh = parallel_dims.build_mesh(device_type="cuda")
+    if parallel_dims.dp_enabled:
+        dp_mesh = world_mesh["dp"]
+        dp_degree = dp_mesh.size()
+        dp_rank = dp_mesh.get_local_rank()
+    else:
+        dp_degree, dp_rank = 1, 0
 
     # hf_config = AutoConfig.from_pretrained(cfg.tokenizer_name) # for vocab size below TODO: fails on LUMI?
 
@@ -213,12 +230,6 @@ def main():
 
 
     # build dataloader
-    if parallel_dims.dp_enabled:
-        dp_mesh = world_mesh["dp"]
-        dp_degree = dp_mesh.size()
-        dp_rank = dp_mesh.get_local_rank()
-    else:
-        dp_degree, dp_rank = 1, 0
     # data_loader = build_hf_data_loader(
     #     "c4_mini",
     #     "src/maester/datasets/c4_mini",
