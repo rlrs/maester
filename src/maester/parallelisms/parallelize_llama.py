@@ -209,23 +209,13 @@ def apply_compile(model: nn.Module, config):
             "fused_rmsnorm is not compatible with torch.compile yet. Please use rmsnorm or layernorm."
         )
 
-    # compile trunk layers
-    for layer_id, transformer_block in model.trunk.layers.items():
+    for layer_id, transformer_block in model.layers.items():
         # TODO: dynamic shape have some issues so we turn it off for now.
         # TODO: inline inbuilt nn modules does not work yet, enable it to accelarate
         # compile time.
         # torch._dynamo.config.inline_inbuilt_nn_modules = True
-        transformer_block = torch.compile(transformer_block, dynamic=False)
-        model.trunk.layers.register_module(layer_id, transformer_block)
-
-    # compile head layers
-    for layer_id, transformer_block in model.heads.items():
-        # TODO: dynamic shape have some issues so we turn it off for now.
-        # TODO: inline inbuilt nn modules does not work yet, enable it to accelarate
-        # compile time.
-        # torch._dynamo.config.inline_inbuilt_nn_modules = True
-        transformer_block = torch.compile(transformer_block, dynamic=False)
-        model.heads.register_module(layer_id, transformer_block)
+        transformer_block = torch.compile(transformer_block, fullgraph=True)
+        model.layers.register_module(layer_id, transformer_block)
 
     logger.info("Compiled each TransformerBlock with torch.compile")
     return model
