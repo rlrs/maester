@@ -209,12 +209,12 @@ def apply_compile(model: nn.Module, config):
             "fused_rmsnorm is not compatible with torch.compile yet. Please use rmsnorm or layernorm."
         )
 
-    for layer_id, transformer_block in model.layers.items():
+    for layer_id, transformer_block in model.layers.named_children():
         # TODO: dynamic shape have some issues so we turn it off for now.
         # TODO: inline inbuilt nn modules does not work yet, enable it to accelarate
         # compile time.
         # torch._dynamo.config.inline_inbuilt_nn_modules = True
-        transformer_block = torch.compile(transformer_block, fullgraph=True)
+        transformer_block = torch.compile(transformer_block, dynamic=False)
         model.layers.register_module(layer_id, transformer_block)
 
     logger.info("Compiled each TransformerBlock with torch.compile")
@@ -233,7 +233,7 @@ def apply_fsdp(
 
     # This mesh also includes cp degree if it is larger than 1.
     if parallel_dims.dp_type == "fsdp":
-        dp_mesh = world_mesh["dp"]
+        dp_mesh = world_mesh["dp"] if world_mesh.ndim > 1 else world_mesh
     else:
         assert parallel_dims.dp_type == "hsdp", parallel_dims.dp_type
         dp_mesh = world_mesh["dp"]
@@ -246,7 +246,7 @@ def apply_fsdp(
     mp_policy = config.mixed_precision_policy
     fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
 
-    for layer_id, transformer_block in model.layers.items():
+    for layer_id, transformer_block in model.layers.named_children():
         if parallel_dims.pp_enabled:
             # For PP, do not reshard after forward to avoid per-microbatch
             # all-gathers, which can be expensive and non-overlapped
