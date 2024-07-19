@@ -51,7 +51,7 @@ class Config(BaseModel):
     model_config = ConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True)
 
     job_folder: str = "jobs/"
-    job_name: str = "fineweb-1B-llama2-v2"
+    job_name: str = "fineweb-1B-llama2-testing"
 
     max_grad_norm: float = 1.0
     gc_freq: int = 4
@@ -89,7 +89,7 @@ class Config(BaseModel):
     model_name: str = "llama3"
     flavor: str = "1B-v2"
     seq_len: int = 4096
-    norm_type: str = "rmsnorm"
+    norm_type: str = "compiled_rmsnorm"
 
     # optimizer
     opt_class: Type[Any] = torch.optim.AdamW
