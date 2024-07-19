@@ -1,4 +1,6 @@
 import csv
+import hashlib
+import json
 import logging
 import math
 import os
@@ -10,6 +12,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
+import torch.distributed as dist
 import torch.utils.data
 
 from transformers import AutoTokenizer
@@ -905,15 +908,32 @@ class ParquetDataset(_Stateful_Dataset):
         self.parquet_files.sort()  # Ensure consistent sharding across machines
         assert len(self.parquet_files) > 0, "No parquet files found in data directory"
 
-        # Gather per-file document counts (TODO: cache for faster init?)
-        total_rows = 0
-        for file in self.parquet_files:
-            parquet_file = pq.ParquetFile(file)
-            num_rows = parquet_file.metadata.num_rows
-            self.docs_per_file[file] = num_rows
-            # self.docset.append((file, total_rows, total_rows + num_rows))
-            total_rows += num_rows
-        assert total_rows > 0, "No rows found in parquet files"
+        dataset_hash = self._generate_dataset_hash()
+        cache_file = os.path.join(data_dir, f"doc_counts_cache_{dataset_hash}.json")
+        sync_file = os.path.join(data_dir, f"sync_{dataset_hash}.tmp")
+
+        # Rank 0 handles file I/O, other ranks wait
+        if self.rank == 0:
+            if not os.path.exists(cache_file):
+                self._gather_doc_counts()
+                self._save_cached_doc_counts(cache_file)
+            
+            # Create sync file to signal completion
+            with open(sync_file, 'w') as f:
+                f.write('done')
+        else:
+            # Other ranks wait for sync file
+            while not os.path.exists(sync_file):
+                time.sleep(0.1)
+        
+        # All ranks load the cache
+        self._load_cached_doc_counts(cache_file)
+
+        dist.barrier() # ensure no ranks are stuck in the loop above
+
+        # Remove sync file
+        if self.rank == 0:
+            os.remove(sync_file)
 
         # Fragment the files
         start_frag = (rank * worldsize * len(self.parquet_files)) // worldsize
@@ -973,6 +993,39 @@ class ParquetDataset(_Stateful_Dataset):
             "percent_seen",
             "lcg_state",
         ]
+
+    def _generate_dataset_hash(self):
+        """Generate a unique hash for the dataset based on file names and sizes."""
+        hasher = hashlib.md5()
+        for file in self.parquet_files:
+            hasher.update(file.encode())
+            hasher.update(str(os.path.getsize(file)).encode())
+        return hasher.hexdigest()
+
+    def _load_cached_doc_counts(self, cache_file):
+        """Load cached document counts from a file."""
+        start = time.time()
+        with open(cache_file, 'r') as f:
+            self.docs_per_file = json.load(f)
+        logging.info(f"Loaded cached document counts in {time.time() - start} seconds")
+
+    def _save_cached_doc_counts(self, cache_file):
+        """Save document counts to a cache file."""
+        with open(cache_file, 'w') as f:
+            json.dump(self.docs_per_file, f)
+        logging.info(f"Saved document counts cache to {cache_file}")
+
+    def _gather_doc_counts(self):
+        """Gather document counts for each Parquet file."""
+        start = time.time()
+        total_rows = 0
+        for file in self.parquet_files:
+            parquet_file = pq.ParquetFile(file)
+            num_rows = parquet_file.metadata.num_rows
+            self.docs_per_file[file] = num_rows
+            total_rows += num_rows
+        assert total_rows > 0, "No rows found in parquet files"
+        logging.info(f"Gathered {total_rows} rows in {time.time() - start} seconds")
 
     def _get_docid(self, i):
         """
