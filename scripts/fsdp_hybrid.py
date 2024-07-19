@@ -171,7 +171,7 @@ class Config(BaseModel):
     # model
     model_name: str = "llama3"
     flavor: str = "1B-v2"
-    num_future_tokens: int = 1
+    num_future_tokens: int = 4
     seq_len: int = 4096
     norm_type: str = "rmsnorm"
 
