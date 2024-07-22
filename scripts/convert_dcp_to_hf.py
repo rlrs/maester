@@ -83,6 +83,8 @@ if __name__ == "__main__":
     )
     if 'model' in sd: # model-only checkpoints do not have this
         sd = sd['model']
+    sd = {k.replace('._orig_mod', ''): v for k, v in sd.items()} # fix '_orig_mod' thing...
+    print(f"SD keys: {list(sd.keys())}")
     if args.type == "hf":
         # Build and save HF Config
         print('#' * 30)
@@ -94,6 +96,7 @@ if __name__ == "__main__":
         hf_config.num_hidden_layers = max([int(re.search(r'layers.(\d+)', k).group(1)) for k in sd.keys() if 'layers' in k]) + 1
         hf_config.hidden_size = sd['layers.0.attention.wq.weight'].shape[0]
         hf_config.num_attention_heads = 32 # TODO: read all these from a config
+        hf_config.num_key_value_heads = 8
         hf_config.intermediate_size = sd['layers.0.feed_forward.w1.weight'].shape[0]
         hf_config.vocab_size = sd['tok_embeddings.weight'].shape[0]
         hf_config.bos_token_id = hf_tokenizer.bos_token_id
@@ -137,8 +140,8 @@ if __name__ == "__main__":
         }
         final_result = {}
 
-        # permute for sliced rotary TODO: there is a chance that this is needed, but currently unused
-        def permute(w, n_heads, dim1, dim2):
+        # permute for sliced rotary
+        def permute(w, n_heads, dim1=hf_config.hidden_size, dim2=hf_config.hidden_size):
             return w.view(n_heads, dim1 // n_heads // 2, 2, dim2).transpose(1, 2).reshape(dim1, dim2)
     
         for key, value in weights_state_dict.items():
@@ -151,6 +154,12 @@ if __name__ == "__main__":
                 new_key = new_key.format(layer_num)
             else:
                 new_key = weight_map[key]
+
+            if "q_proj" in new_key:
+                value = permute(value, hf_config.num_attention_heads)
+            elif "k_proj" in new_key:
+                key_value_dim = (hf_config.hidden_size // hf_config.num_attention_heads) * hf_config.num_key_value_heads
+                value = permute(value, hf_config.num_key_value_heads, dim1=key_value_dim)
 
             final_result[new_key] = value
 
