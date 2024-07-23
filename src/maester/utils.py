@@ -8,6 +8,7 @@ import os
 from datetime import timedelta
 
 import torch
+import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
 from torch.distributed.device_mesh import DeviceMesh
@@ -46,17 +47,15 @@ def set_pg_timeouts(timeout, world_mesh):
     # otherwise, some ranks may issue collectives with the new/shorter timeout and
     # those may time out, before other ranks have finished with initialization done
     # under the old/slow timeout.
-    torch.distributed.barrier()
+    dist.barrier()
     torch.cuda.synchronize()
 
-    groups = (
-        [world_mesh.get_group()] if world_mesh.ndim == 1 else world_mesh.get_group()
-    )
+    groups = [world_mesh.get_group(mesh_dim) for mesh_dim in range(world_mesh.ndim)]
 
     # None represents the 'default' PG, not part of the mesh
     groups.append(None)
     for group in groups:
-        torch.distributed.distributed_c10d._set_pg_timeout(timeout, group)
+        dist.distributed_c10d._set_pg_timeout(timeout, group)
 
 
 def get_num_params(model: torch.nn.Module, exclude_embedding: bool = False) -> int:

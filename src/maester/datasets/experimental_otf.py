@@ -913,7 +913,7 @@ class ParquetDataset(_Stateful_Dataset):
         sync_file = os.path.join(data_dir, f"sync_{dataset_hash}.tmp")
 
         # Rank 0 handles file I/O, other ranks wait
-        if self.rank == 0:
+        if dist.get_rank() == 0:
             if not os.path.exists(cache_file):
                 self._gather_doc_counts()
                 self._save_cached_doc_counts(cache_file)
@@ -932,7 +932,7 @@ class ParquetDataset(_Stateful_Dataset):
         dist.barrier() # ensure no ranks are stuck in the loop above
 
         # Remove sync file
-        if self.rank == 0:
+        if dist.get_rank() == 0:
             os.remove(sync_file)
 
         # Fragment the files
