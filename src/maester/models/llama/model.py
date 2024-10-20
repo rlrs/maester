@@ -14,7 +14,11 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-from flash_attn import flash_attn_func
+# from maester.models.flash_attn_op import flash_attn_func
+try:
+    from flash_attn import flash_attn_func
+except:
+    pass
 
 from maester.models.norms import create_norm
 
@@ -35,7 +39,7 @@ class ModelArgs:
     max_seq_len: int = 2048
     # If `True`, then each transformer block init uses its layer ID, and if
     # `False`, each uses the total number of transformer blocks
-    depth_init: bool = True
+    depth_init: bool = False
     norm_type: str = "rmsnorm"
 
 
@@ -114,11 +118,11 @@ def apply_rotary_emb(
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    
+
     # add this to match HF rope
     # xq_out = torch.cat([xq_out[..., ::2], xq_out[..., 1::2]], dim=-1)
     # xk_out = torch.cat([xk_out[..., ::2], xk_out[..., 1::2]], dim=-1)
-    
+
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -175,8 +179,8 @@ class Attention(nn.Module):
 
     def init_weights(self, init_std: float):
         for linear in (self.wq, self.wk, self.wv):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+            nn.init.normal_(linear.weight, mean=0.0, std=init_std)
+        nn.init.normal_(self.wo.weight, mean=0.0, std=init_std)
 
     def forward(
         self,
@@ -203,7 +207,7 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        if False: # use sdpa
+        if True: # use sdpa
             # repeat k/v heads if n_kv_heads < n_heads
             keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_heads, head_dim)
             values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_heads, head_dim)
@@ -272,9 +276,9 @@ class FeedForward(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
     def init_weights(self, init_std: float):
-        nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.w1.weight, mean=0.0, std=init_std)
         for linear in (self.w2, self.w3):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
+            nn.init.normal_(linear.weight, mean=0.0, std=init_std)
 
 
 class TransformerBlock(nn.Module):
@@ -321,7 +325,7 @@ class TransformerBlock(nn.Module):
         if model_args.depth_init:
             self.weight_init_std = 0.02 / (2 * (self.layer_id + 1)) ** 0.5
         else:
-            self.weight_init_std = 0.02 / (2 * self.num_layers) ** 0.5
+            self.weight_init_std = 1. / model_args.dim
 
     def forward(
         self,
@@ -415,14 +419,11 @@ class Transformer(nn.Module):
         for layer in self.layers.values():
             layer.init_weights()
         self.norm.reset_parameters()
-        final_out_std = self.model_args.dim**-0.5
-        cutoff_factor = 3
-        nn.init.trunc_normal_(
+        readout_std = 1. / self.model_args.dim
+        nn.init.normal_(
             self.output.weight,
             mean=0.0,
-            std=final_out_std,
-            a=-cutoff_factor * final_out_std,
-            b=cutoff_factor * final_out_std,
+            std=readout_std,
         )
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
@@ -451,7 +452,7 @@ class Transformer(nn.Module):
         for layer in self.layers.values():
             h = layer(h, self.freqs_cis)
         h = self.norm(h) if self.norm else h
-        output = self.output(h).float() if self.output else h
+        output = self.output(h).float() if self.output else h # TODO: fuse this with CrossEntropyLoss?
         return output
 
     @classmethod

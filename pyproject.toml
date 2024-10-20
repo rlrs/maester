@@ -17,7 +17,9 @@ dependencies = [
     "tiktoken",
     "blobfile",
     "sentencepiece",
-    "pydantic"
+    "pydantic",
+    "mosaicml-streaming",
+    "tensorboard"
 ]
 readme = "README.md"
 requires-python = ">= 3.10"
@@ -45,3 +47,7 @@ url = "https://download.pytorch.org/whl/nightly/cu121"
 [tool.pylint."MESSAGES CONTROL"]
 max-line-length = 120
 disable = ["missing-class-docstring"]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
