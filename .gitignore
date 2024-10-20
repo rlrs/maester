@@ -6,5 +6,18 @@ dist/
 wheels/
 *.egg-info
 
+.vscode/
+.pytest_cache/
+.ruff_cache/
+
+core
+
 # venv
 .venv
+
+logs/
+separate-logs/
+*.distcp
+jobs/**/*.pth
+
+wandb/
