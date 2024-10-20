@@ -1133,6 +1133,9 @@ class ParquetDataset(_Stateful_Dataset):
                 table = self._read_specific_row(reader, local_row)
                 text = table['text'][0].as_py()
                 doc = self.tokenizer.encode(text, add_special_tokens=False, padding=False, truncation=False)
+                if len(doc) < 2:
+                    logging.warning(f"Empty document detected at {file_path}:{local_row}")
+                    continue
 
                 if doc[0] in self.drop:
                     doc = doc[1:]
@@ -1152,7 +1155,7 @@ class ParquetDataset(_Stateful_Dataset):
                                 self.docs_seen += 1
                                 self.percent_seen = (self.docs_seen * 100 / (self._len + 1e-9))
                             out = self._construct_chunk(j, doc, n_chunks)
-                            # print(f"ParquetDataset: yielding chunk {j}/{n_chunks}, first tokens: {out[:5]}...")
+                            # print(f"ParquetDataset: yielding chunk {j}/{n_chunks}, length {len(out)}, first tokens: {out[:5]}...")
                             yield out
 
             # Load any chunks initially skipped in first doc
