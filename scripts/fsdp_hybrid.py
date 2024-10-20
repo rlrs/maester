@@ -37,11 +37,11 @@ from maester.utils import (dist_max, dist_mean, get_num_flop_per_token,
 
 
 class DatasetConfig(BaseModel):
-        data_logical_shards: int = 1024
+        data_logical_shards: int = 32
         # dataset_path: str = "../fineweb-edu"
         # datasets: str = "fineweb"
         data_dirs: list[str] = [
-                                "../.cache/huggingface/hub/datasets--HuggingFaceFW--fineweb-edu/snapshots/651a648da38bf545cc5487530dbf59d8168c8de3/data/",
+                                "data/",
                                 # "../2024-v1/parquet/"
                                 ]
         dataset_weights: str = "1"
@@ -53,7 +53,7 @@ class Config(BaseModel):
     model_config = ConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True)
 
     job_folder: str = "jobs/"
-    job_name: str = "llama-70B-test"
+    job_name: str = "llama-1B-test"
 
     max_grad_norm: float = 1.0
     gc_freq: int = 4
@@ -61,8 +61,8 @@ class Config(BaseModel):
     data_parallel_replicate_degree: int = 1
     tensor_parallel_degree: int = 1
     pipeline_parallel_degree: int = 1 # not implemented
-    train_batch_size: int = 1 # per device; 2 * 8 gpus * 32 nodes * 4096 seqlen = 2.1M tokens per batch
-    train_num_steps: int = 50000  # ~200B tokens
+    train_batch_size: int = 4 # per device; 2 * 8 gpus * 32 nodes * 4096 seqlen = 2.1M tokens per batch
+    train_num_steps: int = 1000  # ~200B tokens
     compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
     enable_loss_parallel: bool = True
     init_timeout_seconds: int = 120
@@ -70,7 +70,7 @@ class Config(BaseModel):
 
     # datasets
     dataset: DatasetConfig = DatasetConfig()
-    tokenizer_name: str = "meta-llama/Llama-3.1-8B"
+    tokenizer_name: str = "meta-llama/Llama-2-7B"
 
     # logging/metrics
     log_freq: int = 10
@@ -89,14 +89,14 @@ class Config(BaseModel):
 
     # model
     model_name: str = "llama3"
-    flavor: str = "70B"
+    flavor: str = "500M"
     seq_len: int = 2048
     norm_type: str = "compiled_rmsnorm"
 
     # optimizer
     opt_class: Type[Any] = torch.optim.AdamW
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
-        lr = 3e-4, # max lr, schedule reduces it at points
+        lr = 3e-5, # max lr, schedule reduces it at points
         betas = (0.9, 0.95),
         weight_decay=0.1,
         eps=1e-8,
@@ -110,17 +110,17 @@ class Config(BaseModel):
 
     # lr schedule
     scheduler: str = "linear_warmup_constant_sqrt_decay"
-    warmup_steps: int = 200
+    warmup_steps: int = 400
     cooldown_steps: int = 10000
     #scheduler: str = "linear_warmup_cosine"
     #warmup_steps: int = 200
 
     # fsdp
-    mixed_precision_param: torch.dtype = torch.bfloat16
+    mixed_precision_param: torch.dtype = torch.float16
     mixed_precision_reduce: torch.dtype = torch.float32
 
     # activation checkpointing
-    ac_mode: str = "full" # "full" | "selective" | "none"
+    ac_mode: str = "selective" # "full" | "selective" | "none"
     selective_ac_option: str | int = "op"
 
     # experimental
@@ -128,8 +128,8 @@ class Config(BaseModel):
     enable_compiled_autograd: bool = True
 
     # profiling
-    enable_profiling: bool = True
-    enable_memory_snapshot: bool = True
+    enable_profiling: bool = False
+    enable_memory_snapshot: bool = False
     traces_folder: str = "traces"
     memory_snapshot_folder: str = "snapshots"
     profile_freq: int = 10
@@ -206,7 +206,7 @@ def main():
         # 2. vocab size from tokenizer
         # 3. max_seq_len base on inputs
         model_config.norm_type = cfg.norm_type
-        model_config.vocab_size = 128256 # TODO: automatically set this
+        model_config.vocab_size = 32000 # 128256 # TODO: automatically set this
         model_config.max_seq_len = cfg.seq_len
         # del hf_config # only needed for vocab size
 
@@ -273,13 +273,13 @@ def main():
 
         # build optimizer after model parallelization
         # optimizer: torch.optim.Optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg)
-        # optimizer: torch.optim.Optimizer = cfg.opt_class([
-        #     {'params': sharded_model.tok_embeddings.parameters(), 'lr': cfg.embedding_lr_mul * cfg.opt_cfg['lr']},
-        #     {'params': sharded_model.layers.parameters(), 'lr': cfg.hidden_lr_mul * cfg.opt_cfg['lr'] * (sharded_model.model_args.dim / cfg.base_lr_dim)**-1},
-        #     {'params': sharded_model.norm.parameters(), 'lr': cfg.hidden_lr_mul * cfg.opt_cfg['lr'] * (sharded_model.model_args.dim / cfg.base_lr_dim)**-1},
-        #     {'params': sharded_model.output.parameters(), 'lr': cfg.readout_lr_mul * cfg.opt_cfg['lr'] * (sharded_model.model_args.dim / cfg.base_lr_dim)**-1},
-        # ], **cfg.opt_cfg)
-        # scheduler = get_lr_scheduler(optimizer, cfg)
+        optimizer: torch.optim.Optimizer = cfg.opt_class([
+            {'params': model.tok_embeddings.parameters(), 'lr': cfg.embedding_lr_mul * cfg.opt_cfg['lr']},
+            {'params': model.layers.parameters(), 'lr': cfg.hidden_lr_mul * cfg.opt_cfg['lr'] * (model.model_args.dim / cfg.base_lr_dim)**-1},
+            {'params': model.norm.parameters(), 'lr': cfg.hidden_lr_mul * cfg.opt_cfg['lr'] * (model.model_args.dim / cfg.base_lr_dim)**-1},
+            {'params': model.output.parameters(), 'lr': cfg.readout_lr_mul * cfg.opt_cfg['lr'] * (model.model_args.dim / cfg.base_lr_dim)**-1},
+        ], **cfg.opt_cfg)
+        scheduler = get_lr_scheduler(optimizer, cfg)
 
         metric_logger = build_metric_logger(cfg)
 
@@ -295,14 +295,14 @@ def main():
         # training loop
         cleanup_before_training()
         model.train()
-        # if hasattr(optimizer, 'train'): # some optimizers need to be put in train mode (e.g. schedule free)
-        #     optimizer.train() # type: ignore (.train obviously exists)
+        if hasattr(optimizer, 'train'): # some optimizers need to be put in train mode (e.g. schedule free)
+            optimizer.train() # type: ignore (.train obviously exists)
 
         # checkpointing
         checkpoint = CheckpointManager(
             model=model,
-            optimizer=None,#optimizer,
-            lr_scheduler=None,#scheduler,
+            optimizer=optimizer,
+            lr_scheduler=scheduler,
             dataloader=data_loader,
             states={"train_state": train_state},
             cfg=cfg,
@@ -344,7 +344,7 @@ def main():
                 input_ids = input_ids.cuda()
                 labels = labels.cuda()
 
-                # optimizer.zero_grad()
+                optimizer.zero_grad()
 
                 # non-pp loss parallel, pp is not implemented
                 with loss_parallel_ctx():
@@ -358,8 +358,8 @@ def main():
                 total_grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), cfg.max_grad_norm, foreach=True
                 )
-                # optimizer.step()
-                # scheduler.step()
+                optimizer.step()
+                scheduler.step()
 
                 losses_since_last_log.append(loss)
 
@@ -398,7 +398,7 @@ def main():
                         "grad/norm": total_grad_norm,
                         "tps": tps,
                         "mfu(%)": mfu,
-                        "data/total_tokens": total_tokens * parallel_dims.dp,
+                        "data/total_tokens": total_tokens * parallel_dims.dp_shard * parallel_dims.dp_replicate,
                         "time/end_to_end(s)": time_end_to_end,
                         "time/data_loading(s)": time_data_loading,
                         "time/data_loading(%)": time_data_loading_pct,
@@ -409,13 +409,13 @@ def main():
                         "memory/num_alloc_retries": gpu_mem_stats.num_alloc_retries,
                         "memory/num_ooms": gpu_mem_stats.num_ooms,
                     }
-                    # for i in range(len(optimizer.param_groups)):
-                    #     metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
+                    for i in range(len(optimizer.param_groups)):
+                        metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
                     metric_logger.log(metrics, step=train_state.step)
 
                     logger.info(
                         f"Step {train_state.step:2}: "
-                        # f"lr={scheduler.get_last_lr()[0]:7.4f}, "
+                        f"lr={scheduler.get_last_lr()[0]:7.4f}, "
                         f"loss={global_avg_loss:7.4f} (max={global_max_loss:7.4f}), "
                         f"tps={round(tps):}, "
                         f"mfu={mfu:.2f}%, "
