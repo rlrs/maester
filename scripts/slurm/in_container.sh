@@ -3,7 +3,7 @@
 set -euxo pipefail
 
 # script starts with pwd in the users home directory, so we need to cd to our repo
-cd /scratch/project_465000670/maester
+cd /scratch/project_465000954/maester
 
 source .venv/bin/activate
 
