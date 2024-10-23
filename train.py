@@ -5,18 +5,16 @@ import time
 from dataclasses import dataclass
 from datetime import timedelta
 from timeit import default_timer as timer
-from typing import Any, Type
+from typing import Any
+import json
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from pydantic import BaseModel, ConfigDict, Field
-from schedulefree import AdamWScheduleFree
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor.parallel import loss_parallel
-from transformers import AutoConfig
 
 from maester.checkpoint import CheckpointManager
 # from maester.datasets import (MosaicDataset, build_hf_data_loader,
@@ -34,106 +32,7 @@ from maester.profiling import maybe_enable_profiling, maybe_enable_memory_snapsh
 from maester.utils import (dist_max, dist_mean, get_num_flop_per_token,
                            get_num_params, get_peak_flops, init_distributed,
                            set_pg_timeouts)
-
-
-class DatasetConfig(BaseModel):
-        data_logical_shards: int = 32
-        # dataset_path: str = "../fineweb-edu"
-        # datasets: str = "fineweb"
-        data_dirs: list[str] = [
-                                "data/",
-                                # "../2024-v1/parquet/"
-                                ]
-        dataset_weights: str = "1"
-        bos_token: int = 1
-        eos_token: int = 2
-        drop_tokens: str = ""
-
-class Config(BaseModel):
-    model_config = ConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True)
-
-    job_folder: str = "jobs/"
-    job_name: str = "llama-1B-test"
-
-    max_grad_norm: float = 1.0
-    gc_freq: int = 4
-    data_parallel_shard_degree: int = -1
-    data_parallel_replicate_degree: int = 1
-    tensor_parallel_degree: int = 1
-    pipeline_parallel_degree: int = 1 # not implemented
-    train_batch_size: int = 4 # per device; 2 * 8 gpus * 32 nodes * 4096 seqlen = 2.1M tokens per batch
-    train_num_steps: int = 1000  # ~200B tokens
-    compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
-    enable_loss_parallel: bool = True
-    init_timeout_seconds: int = 120
-    train_timeout_seconds: int = 60
-
-    # datasets
-    dataset: DatasetConfig = DatasetConfig()
-    tokenizer_name: str = "meta-llama/Llama-2-7B"
-
-    # logging/metrics
-    log_freq: int = 10
-    log_rank0_only: bool = True
-    save_tb_folder: str = "tb"
-    enable_tensorboard: bool = False
-    enable_wandb: bool = True
-    wandb_entity: str = "danish-foundation-models"
-
-    # checkpointing
-    enable_checkpoint: bool = True
-    checkpoint_folder: str = "checkpoints"
-    checkpoint_interval: int = 5000 # ~20B tokens
-    model_weights_only: bool = True # just for the final weight export
-    export_dtype: str = "bfloat16" # just for the final weight export
-
-    # model
-    model_name: str = "llama3"
-    flavor: str = "500M"
-    seq_len: int = 2048
-    norm_type: str = "compiled_rmsnorm"
-
-    # optimizer
-    opt_class: Type[Any] = torch.optim.AdamW
-    opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
-        lr = 3e-5, # max lr, schedule reduces it at points
-        betas = (0.9, 0.95),
-        weight_decay=0.1,
-        eps=1e-8,
-        # foreach=True, # foreach might work where fused doesn't
-        fused=True
-    )
-    embedding_lr_mul: float = 4.0
-    hidden_lr_mul: float = 1.0
-    readout_lr_mul: float = 2.0
-    base_lr_dim: int = 2048 # the model_dim used for tuning lr multipliers
-
-    # lr schedule
-    scheduler: str = "linear_warmup_constant_sqrt_decay"
-    warmup_steps: int = 400
-    cooldown_steps: int = 10000
-    #scheduler: str = "linear_warmup_cosine"
-    #warmup_steps: int = 200
-
-    # fsdp
-    mixed_precision_param: torch.dtype = torch.float16
-    mixed_precision_reduce: torch.dtype = torch.float32
-
-    # activation checkpointing
-    ac_mode: str = "selective" # "full" | "selective" | "none"
-    selective_ac_option: str | int = "op"
-
-    # experimental
-    enable_async_tensor_parallel: bool = False
-    enable_compiled_autograd: bool = True
-
-    # profiling
-    enable_profiling: bool = False
-    enable_memory_snapshot: bool = False
-    traces_folder: str = "traces"
-    memory_snapshot_folder: str = "snapshots"
-    profile_freq: int = 10
-
+from maester.config import Config
 
 # Training state that is saved in checkpoints
 @dataclass
@@ -161,7 +60,11 @@ def main():
     init_logger()
     logger.info(f"Starting training.")
 
-    cfg = Config() # TODO: enable configuring?
+    cfg = Config()
+    if cfg.load_config: # set from CLI, e.g. from SLURM. TODO: better way?
+        logger.info(f"Loading config from {cfg.load_config}")
+        with open(cfg.load_config, 'r') as f:
+            cfg = Config(**json.load(f))
 
     # take control of garbage collection to avoid stragglers
     gc.disable()
@@ -415,7 +318,7 @@ def main():
 
                     logger.info(
                         f"Step {train_state.step:2}: "
-                        f"lr={scheduler.get_last_lr()[0]:7.4f}, "
+                        f"lr={scheduler.get_last_lr()[0]:.2E}, "
                         f"loss={global_avg_loss:7.4f} (max={global_max_loss:7.4f}), "
                         f"tps={round(tps):}, "
                         f"mfu={mfu:.2f}%, "

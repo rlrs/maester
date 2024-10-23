@@ -27,12 +27,13 @@ from torch.distributed.tensor.parallel import (ColwiseParallel,
 
 from maester.log_utils import logger
 from maester.parallelisms.parallel_dims import ParallelDims
+from maester.config import Config, TORCH_DTYPE_MAP
 
 def parallelize_llama(
     model: nn.Module,
     world_mesh: DeviceMesh,
     parallel_dims: ParallelDims,
-    config,
+    config: Config,
 ):
     """
     Apply tensor parallelism, activation checkpointing, torch.compile, and data
@@ -42,7 +43,7 @@ def parallelize_llama(
     """
 
     if parallel_dims.tp_enabled:
-        if config.enable_async_tensor_parallel and not config.enable_compile:
+        if config.enable_async_tensor_parallel and not config.compile:
             raise RuntimeError("Async TP requires --training.compile")
         apply_tp(model, world_mesh, parallel_dims, enable_async_tp=config.enable_async_tensor_parallel)
 
@@ -64,8 +65,8 @@ def parallelize_llama(
             else:
                 dp_mesh = world_mesh["dp"]
         
-        apply_fsdp(model, dp_mesh, param_dtype=config.mixed_precision_param, 
-                   reduce_dtype=config.mixed_precision_reduce)
+        apply_fsdp(model, dp_mesh, param_dtype=TORCH_DTYPE_MAP[config.mixed_precision_param], 
+                   reduce_dtype=TORCH_DTYPE_MAP[config.mixed_precision_reduce])
         if parallel_dims.dp_replicate_enabled:
             logger.info("Applied HSDP to the model")
         else:
@@ -164,7 +165,7 @@ def apply_tp(
         "Tensor Parallelism to the model"
     )
 
-def _apply_ac_to_transformer_block(module: nn.Module, ac_config):
+def _apply_ac_to_transformer_block(module: nn.Module, ac_config: Config):
     valid_ac_modes = ("full", "selective")
     if ac_config.ac_mode not in valid_ac_modes:
         raise ValueError(
@@ -225,7 +226,7 @@ def _apply_ac_to_transformer_block(module: nn.Module, ac_config):
         else:
             return module
 
-def apply_ac(model: nn.Module, ac_config):
+def apply_ac(model: nn.Module, ac_config: Config):
     """Apply activation checkpointing to the model."""
     for layer_id, transformer_block in model.layers.named_children():
         transformer_block = _apply_ac_to_transformer_block(transformer_block, ac_config)

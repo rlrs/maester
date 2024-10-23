@@ -18,8 +18,11 @@ dependencies = [
     "blobfile",
     "sentencepiece",
     "pydantic",
-    "mosaicml-streaming",
-    "tensorboard"
+    # "mosaicml-streaming",
+    "tensorboard",
+    "distributed-shampoo",
+    "torchdata>=0.8.0",
+    "pydantic-settings>=2.6.0",
 ]
 readme = "README.md"
 requires-python = ">= 3.10"
@@ -51,3 +54,6 @@ disable = ["missing-class-docstring"]
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
+
+[tool.uv.sources]
+distributed-shampoo = { git = "https://github.com/facebookresearch/optimizers.git" }

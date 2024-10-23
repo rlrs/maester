@@ -41,11 +41,11 @@ llama3_configs = {
     ),
     "500M": ModelArgs(
         dim=1024,
-        n_layers=16,
+        n_layers=14,
         n_heads=32,
         n_kv_heads=8,
-        ffn_dim_multiplier=1.3,
-        multiple_of=1024,
+        ffn_dim_multiplier=1.2,
+        multiple_of=512,
         rope_theta=500000,
     ),
     "1B": ModelArgs(
