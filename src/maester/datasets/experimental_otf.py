@@ -910,30 +910,19 @@ class ParquetDataset(_Stateful_Dataset):
 
         dataset_hash = self._generate_dataset_hash()
         cache_file = os.path.join(data_dir, f"doc_counts_cache_{dataset_hash}.json")
-        sync_file = os.path.join(data_dir, f"sync_{dataset_hash}.tmp")
 
         # Rank 0 handles file I/O, other ranks wait
-        if dist.get_rank() == 0:
+        if dist.get_rank(dist.group.WORLD) == 0:
             if not os.path.exists(cache_file):
                 self._gather_doc_counts()
                 self._save_cached_doc_counts(cache_file)
-            
-            # Create sync file to signal completion
-            with open(sync_file, 'w') as f:
-                f.write('done')
-        else:
-            # Other ranks wait for sync file
-            while not os.path.exists(sync_file):
-                time.sleep(0.1)
+        
+        dist.barrier()
         
         # All ranks load the cache
         self._load_cached_doc_counts(cache_file)
 
-        dist.barrier() # ensure no ranks are stuck in the loop above
-
-        # Remove sync file
-        if dist.get_rank() == 0:
-            os.remove(sync_file)
+        dist.barrier() # ensure all ranks loaded
 
         # Fragment the files
         start_frag = (rank * worldsize * len(self.parquet_files)) // worldsize
