@@ -1,118 +1,74 @@
+import subprocess
 from maester.config import Config
+from maester.models import models_config
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
-import os
 
-class SubmitConfig(BaseSettings):
-    model_config = SettingsConfigDict(cli_parse_args=True)
+class SubmitConfig(Config):
+    model_config = SettingsConfigDict(frozen=True, env_prefix="SUBMIT_", cli_parse_args=True) # these are pydantic settings for the config
 
-    num_nodes: int
+    # submission options
+    dry_run: bool = False
+    validate_only: bool = False
 
-SBATCH_TEMPLATE = """
-##SBATCH --exclude=nid[005172-005177]
-#SBATCH --job-name={job_name}
-#SBATCH --nodes={num_nodes}
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=56
-#SBATCH --mem=0
-#SBATCH --partition={partition}
-#SBATCH --time={time}
-#SBATCH --gpus-per-node=8
-#SBATCH --exclusive=user
-#SBATCH --hint=nomultithread
-#SBATCH --account={account}
-#SBATCH --output=logs/%j.out
-#SBATCH --error=logs/%j.err
 
-# if run without sbatch, invoke here
-if [ -z $SLURM_JOB_ID ]; then
-    mkdir -p logs
-    sbatch "$0"
-    exit
-fi
 
-# LUMI setup
-# These are some more custom exports
-export PROJECT_SCRATCH="/scratch/{account}"
-export PROJECT_FLASH="/flash/{account}"
-export SINGULARITY_BIND=/var/spool/slurmd,/opt/cray,/usr/lib64/libcxi.so.1,/usr/lib64/libjansson.so.4
-export LC_ALL=C
-export HF_HOME="${{PROJECT_SCRATCH}}/.cache/huggingface"
-export UV_CACHE_DIR="${{PROJECT_SCRATCH}}/.uv"
+with open("templates/slurm.sh") as f:
+    SLURM_TEMPLATE = f.read()
 
-# values for distributed setup
-GPUS_PER_NODE=$SLURM_GPUS_PER_NODE
-NNODES=$SLURM_NNODES
-export NODE_RANK=$SLURM_NODEID
-export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-export MASTER_PORT=9999
-export WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
+def validate_config(cfg: Config) -> list[str]:
+    """Validate configuration before job submission. TODO: add more useful validation
+    Returns list of error messages, empty if valid."""
+    errors = []
 
-# compilers in the container
-export CC=gcc-12
-export CXX=g++-12
+    # Check parallelism configuration
+    # total_gpus = cfg.num_nodes * 8
+    # parallel_size = (cfg.data_parallel_shard_degree * 
+    #                 cfg.data_parallel_replicate_degree * 
+    #                 cfg.tensor_parallel_degree)
+    
+    # Validate data paths
+    for data_dir in cfg.dataset.data_dirs:
+        if not Path(data_dir).exists():
+            errors.append(f"Data directory not found: {data_dir}")
+    
+    # Rough memory estimation - can be refined based on actual usage patterns
+    # model_params = models_config[cfg.model_name][cfg.flavor].n_params
+    # param_bytes = 2 if cfg.mixed_precision_param == "float16" else 4  # bytes per parameter
+    
+    # # Very rough estimate: model params + gradients + optimizer states + activations + buffer
+    # est_mem_gb = (
+    #     (model_params * param_bytes) / 1e9 +  # Model
+    #     (model_params * param_bytes) / 1e9 +  # Gradients
+    #     (model_params * 8) / 1e9 +           # Optimizer states (rough estimate)
+    #     (cfg.train_batch_size * cfg.seq_len * cfg.vocab_size * 4) / 1e9 +  # Activations
+    #     5  # Buffer
+    # )
+    
+    # if est_mem_gb > 75:  # MI250X has ~80GB, leave some headroom
+    #     errors.append(
+    #         f"Estimated memory usage {est_mem_gb:.1f}GB may exceed GPU memory"
+    #     )
+    return errors
 
-SING_BIND="${{PROJECT_SCRATCH}},${{PROJECT_FLASH}}"
-
-# hold separate logs for easier debugging
-rm -rf separate-logs
-mkdir -p separate-logs
-
-set -exuo pipefail
-
-# symlink logs/latest.out and logs/latest.err
-ln -f -s $SLURM_JOB_ID.out logs/latest.out
-ln -f -s $SLURM_JOB_ID.err logs/latest.err
-
-CHECKPOINT_PATH=checkpoints
-
-# surely we can do this better?
-CMD="train.py --load_config 'jobs/{job_name}/config.json'"
-
-# Bind masks from Samuel (TODO: unused for now, look into this whenever)
-c=fe
-
-# Bind mask for one thread per core
-BIND_MASK_1="0x${{c}}000000000000,0x${{c}}00000000000000,0x${{c}}0000,0x${{c}}000000,0x${{c}},0x${{c}}00,0x${{c}}00000000,0x${{c}}0000000000"
-
-# Bind mask for two threads per core
-BIND_MASK_2="0x${{c}}00000000000000${{c}}000000000000,0x${{c}}00000000000000${{c}}00000000000000,0x${{c}}00000000000000${{c}}0000,0x${{c}}00000000000000${{c}}000000,0x${{c}}00000000000000${{c}},0x${{c}}00000000000000${{c}}00,0x${{c}}00000000000000${{c}}00000000,0x${{c}}00000000000000${{c}}0000000000"
-
-BIND_MASK="$BIND_MASK_1"
-#echo "Using --cpu-bind=mask_cpu:$BIND_MASK"
-
-echo $CMD
-
-echo "START $SLURM_JOBID: $(date)"
-
-srun \
-    --label \
-    singularity exec -B "$SING_BIND" "{container}" \
-    /scratch/{account}/maester/scripts/slurm/in_container.sh \
-    $CMD
-
-echo "END $SLURM_JOBID: $(date)"
-"""
-
-if __name__ == '__main__':
-    cfg = Config()
+def setup_job_dir(cfg: Config) -> Path:
+    """Create job directory and write config."""
     cfg.job_folder.mkdir(exist_ok=True)
-    if (job_folder := cfg.job_folder / cfg.job_name).exists():
-        answer = input(f"Job folder {job_folder} already exists. OK to continue? (y/N): ")
-        if answer != "y":
-            exit(1)
-    job_folder.mkdir(exist_ok=True)
-
-    # write config
-    print(cfg.model_dump())
-    answer = input("Confirm that config is acceptable (y/N): ")
-    if answer != "y":
-        exit(1)
-    with open(job_folder / 'config.json', 'w') as f:
+    job_folder = cfg.job_folder / cfg.job_name
+    
+    if job_folder.exists():
+        answer = input(f"Job folder {job_folder} already exists. Continue? (y/N): ")
+        if answer.lower() != "y":
+            raise ValueError("Job folder already exists")
+    
+    job_folder.mkdir(exist_ok=True, parents=True)
+    
+    # Write config
+    with open(job_folder / "config.json", "w") as f:
         f.write(cfg.model_dump_json(indent=2))
-
-    # write sbatch command
-    sbatch_command = SBATCH_TEMPLATE.format(
+    
+    # Write SLURM script
+    slurm_script = SLURM_TEMPLATE.format(
         job_name=cfg.job_name,
         num_nodes=cfg.num_nodes,
         partition=cfg.partition,
@@ -120,11 +76,79 @@ if __name__ == '__main__':
         time=cfg.time,
         container=cfg.container,
     )
+    
     with open(job_folder / "slurm.sh", "w") as f:
-        f.write(sbatch_command)
+        f.write(slurm_script)
+        
+    return job_folder
 
-    cmd = f"sbatch {job_folder / 'slurm.sh'}"
-    print(f"running {cmd}")
-    os.system(cmd)
+def submit_job(job_dir: Path, dry_run: bool = False) -> str | None:
+    """Submit job to SLURM. Returns job ID if successful."""
+    cmd = f"sbatch {job_dir}/slurm.sh"
+    
+    if dry_run:
+        print(f"Would submit job with command: {cmd}")
+        return None
+        
+    try:
+        result = subprocess.run(["sbatch", str(job_dir / "slurm.sh")], 
+                              capture_output=True, text=True, check=True)
+        job_id = result.stdout.strip().split()[-1]
+        return job_id
+    except subprocess.CalledProcessError as e:
+        print(f"Job submission failed: {e.stderr}")
+        raise
 
+
+def main():
+    cfg = SubmitConfig() # load config using Pydantic setting management
+
+    # Print for validation
+    print(cfg.model_dump_json(indent=2))
+    answer = input("\nValidate configuration? (y/N): ")
+    if answer.lower() != "y":
+        return 1
+    
+    # Validate
+    errors = validate_config(cfg)
+    if errors:
+        print("Configuration validation failed:")
+        for error in errors:
+            print(f"- {error}")
+        if not any("Warning" in error for error in errors):
+            return 1
+    
+    if cfg.validate_only:
+        return 0
+        
+    # Review config
+    print("\nJob Configuration:")
+    print(f"Name: {cfg.job_name}")
+    print(f"Model: {cfg.model_name} ({cfg.flavor})")
+    print(f"Nodes: {cfg.num_nodes} ({cfg.num_nodes * 8} GPUs)")
+    print(f"Parallelism: DP={cfg.data_parallel_shard_degree}x{cfg.data_parallel_replicate_degree}, TP={cfg.tensor_parallel_degree}")
+    print(f"Batch size: {cfg.train_batch_size} per GPU")
+    
+    if not cfg.dry_run:
+        answer = input("\nSubmit job? (y/N): ")
+        if answer.lower() != "y":
+            return 0
+    
+    # Set up job directory
+    job_dir = setup_job_dir(cfg)
+    print(f"\nPrepared job directory: {job_dir}")
+    
+    # Submit
+    try:
+        job_id = submit_job(job_dir, dry_run=cfg.dry_run)
+        if job_id:
+            print(f"Submitted job {job_id}")
+    except Exception as e:
+        print(f"Failed to submit job: {e}")
+        return 1
+        
+    return 0
+
+if __name__ == "__main__":
+    exit(main())
     

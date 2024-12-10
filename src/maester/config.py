@@ -11,17 +11,17 @@ TORCH_DTYPE_MAP = {
 }
 
 class DatasetConfig(BaseSettings):
-        data_logical_shards: int = 32
-        # dataset_path: str = "../fineweb-edu"
-        # datasets: str = "fineweb"
-        data_dirs: list[str] = [
-                                "data/",
-                                # "../2024-v1/parquet/"
-                                ]
-        dataset_weights: str = "1"
-        bos_token: int = 1
-        eos_token: int = 2
-        drop_tokens: str = ""
+    data_logical_shards: int = 32
+    # dataset_path: str = "../fineweb-edu"
+    # datasets: str = "fineweb"
+    data_dirs: list[str] = [
+                            "data/",
+                            # "../2024-v1/parquet/"
+                            ]
+    dataset_weights: str = "1"
+    bos_token: int = 1
+    eos_token: int = 2
+    drop_tokens: str = ""
 
 class Config(BaseSettings):
     model_config = SettingsConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True, cli_parse_args=True)
@@ -34,7 +34,7 @@ class Config(BaseSettings):
     account: str = "project_465000954"
     time: str = "0-01:00:00"
     container: str = "/appl/local/containers/sif-images/lumi-rocm-rocm-6.2.2.sif"
-    load_config: Path | None = None  # TODO: find a better way to do this? this should be set from CLI
+    load_config: Path | None = None
 
     max_grad_norm: float = 1.0
     gc_freq: int = 4
