@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 import wandb
+from maester.config import Config
 from maester.log_utils import logger
 
 def is_serializable(obj):
@@ -140,12 +141,12 @@ class WandbMetricLogger:
             wandb.finish()
 
 
-def build_metric_logger(config, tag: Optional[str] = None):
-    dump_dir = os.path.join(config.job_folder, config.job_name)
+def build_metric_logger(config: Config, tag: Optional[str] = None):
+    job_folder = os.path.join(config.dump_dir, config.job_name)
     save_tb_folder = config.save_tb_folder
     # TODO: should we use current minute as identifier?
     datetime_str = datetime.now().strftime("%Y%m%d-%H%M")
-    log_dir = os.path.join(dump_dir, save_tb_folder, datetime_str)
+    log_dir = os.path.join(job_folder, save_tb_folder, datetime_str)
 
     assert not (config.enable_tensorboard and config.enable_wandb)
     if config.enable_tensorboard:

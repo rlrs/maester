@@ -27,7 +27,7 @@ class Config(BaseSettings):
     model_config = SettingsConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True, cli_parse_args=True)
 
     # submission/job 
-    job_folder: Path = Path("jobs/")
+    dump_dir: str = "jobs/"
     job_name: str = "llama-1B-test"
     num_nodes: int = 8
     partition: str = "standard-g"
@@ -46,7 +46,7 @@ class Config(BaseSettings):
     train_num_steps: int = 1000  # ~200B tokens
     compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
     enable_loss_parallel: bool = True
-    init_timeout_seconds: int = 120
+    init_timeout_seconds: int = 180 # 300 is probably good for large-ish runs, e.g. up to 64 nodes 
     train_timeout_seconds: int = 60
 
     # datasets
@@ -109,7 +109,7 @@ class Config(BaseSettings):
     enable_compiled_autograd: bool = True
 
     # profiling
-    enable_profiling: bool = False
+    enable_profiling: bool = True
     enable_memory_snapshot: bool = False
     traces_folder: str = "traces"
     memory_snapshot_folder: str = "snapshots"
