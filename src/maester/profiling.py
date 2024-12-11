@@ -12,6 +12,7 @@ import time
 import torch
 import torch.distributed as dist
 # from torchtitan.config_manager import JobConfig # TODO: typed cfg
+from maester.config import Config
 from maester.log_utils import logger
 
 # the number of warmup steps before the active step in each profiling cycle
@@ -22,13 +23,13 @@ MEMORY_SNAPSHOT_MAX_ENTRIES = 100000
 
 
 @contextlib.contextmanager
-def maybe_enable_profiling(config, *pos_args, **kwargs):
+def maybe_enable_profiling(config: Config, *pos_args, **kwargs):
     # get user defined profiler settings
 
     if config.enable_profiling:
-        dump_dir = os.path.join(config.job_folder, config.job_name)
+        job_folder = os.path.join(config.dump_dir, config.job_name)
         save_trace_dir = config.traces_folder
-        trace_dir = os.path.join(dump_dir, save_trace_dir)
+        trace_dir = os.path.join(job_folder, save_trace_dir)
         profile_freq = config.profile_freq
 
         _global_iter_count = 0
@@ -80,10 +81,10 @@ def maybe_enable_profiling(config, *pos_args, **kwargs):
 
 
 @contextlib.contextmanager
-def maybe_enable_memory_snapshot(config, *, global_step: int = 0):
+def maybe_enable_memory_snapshot(config: Config, *, global_step: int = 0):
     if config.enable_memory_snapshot:
         snapshot_folder = config.memory_snapshot_folder
-        snapshot_dir = os.path.join(config.job_folder, config.job_name, snapshot_folder)
+        snapshot_dir = os.path.join(config.dump_dir, config.job_name, snapshot_folder)
         if not os.path.exists(snapshot_dir):
             os.makedirs(snapshot_dir, exist_ok=True)
         rank = torch.distributed.get_rank()

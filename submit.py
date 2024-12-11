@@ -53,15 +53,16 @@ def validate_config(cfg: Config) -> list[str]:
 
 def setup_job_dir(cfg: Config) -> Path:
     """Create job directory and write config."""
-    cfg.job_folder.mkdir(exist_ok=True)
-    job_folder = cfg.job_folder / cfg.job_name
+    dump_dir = Path(cfg.dump_dir)
+    dump_dir.mkdir(exist_ok=True)
+    job_folder = dump_dir / cfg.job_name
     
     if job_folder.exists():
         answer = input(f"Job folder {job_folder} already exists. Continue? (y/N): ")
         if answer.lower() != "y":
             raise ValueError("Job folder already exists")
     
-    job_folder.mkdir(exist_ok=True, parents=True)
+    job_folder.mkdir(exist_ok=True)
     
     # Write config
     with open(job_folder / "config.json", "w") as f:
