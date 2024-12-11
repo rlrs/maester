@@ -1,12 +1,12 @@
 import contextlib
 import gc
+import json
 import os
 import time
 from dataclasses import dataclass
 from datetime import timedelta
 from timeit import default_timer as timer
 from typing import Any
-import json
 
 import numpy as np
 import torch
@@ -17,10 +17,8 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor.parallel import loss_parallel
 
 from maester.checkpoint import CheckpointManager
-# from maester.datasets import (MosaicDataset, build_hf_data_loader,
-#                               create_tokenizer)
+from maester.config import Config
 from maester.datasets.experimental_otf import build_experimental_data_loader
-# from maester.datasets.mosaic_dataset import MosaicDataLoader
 from maester.log_utils import init_logger, logger
 from maester.lr_scheduling import get_lr_scheduler
 from maester.memory import cleanup_before_training
@@ -28,11 +26,12 @@ from maester.metrics import build_gpu_memory_monitor, build_metric_logger
 from maester.models import (model_name_to_cls, model_name_to_tokenizer,
                             models_config)
 from maester.parallelisms import ParallelDims, parallelize_llama
-from maester.profiling import maybe_enable_profiling, maybe_enable_memory_snapshot
+from maester.profiling import (maybe_enable_memory_snapshot,
+                               maybe_enable_profiling)
 from maester.utils import (dist_max, dist_mean, get_num_flop_per_token,
                            get_num_params, get_peak_flops, init_distributed,
                            set_pg_timeouts)
-from maester.config import Config
+
 
 # Training state that is saved in checkpoints
 @dataclass
