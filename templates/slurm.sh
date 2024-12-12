@@ -1,3 +1,4 @@
+#!/bin/bash
 ##SBATCH --exclude=nid[005172-005177]
 #SBATCH --job-name={job_name}
 #SBATCH --nodes={num_nodes}
@@ -10,12 +11,12 @@
 #SBATCH --exclusive=user
 #SBATCH --hint=nomultithread
 #SBATCH --account={account}
-#SBATCH --output=logs/%j.out
-#SBATCH --error=logs/%j.err
+#SBATCH --output={dump_dir}/{job_name}/logs/%j.out
+#SBATCH --error={dump_dir}/{job_name}/logs/%j.err
 
 # if run without sbatch, invoke here
 if [ -z $SLURM_JOB_ID ]; then
-    mkdir -p logs
+    mkdir -p {dump_dir}/{job_name}/logs
     sbatch "$0"
     exit
 fi
@@ -28,6 +29,7 @@ export SINGULARITY_BIND=/var/spool/slurmd,/opt/cray,/usr/lib64/libcxi.so.1,/usr/
 export LC_ALL=C
 export HF_HOME="${{PROJECT_SCRATCH}}/.cache/huggingface"
 export UV_CACHE_DIR="${{PROJECT_SCRATCH}}/.uv"
+export SINGULARITYENV_LD_LIBRARY_PATH=/opt/ompi/lib:${EBROOTAWSMINOFIMINRCCL}/lib:/opt/cray/xpmem/2.5.2-2.4_3.47__gd0f7936.shasta/lib64:/opt/aws-ofi-rccl:${SINGULARITYENV_LD_LIBRARY_PATH}
 
 # values for distributed setup
 GPUS_PER_NODE=$SLURM_GPUS_PER_NODE
@@ -44,19 +46,21 @@ export CXX=g++-12
 SING_BIND="${{PROJECT_SCRATCH}},${{PROJECT_FLASH}}"
 
 # hold separate logs for easier debugging
-rm -rf separate-logs
-mkdir -p separate-logs
+rm -rf {dump_dir}/{job_name}/separate-logs
+mkdir -p {dump_dir}/{job_name}/separate-logs
 
 set -exuo pipefail
 
 # symlink logs/latest.out and logs/latest.err
-ln -f -s $SLURM_JOB_ID.out logs/latest.out
-ln -f -s $SLURM_JOB_ID.err logs/latest.err
+pushd {dump_dir}/{job_name}/logs/
+ln -f -s $SLURM_JOB_ID.out latest.out
+ln -f -s $SLURM_JOB_ID.err latest.err
+popd
 
 CHECKPOINT_PATH=checkpoints
 
 # surely we can do this better?
-CMD="train.py --load_config 'jobs/{job_name}/config.json'"
+CMD="train.py --load_config jobs/{job_name}/config.json"
 
 # Bind masks from Samuel (TODO: unused for now, look into this whenever)
 c=fe
