@@ -2,6 +2,8 @@ import contextlib
 import gc
 import json
 import os
+from pathlib import Path
+import sys
 import time
 from dataclasses import dataclass
 from datetime import timedelta
@@ -59,11 +61,16 @@ def main():
     init_logger()
     logger.info(f"Starting training.")
 
-    cfg = Config()
-    if cfg.load_config: # set from CLI, e.g. from SLURM. TODO: better way?
-        logger.info(f"Loading config from {cfg.load_config}")
-        with open(cfg.load_config, 'r') as f:
+    if len(sys.argv) > 1: 
+        config_path = Path(sys.argv[1]) / "config.json"
+        if not config_path.exists():
+            raise ValueError(f"Config not found: {config_path}")
+        logger.info(f"Loading config from {config_path}")
+        with open(config_path, 'r') as f:
             cfg = Config(**json.load(f))
+    else:
+        logger.info("Using configuration from config.py")
+        cfg = Config()
 
     # take control of garbage collection to avoid stragglers
     gc.disable()

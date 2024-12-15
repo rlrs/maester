@@ -29,7 +29,7 @@ export SINGULARITY_BIND=/var/spool/slurmd,/opt/cray,/usr/lib64/libcxi.so.1,/usr/
 export LC_ALL=C
 export HF_HOME="${{PROJECT_SCRATCH}}/.cache/huggingface"
 export UV_CACHE_DIR="${{PROJECT_SCRATCH}}/.uv"
-export SINGULARITYENV_LD_LIBRARY_PATH=/opt/ompi/lib:${EBROOTAWSMINOFIMINRCCL}/lib:/opt/cray/xpmem/2.5.2-2.4_3.47__gd0f7936.shasta/lib64:/opt/aws-ofi-rccl:${SINGULARITYENV_LD_LIBRARY_PATH}
+export SINGULARITYENV_LD_LIBRARY_PATH=/opt/ompi/lib:/opt/cray/xpmem/2.5.2-2.4_3.47__gd0f7936.shasta/lib64:/opt/aws-ofi-rccl:${{SINGULARITYENV_LD_LIBRARY_PATH}}
 
 # values for distributed setup
 GPUS_PER_NODE=$SLURM_GPUS_PER_NODE
@@ -59,9 +59,6 @@ popd
 
 CHECKPOINT_PATH=checkpoints
 
-# surely we can do this better?
-CMD="train.py --load_config jobs/{job_name}/config.json"
-
 # Bind masks from Samuel (TODO: unused for now, look into this whenever)
 c=fe
 
@@ -74,7 +71,7 @@ BIND_MASK_2="0x${{c}}00000000000000${{c}}000000000000,0x${{c}}00000000000000${{c
 BIND_MASK="$BIND_MASK_1"
 #echo "Using --cpu-bind=mask_cpu:$BIND_MASK"
 
-echo $CMD
+# echo $CMD
 
 echo "START $SLURM_JOBID: $(date)"
 
@@ -82,6 +79,6 @@ srun \
     --label \
     singularity exec -B "$SING_BIND" "{container}" \
     /scratch/{account}/maester/scripts/slurm/in_container.sh \
-    $CMD
+    train.py "{dump_dir}/{job_name}"
 
 echo "END $SLURM_JOBID: $(date)"

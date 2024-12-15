@@ -118,13 +118,14 @@ class TBMetricLogger:
         self.writer.close()
 
 class WandbMetricLogger:
-    def __init__(self, config):
+    def __init__(self, config: Config):
         self.rank0_only: bool = config.log_rank0_only
         if (not self.rank0_only) or dist.get_rank() == 0:
             wandb.init(
-                project=config.job_name,
+                name=config.job_name if config.job_name else None,
+                project=config.wandb_project,
                 entity=config.wandb_entity,
-                config={k:v for k, v in config.dict().items() if is_serializable(v)},
+                config={k:v for k, v in config.model_dump().items() if is_serializable(v)},
                 # group="FSDP-group",
                 # id="fsdp-id",
                 # reinit=True, # necessary for multi-process?
