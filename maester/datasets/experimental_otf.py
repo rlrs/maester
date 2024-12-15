@@ -1504,7 +1504,7 @@ def build_experimental_data_loader(cfg, rank, world_size):
     if cfg.enable_checkpoint: # and not cfg.model_weights_only: # model_weights_only is only for final weight export...
         data = Checkpoint_Dataset(
             data,
-            os.path.join(cfg.job_folder, cfg.job_name, cfg.checkpoint_folder, "dataloader"),
+            os.path.join(cfg.dump_dir, cfg.job_name, cfg.checkpoint_folder, "dataloader"),
             cfg.checkpoint_interval,
             cfg.train_batch_size,
         )
