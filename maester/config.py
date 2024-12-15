@@ -11,24 +11,22 @@ TORCH_DTYPE_MAP = {
 }
 
 class DatasetConfig(BaseSettings):
-    data_logical_shards: int = 32
-    # dataset_path: str = "../fineweb-edu"
-    # datasets: str = "fineweb"
+    data_logical_shards: int = 8192
     data_dirs: list[str] = [
-                            "data/",
-                            # "../2024-v1/parquet/"
+                            "../fineweb-edu/data/",
+                            "../fineweb-2/dan_Latn/train"
                             ]
-    dataset_weights: str = "1"
+    dataset_weights: str = "1,2"
     bos_token: int = 1
     eos_token: int = 2
     drop_tokens: str = ""
 
 class Config(BaseSettings):
-    model_config = SettingsConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True, cli_parse_args=True)
+    model_config = SettingsConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True, cli_parse_args=False)
 
     # submission/job 
     dump_dir: str = "jobs/"
-    job_name: str = "llama-1B-test"
+    job_name: str = "llama-tp2"
     num_nodes: int = 8
     partition: str = "standard-g"
     account: str = "project_465000954"
@@ -40,10 +38,10 @@ class Config(BaseSettings):
     gc_freq: int = 4
     data_parallel_shard_degree: int = -1
     data_parallel_replicate_degree: int = 1
-    tensor_parallel_degree: int = 1
+    tensor_parallel_degree: int = 2
     pipeline_parallel_degree: int = 1 # not implemented
-    train_batch_size: int = 4 # per device; 2 * 8 gpus * 32 nodes * 4096 seqlen = 2.1M tokens per batch
-    train_num_steps: int = 1000  # ~200B tokens
+    train_batch_size: int = 6 # per device; 6 * 8 gpus * 64 nodes * 4096 seqlen = 12.6M tokens per batch
+    train_num_steps: int = 10000  # ~200B tokens
     compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
     enable_loss_parallel: bool = True
     init_timeout_seconds: int = 180 # 300 is probably good for large-ish runs, e.g. up to 64 nodes 
@@ -60,6 +58,7 @@ class Config(BaseSettings):
     enable_tensorboard: bool = False
     enable_wandb: bool = True
     wandb_entity: str = "danish-foundation-models"
+    wandb_project: str = "llama"
 
     # checkpointing
     enable_checkpoint: bool = True
@@ -70,8 +69,8 @@ class Config(BaseSettings):
 
     # model
     model_name: str = "llama3"
-    flavor: str = "500M"
-    seq_len: int = 2048
+    flavor: str = "8B"
+    seq_len: int = 4096
     norm_type: str = "compiled_rmsnorm"
 
     # optimizer
@@ -90,14 +89,11 @@ class Config(BaseSettings):
     base_lr_dim: int = 2048 # the model_dim used for tuning lr multipliers
 
     # lr schedule
-    scheduler: str = "linear_warmup_constant_sqrt_decay"
-    warmup_steps: int = 400
-    cooldown_steps: int = 10000
-    #scheduler: str = "linear_warmup_cosine"
-    #warmup_steps: int = 200
+    scheduler: str = "linear_warmup_cosine"
+    warmup_steps: int = 500
 
     # fsdp
-    mixed_precision_param: str = 'float16'
+    mixed_precision_param: str = 'bfloat16'
     mixed_precision_reduce: str = 'float32'
 
     # activation checkpointing
@@ -109,7 +105,7 @@ class Config(BaseSettings):
     enable_compiled_autograd: bool = True
 
     # profiling
-    enable_profiling: bool = True
+    enable_profiling: bool = False
     enable_memory_snapshot: bool = False
     traces_folder: str = "traces"
     memory_snapshot_folder: str = "snapshots"
