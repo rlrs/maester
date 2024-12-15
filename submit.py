@@ -12,7 +12,6 @@ class SubmitConfig(Config):
     validate_only: bool = False
 
 
-
 with open("templates/slurm.sh") as f:
     SLURM_TEMPLATE = f.read()
 
@@ -63,6 +62,10 @@ def setup_job_dir(cfg: Config) -> Path:
             raise ValueError("Job folder already exists")
     
     job_folder.mkdir(exist_ok=True)
+    (job_folder / "logs").mkdir(exist_ok=True)
+    (job_folder / "checkpoints").mkdir(exist_ok=True)
+    if cfg.enable_tensorboard:
+        (job_folder / cfg.save_tb_folder).mkdir(exist_ok=True)
     
     # Write config
     with open(job_folder / "config.json", "w") as f:
@@ -71,6 +74,7 @@ def setup_job_dir(cfg: Config) -> Path:
     # Write SLURM script
     slurm_script = SLURM_TEMPLATE.format(
         job_name=cfg.job_name,
+        dump_dir=cfg.dump_dir,
         num_nodes=cfg.num_nodes,
         partition=cfg.partition,
         account=cfg.account,
@@ -130,10 +134,17 @@ def main():
     print(f"Parallelism: DP={cfg.data_parallel_shard_degree}x{cfg.data_parallel_replicate_degree}, TP={cfg.tensor_parallel_degree}")
     print(f"Batch size: {cfg.train_batch_size} per GPU")
     
-    if not cfg.dry_run:
+    if not (dry_run := cfg.dry_run):
         answer = input("\nSubmit job? (y/N): ")
         if answer.lower() != "y":
             return 0
+        
+    config_dict = cfg.model_dump()
+    # Remove submit-only fields
+    submit_fields = set(SubmitConfig.model_fields.keys()) - set(Config.model_fields.keys())
+    for field in submit_fields:
+        config_dict.pop(field)
+    cfg = Config(**config_dict)
     
     # Set up job directory
     job_dir = setup_job_dir(cfg)
@@ -141,7 +152,7 @@ def main():
     
     # Submit
     try:
-        job_id = submit_job(job_dir, dry_run=cfg.dry_run)
+        job_id = submit_job(job_dir, dry_run=dry_run)
         if job_id:
             print(f"Submitted job {job_id}")
     except Exception as e:
