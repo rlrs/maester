@@ -109,7 +109,7 @@ class CheckpointManager:
                 }
             )
 
-            self.folder = os.path.join(cfg.job_folder, cfg.job_name, cfg.checkpoint_folder)
+            self.folder = os.path.join(cfg.dump_dir, cfg.job_name, cfg.checkpoint_folder)
             self.interval_type = IntervalType.STEPS
             self.interval = cfg.checkpoint_interval
             self.model_weights_only = cfg.model_weights_only

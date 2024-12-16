@@ -18,6 +18,5 @@ core
 logs/
 separate-logs/
 *.distcp
-jobs/**/*.pth
 
 wandb/

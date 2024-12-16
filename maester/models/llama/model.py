@@ -201,9 +201,10 @@ class Attention(nn.Module):
         bs, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        xq = xq.view(bs, seqlen, self.n_heads, self.head_dim)
-        xk = xk.view(bs, seqlen, self.n_kv_heads, self.head_dim)
-        xv = xv.view(bs, seqlen, self.n_kv_heads, self.head_dim)
+        # -1 to infer n_heads since TP shards them
+        xq = xq.view(bs, seqlen, -1, self.head_dim)
+        xk = xk.view(bs, seqlen, -1, self.head_dim)
+        xv = xv.view(bs, seqlen, -1, self.head_dim)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
@@ -232,7 +233,7 @@ class Attention(nn.Module):
                         causal=True,
                     )
 
-        assert output.shape == (bs, seqlen, self.n_heads, self.head_dim), f"attn: {output.shape} != {(bs, seqlen, self.n_heads, self.head_dim)}"
+        # assert output.shape == (bs, seqlen, self.n_heads, self.head_dim), f"attn: {output.shape} != {(bs, seqlen, self.n_heads, self.head_dim)}"
         output = output.view(bs, seqlen, -1)
         return self.wo(output)
 
@@ -452,7 +453,7 @@ class Transformer(nn.Module):
         for layer in self.layers.values():
             h = layer(h, self.freqs_cis)
         h = self.norm(h) if self.norm else h
-        output = self.output(h).float() if self.output else h # TODO: fuse this with CrossEntropyLoss?
+        output = self.output(h) if self.output else h
         return output
 
     @classmethod
