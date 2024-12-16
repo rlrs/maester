@@ -44,8 +44,12 @@ def parallelize_llama(
 
     if parallel_dims.tp_enabled:
         if config.enable_async_tensor_parallel and not config.compile:
-            raise RuntimeError("Async TP requires --training.compile")
-        apply_tp(model, world_mesh, parallel_dims, enable_async_tp=config.enable_async_tensor_parallel)
+            raise RuntimeError("Async TP requires config.compile=True")
+        apply_tp(model, 
+                 world_mesh["tp"], 
+                 loss_parallel=config.enable_loss_parallel,
+                 enable_async_tp=config.enable_async_tensor_parallel,
+        )
 
     if config.ac_mode != "none":
         apply_ac(model, config)
