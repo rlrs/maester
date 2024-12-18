@@ -17,6 +17,8 @@ import torch.nn.functional as F
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor.parallel import loss_parallel
+import unit_scaling as uu
+import unit_scaling.functional as U
 
 from maester.checkpoint import CheckpointManager
 from maester.config import Config
@@ -181,13 +183,12 @@ def main():
         #             There are {dataset_steps_in_epoch} steps in an epoch.")
 
         # build optimizer after model parallelization
-        # optimizer: torch.optim.Optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg)
-        optimizer: torch.optim.Optimizer = cfg.opt_class([
-            {'params': model.tok_embeddings.parameters(), 'lr': cfg.embedding_lr_mul * cfg.opt_cfg['lr']},
-            {'params': model.layers.parameters(), 'lr': cfg.hidden_lr_mul * cfg.opt_cfg['lr'] * (model.model_args.dim / cfg.base_lr_dim)**-1},
-            {'params': model.norm.parameters(), 'lr': cfg.hidden_lr_mul * cfg.opt_cfg['lr'] * (model.model_args.dim / cfg.base_lr_dim)**-1},
-            {'params': model.output.parameters(), 'lr': cfg.readout_lr_mul * cfg.opt_cfg['lr'] * (model.model_args.dim / cfg.base_lr_dim)**-1},
-        ], **cfg.opt_cfg)
+        if cfg.opt_name == "uu.optim.AdamW":
+            optimizer = uu.optim.AdamW(model.parameters(), **cfg.opt_cfg)
+        elif cfg.opt_name == "torch.optim.AdamW":
+            optimizer = torch.optim.AdamW(model.parameters(), **cfg.opt_cfg)
+        else:
+            raise ValueError(f"Optimizer name '{cfg.opt_name}' not supported")
         scheduler = get_lr_scheduler(optimizer, cfg)
 
         metric_logger = build_metric_logger(cfg)
@@ -199,7 +200,7 @@ def main():
 
         # loss fn can be shared by pipeline-parallel or non-pp execution
         def loss_fn(pred, labels):
-            return F.cross_entropy(pred.flatten(0, 1).float(), labels.flatten(0, 1))
+            return U.cross_entropy(pred.flatten(0, 1).float(), labels.flatten(0, 1))
         
         if cfg.compile:
             loss_fn = torch.compile(loss_fn)

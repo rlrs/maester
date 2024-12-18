@@ -250,7 +250,6 @@ def apply_compile(model: nn.Module):
 
     logger.info("Compiling each TransformerBlock with torch.compile")
 
-
 def apply_fsdp(
     model: nn.Module,
     dp_mesh: DeviceMesh,
@@ -263,9 +262,12 @@ def apply_fsdp(
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
 
-    for layer_id, transformer_block in model.layers.items():
+    # for layer_id, transformer_block in model.layers.items(): # umup not using ModuleDict
+    for layer_id, transformer_block in enumerate(model.layers):
         # As an optimization, do not reshard after forward for the last
         # transformer block since FSDP would prefetch it immediately
+        # reshard_dim = dp_mesh.shape[1] if dp_mesh.ndim == 2 else True # hpZ
+        # reshard_after_forward = reshard_dim if int(layer_id) < len(model.layers) - 1 else False 
         reshard_after_forward = int(layer_id) < len(model.layers) - 1
         fully_shard(
             transformer_block,

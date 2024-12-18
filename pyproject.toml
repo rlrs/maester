@@ -6,7 +6,7 @@ authors = [
     { name = "Rasmus Larsen", email = "rasmus.larsen@alexandra.dk" }
 ]
 dependencies = [
-    "torch>=2.2.2",
+    "torch>=2.5",
     # "hydra-core>=1.3.2",
     "datasets>=2.16.0",
     # "pandas>=2.0,<2.2",
@@ -20,9 +20,14 @@ dependencies = [
     "pydantic",
     # "mosaicml-streaming",
     "tensorboard",
-    "distributed-shampoo",
+    # "distributed-shampoo",
     "torchdata>=0.8.0",
     "pydantic-settings>=2.6.0",
+    "unit-scaling>=0.3.4",
+    "markupsafe<2.1.5",
+    "yarl<1.13",
+    "transformers>=4.47.0",
+    "pyarrow>=17.0.0",
 ]
 readme = "README.md"
 requires-python = ">= 3.10"
@@ -43,10 +48,6 @@ allow-direct-references = true
 [tool.hatch.build.targets.wheel]
 packages = ["src/maester"]
 
-[[tool.rye.sources]]
-name = "pytorch-nightly"
-url = "https://download.pytorch.org/whl/nightly/cu121"
-
 [tool.pylint."MESSAGES CONTROL"]
 max-line-length = 120
 disable = ["missing-class-docstring"]
@@ -57,3 +58,9 @@ venv = ".venv"
 
 [tool.uv.sources]
 distributed-shampoo = { git = "https://github.com/facebookresearch/optimizers.git" }
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/nightly/rocm6.2"

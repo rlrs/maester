@@ -8,6 +8,7 @@ import math
 
 import torch
 import torch.nn as nn
+import unit_scaling as uu
 
 import triton
 import triton.language as tl
@@ -41,6 +42,8 @@ def create_norm(norm_type: str, dim: int, eps: float = 1e-6):
         return RMSNorm(dim, eps=eps, compile=True)
     elif norm_type == "fused_rmsnorm":
         return FusedRMSNorm(dim, eps=eps)
+    elif norm_type == "umup_rmsnorm":
+        return uu.RMSNorm(dim, eps=eps)
     else:
         raise NotImplementedError(f"Unknown norm_type: '{norm_type}'")
 
