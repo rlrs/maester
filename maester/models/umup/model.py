@@ -155,19 +155,23 @@ class Attention(nn.Module):
         )
         self.n_rep = self.n_heads // self.n_kv_heads
         self.head_dim = model_args.dim // model_args.n_heads
+        self.dim = model_args.dim
 
-        self.wq = uu.Linear(
-            model_args.dim, model_args.n_heads * self.head_dim, bias=False
-        )
-        self.wk = uu.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = uu.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
+
+        # self.wq = uu.Linear(
+        #     model_args.dim, model_args.n_heads * self.head_dim, bias=False
+        # )
+        # self.wk = uu.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        # self.wv = uu.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wqkv = uu.Linear(model_args.dim, (model_args.n_heads + 2*self.n_kv_heads) * self.head_dim, bias=False)
         self.wo = uu.Linear(
-            model_args.n_heads * self.head_dim, model_args.dim, bias=False
+            model_args.dim, model_args.dim, bias=False
         )
 
     def init_weights(self):
-        for linear in (self.wq, self.wk, self.wv):
-            nn.init.normal_(linear.weight, mean=0.0, std=1.0)
+        # for linear in (self.wq, self.wk, self.wv):
+        #     nn.init.normal_(linear.weight, mean=0.0, std=1.0)
+        nn.init.normal_(self.wqkv.weight, mean=0.0, std=1.0)
         nn.init.normal_(self.wo.weight, mean=0.0, std=1.0)
 
     def forward(
@@ -187,14 +191,16 @@ class Attention(nn.Module):
 
         """
         bs, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        # xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        kv_size = self.n_kv_heads * self.head_dim
+        xq, xk, xv = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
 
         # -1 to infer n_heads since TP shards them
         xq = xq.view(bs, seqlen, -1, self.head_dim)
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis) 
 
         if True: # use sdpa
             # repeat k/v heads if n_kv_heads < n_heads
@@ -262,7 +268,7 @@ class FeedForward(nn.Module):
         self.w3 = uu.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2(U.silu(self.w1(x)) * self.w3(x))
 
     def init_weights(self):
         nn.init.normal_(self.w1.weight, mean=0.0, std=1.0)
@@ -338,7 +344,7 @@ class TransformerBlock(nn.Module):
         h = U.residual_add(residual, skip, self.attn_tau)
 
         residual, skip = U.residual_split(h, self.ffn_tau)
-        residual = self.feed_forward(self.ffn_norm(h))
+        residual = self.feed_forward(self.ffn_norm(residual))
         out = U.residual_add(residual, skip, self.ffn_tau)
 
         return out
@@ -393,7 +399,7 @@ class Transformer(nn.Module):
         )
 
         self.output = uu.LinearReadout(model_args.dim, model_args.vocab_size, bias=False)
-        # self.init_weights()
+        self.init_weights()
 
     def init_weights(self):
         """

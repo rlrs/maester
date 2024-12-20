@@ -7,10 +7,14 @@
 import os
 from collections import namedtuple
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 import json
+import math
+from collections import defaultdict
+import re
 
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
 import wandb
@@ -164,4 +168,211 @@ def build_metric_logger(config: Config, tag: Optional[str] = None):
     return None # TODO: how to handle?
 
 
+class UnitScaleMonitor:
+    """Monitors RMS statistics to verify unit scaling is maintained during training."""
     
+    def __init__(self, 
+                model: nn.Module,
+                log_freq: int = 100, 
+                ignored_substrings: Optional[Set[str]] = None,
+                include_weight_changes: bool = True):
+        """
+        Args:
+            model: Model to monitor
+            log_freq: How often to compute and return statistics 
+            ignored_substrings: Parameter names containing these will be ignored
+            include_weight_changes: Track weight changes between steps
+        """
+        self.model = model
+        self.log_freq = log_freq
+        self.step = 0
+        self.ignored_substrings = ignored_substrings or set()
+        self.include_weight_changes = include_weight_changes
+        
+        # Stats dicts indexed by param/tensor name
+        self.activation_stats = defaultdict(list)
+        self.gradient_stats = defaultdict(list)
+        self.weight_stats = defaultdict(list)
+        
+        # For tracking weight changes
+        self.prev_weights = {}
+        self.weight_changes = defaultdict(list)
+        if include_weight_changes:
+            self._store_current_weights()
+            
+        # Register hooks 
+        self.hooks = []
+        self._register_hooks()
+
+    def _store_current_weights(self):
+        """Store current weights for change tracking."""
+        self.prev_weights = {
+            name: param.data.clone().detach() 
+            for name, param in self.model.named_parameters()
+            if param.requires_grad and self._should_track(name)
+        }
+
+    def _get_weight_changes(self) -> Dict[str, float]:
+        """Compute RMS of weight changes since last step."""
+        changes = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and self._should_track(name):
+                if name in self.prev_weights:
+                    change = param.data - self.prev_weights[name]
+                    changes[name] = self._rms(change)
+        return changes
+
+    def _group_name(self, name: str) -> str:
+        """Convert parameter name to a grouped metric name."""
+        # Split on dots and common separators
+        parts = re.split(r'[._]', name)
+        
+        # Handle common transformer layer patterns
+        if 'layers' in parts:
+            layer_idx = parts[parts.index('layers') + 1]
+            # Group by layer type and number
+            if 'attention' in name:
+                return f"layer{layer_idx}/attention/{'/'.join(parts[-2:])}"
+            elif any(x in name for x in ['mlp', 'ffn']):
+                return f"layer{layer_idx}/ffn/{'/'.join(parts[-2:])}"
+            else:
+                return f"layer{layer_idx}/other/{'/'.join(parts[-2:])}"
+        elif 'embedding' in name:
+            return f"embedding/{'/'.join(parts[-2:])}"
+        elif 'norm' in name:
+            return f"norm/{'/'.join(parts[-2:])}"
+        else:
+            return f"other/{'/'.join(parts[-2:])}"
+
+    def _should_track(self, name: str) -> bool:
+        """Returns whether parameter/tensor should be tracked."""
+        return not any(ign in name for ign in self.ignored_substrings)
+
+    def _rms(self, tensor: torch.Tensor) -> float:
+        """Compute root mean square: sqrt(mean(x^2))."""
+        return math.sqrt(torch.mean(tensor ** 2).item())
+
+    def _register_hooks(self):
+        """Register forward/backward hooks to capture activations/gradients."""
+        
+        def fw_hook(name: str, mod: nn.Module, inp, out):
+            """Forward hook to capture activations."""
+            if self.step % self.log_freq == 0 and self._should_track(name):
+                if isinstance(out, torch.Tensor):
+                    grouped_name = self._group_name(name)
+                    self.activation_stats[grouped_name].append(self._rms(out.detach()))
+                elif isinstance(out, tuple):
+                    for i, o in enumerate(out):
+                        if isinstance(o, torch.Tensor):
+                            grouped_name = f"{self._group_name(name)}.{i}"
+                            self.activation_stats[grouped_name].append(
+                                self._rms(o.detach()))
+
+        def bw_hook(name: str, mod: nn.Module, grad_in, grad_out):
+            """Backward hook to capture gradients."""
+            if self.step % self.log_freq == 0 and self._should_track(name):
+                if isinstance(grad_out, tuple):
+                    for i, g in enumerate(grad_out):
+                        if isinstance(g, torch.Tensor):
+                            grouped_name = f"{self._group_name(name)}/grad.{i}"
+                            self.gradient_stats[grouped_name].append(
+                                self._rms(g.detach()))
+                else:
+                    grouped_name = f"{self._group_name(name)}/grad"
+                    self.gradient_stats[grouped_name].append(
+                        self._rms(grad_out.detach()))
+                            
+        # Register hooks for tracked modules
+        for name, module in self.model.named_modules():
+            if isinstance(module, (nn.Linear, nn.LayerNorm, nn.Embedding)):
+                self.hooks.extend([
+                    module.register_forward_hook(
+                        lambda mod, inp, out, n=name: fw_hook(n, mod, inp, out)),
+                    module.register_full_backward_hook(
+                        lambda mod, grad_in, grad_out, n=name: bw_hook(n, mod, grad_in, grad_out))
+                ])
+
+    def step_monitor(self) -> Optional[Dict[str, float]]:
+        """Call this after each optimization step to collect statistics."""
+        self.step += 1
+        
+        if self.step % self.log_freq == 0:
+            stats = {}
+            
+            # Track weights RMS
+            for name, param in self.model.named_parameters():
+                if param.requires_grad and self._should_track(name):
+                    grouped_name = self._group_name(name)
+                    
+                    # Weight RMS
+                    self.weight_stats[grouped_name].append(self._rms(param.data))
+                    stats[f"{grouped_name}/weight_rms"] = self.weight_stats[grouped_name][-1]
+                    
+                    # Gradient RMS
+                    if param.grad is not None:
+                        self.gradient_stats[grouped_name].append(self._rms(param.grad))
+                        stats[f"{grouped_name}/grad_rms"] = self.gradient_stats[grouped_name][-1]
+                        
+                        # Compute grad/weight ratio to help identify scaling issues
+                        grad_scale = self._rms(param.grad)
+                        weight_scale = self._rms(param.data)
+                        if weight_scale > 0:
+                            stats[f"{grouped_name}/grad_to_weight_ratio"] = grad_scale / weight_scale
+
+            # Track weight changes if enabled
+            if self.include_weight_changes:
+                changes = self._get_weight_changes()
+                for name, change in changes.items():
+                    grouped_name = self._group_name(name)
+                    self.weight_changes[grouped_name].append(change)
+                    stats[f"{grouped_name}/weight_change"] = change
+                    
+                    # Add relative change (change/current_weight) to help debug scaling
+                    weight_rms = self._rms(self.prev_weights[name])
+                    if weight_rms > 0:
+                        stats[f"{grouped_name}/relative_weight_change"] = change / weight_rms
+                
+                self._store_current_weights()
+            
+            # Add activation statistics
+            for name, values in self.activation_stats.items():
+                if values:
+                    stats[f"{name}/activation_rms"] = values[-1]
+            
+            # Clear activation stats after logging
+            self.activation_stats.clear()
+            
+            return stats
+            
+        return None
+
+    def get_layer_summary(self) -> Dict[str, Dict[str, float]]:
+        """Get per-layer summary of important scaling metrics."""
+        summary = defaultdict(dict)
+        
+        # Group metrics by layer
+        for name in self.weight_stats.keys():
+            layer = name.split('/')[0]  # Get layer name
+            
+            # Get latest values
+            metrics = {
+                'weight_rms': self.weight_stats[name][-1] if self.weight_stats[name] else None,
+                'grad_rms': self.gradient_stats[name][-1] if self.gradient_stats[name] else None,
+                'weight_change': self.weight_changes[name][-1] if self.weight_changes[name] else None
+            }
+            
+            # Add to layer summary
+            for metric_name, value in metrics.items():
+                if value is not None:
+                    if metric_name not in summary[layer]:
+                        summary[layer][metric_name] = {'min': value, 'max': value}
+                    else:
+                        summary[layer][metric_name]['min'] = min(summary[layer][metric_name]['min'], value)
+                        summary[layer][metric_name]['max'] = max(summary[layer][metric_name]['max'], value)
+        
+        return dict(summary)
+
+    def close(self):
+        """Remove hooks when done."""
+        for hook in self.hooks:
+            hook.remove()

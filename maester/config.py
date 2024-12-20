@@ -26,8 +26,8 @@ class Config(BaseSettings):
 
     # submission/job 
     dump_dir: str = "jobs/"
-    job_name: str = "llama-tp2"
-    num_nodes: int = 8
+    job_name: str = "umup-test"
+    num_nodes: int = 2
     partition: str = "standard-g"
     account: str = "project_465000954"
     time: str = "0-01:00:00"
@@ -38,9 +38,9 @@ class Config(BaseSettings):
     gc_freq: int = 4
     data_parallel_shard_degree: int = -1
     data_parallel_replicate_degree: int = 1
-    tensor_parallel_degree: int = 2
+    tensor_parallel_degree: int = 1
     pipeline_parallel_degree: int = 1 # not implemented
-    train_batch_size: int = 6 # per device; 6 * 8 gpus * 64 nodes * 4096 seqlen = 12.6M tokens per batch
+    train_batch_size: int = 12 # per device; 6 * 8 gpus * 64 nodes * 4096 seqlen = 12.6M tokens per batch
     train_num_steps: int = 10000  # ~200B tokens
     compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
     enable_loss_parallel: bool = True
@@ -58,7 +58,7 @@ class Config(BaseSettings):
     enable_tensorboard: bool = False
     enable_wandb: bool = True
     wandb_entity: str = "danish-foundation-models"
-    wandb_project: str = "llama"
+    wandb_project: str = "umup"
 
     # checkpointing
     enable_checkpoint: bool = True
@@ -68,25 +68,21 @@ class Config(BaseSettings):
     export_dtype: str = "bfloat16" # just for the final weight export
 
     # model
-    model_name: str = "llama3"
-    flavor: str = "8B"
+    model_name: str = "umup"
+    flavor: str = "1B"
     seq_len: int = 4096
-    norm_type: str = "compiled_rmsnorm"
+    norm_type: str = "umup_rmsnorm"
 
     # optimizer
-    opt_class: ImportString[Callable] = 'torch.optim.AdamW'
+    opt_name: str = "uu.optim.AdamW"
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
-        lr = 3e-5, # max lr, schedule reduces it at points
+        lr = 1.0, # max lr, schedule reduces it at points
         betas = (0.9, 0.95),
-        weight_decay=0.1,
+        weight_decay=1e-10,
         eps=1e-8,
         # foreach=True, # foreach might work where fused doesn't
         fused=True
     )
-    embedding_lr_mul: float = 4.0
-    hidden_lr_mul: float = 1.0
-    readout_lr_mul: float = 2.0
-    base_lr_dim: int = 2048 # the model_dim used for tuning lr multipliers
 
     # lr schedule
     scheduler: str = "linear_warmup_cosine"

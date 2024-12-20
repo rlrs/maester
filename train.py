@@ -19,6 +19,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor.parallel import loss_parallel
 import unit_scaling as uu
 import unit_scaling.functional as U
+from maester.models.umup.registry import register_module
 
 from maester.checkpoint import CheckpointManager
 from maester.config import Config
@@ -26,7 +27,7 @@ from maester.datasets.experimental_otf import build_experimental_data_loader
 from maester.log_utils import init_logger, logger
 from maester.lr_scheduling import get_lr_scheduler
 from maester.memory import cleanup_before_training
-from maester.metrics import build_gpu_memory_monitor, build_metric_logger
+from maester.metrics import build_gpu_memory_monitor, build_metric_logger, UnitScaleMonitor
 from maester.models import (model_name_to_cls, model_name_to_tokenizer,
                             models_config)
 from maester.parallelisms import ParallelDims, parallelize_llama
@@ -121,6 +122,10 @@ def main():
         model_config.max_seq_len = cfg.seq_len
         # del hf_config # only needed for vocab size
 
+        # build a single umup layer for testing properties
+        
+
+
         with torch.device("meta"):
             logger.info(
                 f"Building {cfg.model_name} {cfg.flavor} with {model_config}"
@@ -143,6 +148,9 @@ def main():
         gpu_memory_monitor = build_gpu_memory_monitor()
         # obtain the peak flops of bf16 type for MFU calculation
         gpu_peak_flops = get_peak_flops(torch.cuda.get_device_properties(0).name)
+
+        # before distribution, register for unit scaling
+        register_module(model)
 
         parallelize_llama(model, world_mesh, parallel_dims, cfg)
         logger.info(f"Model after parallelization {model=}\n")
@@ -184,7 +192,7 @@ def main():
 
         # build optimizer after model parallelization
         if cfg.opt_name == "uu.optim.AdamW":
-            optimizer = uu.optim.AdamW(model.parameters(), **cfg.opt_cfg)
+            optimizer = uu.optim.AdamW(model.named_parameters(), **cfg.opt_cfg)
         elif cfg.opt_name == "torch.optim.AdamW":
             optimizer = torch.optim.AdamW(model.parameters(), **cfg.opt_cfg)
         else:
@@ -210,6 +218,8 @@ def main():
         model.train()
         if hasattr(optimizer, 'train'): # some optimizers need to be put in train mode (e.g. schedule free)
             optimizer.train() # type: ignore (.train obviously exists)
+
+        unit_scale_monitor = UnitScaleMonitor(model, log_freq=cfg.log_freq)
 
         # checkpointing
         checkpoint = CheckpointManager(
@@ -273,6 +283,7 @@ def main():
                 )
                 optimizer.step()
                 scheduler.step()
+                unit_scale_stats = unit_scale_monitor.step_monitor()
 
                 losses_since_last_log.append(loss)
 
@@ -324,7 +335,8 @@ def main():
                     }
                     for i in range(len(optimizer.param_groups)):
                         metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
-                    metric_logger.log(metrics, step=train_state.step)
+                    if unit_scale_stats:
+                        metrics.update(unit_scale_stats)
 
                     logger.info(
                         f"Step {train_state.step:2}: "
