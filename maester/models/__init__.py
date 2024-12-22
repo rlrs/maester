@@ -4,8 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from maester.models.llama import llama2_configs, llama3_configs, mistral_configs, Transformer
 from .umup import umup_configs, Transformer as UMUPTransformer
+from maester.models.llama import llama2_configs, llama3_configs, mistral_configs, Transformer
 
 models_config = {
     "llama2": llama2_configs,
