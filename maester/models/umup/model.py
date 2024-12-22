@@ -317,9 +317,8 @@ class TransformerBlock(nn.Module):
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
         )
 
-        tau_rule = uu.transformer_residual_scaling_rule()
-        self.attn_tau = tau_rule(2 * layer_id, 2 * model_args.n_layers)
-        self.ffn_tau = tau_rule(2 * layer_id + 1, 2 * model_args.n_layers)
+        self.attn_tau = torch.empty(1, dtype=torch.bfloat16)
+        self.ffn_tau = torch.empty(1, dtype=torch.bfloat16)
 
     def forward(
         self,
@@ -354,6 +353,10 @@ class TransformerBlock(nn.Module):
         #     norm.reset_parameters() # umup doesn't have this
         self.attention.init_weights()
         self.feed_forward.init_weights()
+        tau_rule = uu.transformer_residual_scaling_rule()
+        self.attn_tau = torch.tensor(tau_rule(2 * self.layer_id, 2 * self.num_layers), dtype=torch.bfloat16, device=self.feed_forward.w1.weight.device)
+        self.ffn_tau = torch.tensor(tau_rule(2 * self.layer_id + 1, 2 * self.num_layers), dtype=torch.bfloat16, device=self.feed_forward.w1.weight.device)
+
 
 
 class Transformer(nn.Module):

@@ -75,7 +75,6 @@ def get_param_info(param: torch.Tensor, fqn: str) -> Optional[ParameterInfo]:
     1. Direct property access (for unmodified Parameters)  
     2. Registry lookup by FQN
     """
-    logger.info(f"fqn: {fqn}")
     # filter "_orig_mod" and "_checkpoint_wrapped_module" from fqn
     fqn = ".".join(part for part in fqn.split(".") if part != "_orig_mod" and part != "_checkpoint_wrapped_module")
 

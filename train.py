@@ -219,7 +219,7 @@ def main():
         if hasattr(optimizer, 'train'): # some optimizers need to be put in train mode (e.g. schedule free)
             optimizer.train() # type: ignore (.train obviously exists)
 
-        unit_scale_monitor = UnitScaleMonitor(model, log_freq=cfg.log_freq)
+        # unit_scale_monitor = UnitScaleMonitor(model, log_freq=cfg.log_freq)
 
         # checkpointing
         checkpoint = CheckpointManager(
@@ -283,7 +283,7 @@ def main():
                 )
                 optimizer.step()
                 scheduler.step()
-                unit_scale_stats = unit_scale_monitor.step_monitor()
+                # unit_scale_stats = unit_scale_monitor.step_monitor()
 
                 losses_since_last_log.append(loss)
 
@@ -335,8 +335,8 @@ def main():
                     }
                     for i in range(len(optimizer.param_groups)):
                         metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
-                    if unit_scale_stats:
-                        metrics.update(unit_scale_stats)
+                    # if unit_scale_stats:
+                    #     metrics.update(unit_scale_stats)
 
                     logger.info(
                         f"Step {train_state.step:2}: "
