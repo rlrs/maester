@@ -85,7 +85,6 @@ def main():
         dp_shard=cfg.data_parallel_shard_degree,
         dp_replicate=cfg.data_parallel_replicate_degree,
         tp=cfg.tensor_parallel_degree,
-        pp=cfg.pipeline_parallel_degree,
         world_size=world_size,
         enable_loss_parallel=cfg.enable_loss_parallel,
     )
@@ -206,7 +205,6 @@ def main():
             loss_parallel if parallel_dims.loss_parallel_enabled else contextlib.nullcontext
         )
 
-        # loss fn can be shared by pipeline-parallel or non-pp execution
         def loss_fn(pred, labels):
             return U.cross_entropy(pred.flatten(0, 1).float(), labels.flatten(0, 1))
         
@@ -337,6 +335,7 @@ def main():
                         metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
                     # if unit_scale_stats:
                     #     metrics.update(unit_scale_stats)
+                    metric_logger.log(metrics, step=train_state.step)
 
                     logger.info(
                         f"Step {train_state.step:2}: "
