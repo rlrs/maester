@@ -26,22 +26,21 @@ class Config(BaseSettings):
 
     # submission/job 
     dump_dir: str = "jobs/"
-    job_name: str = "umup-test"
-    num_nodes: int = 2
+    job_name: str = "sp-training1"
+    num_nodes: int = 8
     partition: str = "standard-g"
     account: str = "project_465000954"
-    time: str = "0-01:00:00"
+    time: str = "0-12:00:00"
     container: str = "/appl/local/containers/sif-images/lumi-rocm-rocm-6.2.2.sif"
     load_config: Path | None = None
 
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 1e10
     gc_freq: int = 4
     data_parallel_shard_degree: int = -1
     data_parallel_replicate_degree: int = 1
     tensor_parallel_degree: int = 1
-    pipeline_parallel_degree: int = 1 # not implemented
-    train_batch_size: int = 12 # per device; 6 * 8 gpus * 64 nodes * 4096 seqlen = 12.6M tokens per batch
-    train_num_steps: int = 10000  # ~200B tokens
+    train_batch_size: int = 24 # per device; 24 * 8 gpus * 8 nodes * 4096 seqlen = 6.2M tokens per batch
+    train_num_steps: int = 4000  # ~25B tokens
     compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
     enable_loss_parallel: bool = True
     init_timeout_seconds: int = 180 # 300 is probably good for large-ish runs, e.g. up to 64 nodes 
@@ -63,22 +62,22 @@ class Config(BaseSettings):
     # checkpointing
     enable_checkpoint: bool = True
     checkpoint_folder: str = "checkpoints"
-    checkpoint_interval: int = 5000 # ~20B tokens
+    checkpoint_interval: int = 500 # ~3B tokens
     model_weights_only: bool = True # just for the final weight export
     export_dtype: str = "bfloat16" # just for the final weight export
 
     # model
-    model_name: str = "umup"
+    model_name: str = "llama3"
     flavor: str = "1B"
     seq_len: int = 4096
-    norm_type: str = "umup_rmsnorm"
+    norm_type: str = "compiled_rmsnorm"
 
     # optimizer
-    opt_name: str = "uu.optim.AdamW"
+    opt_name: str = "torch.optim.AdamW" # uu.optim.AdamW
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
-        lr = 1.0, # max lr, schedule reduces it at points
+        lr = 3e-4, # max lr, schedule reduces it at points
         betas = (0.9, 0.95),
-        weight_decay=1e-10,
+        weight_decay=1e-2,
         eps=1e-8,
         # foreach=True, # foreach might work where fused doesn't
         fused=True
@@ -86,7 +85,7 @@ class Config(BaseSettings):
 
     # lr schedule
     scheduler: str = "linear_warmup_cosine"
-    warmup_steps: int = 500
+    warmup_steps: int = 400
 
     # fsdp
     mixed_precision_param: str = 'bfloat16'
