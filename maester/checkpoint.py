@@ -208,7 +208,7 @@ class CheckpointManager:
         if step == -1:
             step_counts = []
             for filename in os.listdir(self.folder):
-                match = re.search(r"step-(\d+)", filename)
+                match = re.search(r"^step-(\d+)", filename)
                 if match:
                     step_counts.append(int(match.group(1)))
             if not step_counts:

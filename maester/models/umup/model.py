@@ -317,8 +317,12 @@ class TransformerBlock(nn.Module):
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
         )
 
-        self.attn_tau = torch.empty(1, dtype=torch.bfloat16)
-        self.ffn_tau = torch.empty(1, dtype=torch.bfloat16)
+        self.register_buffer('attn_tau', 
+                             torch.empty(1, dtype=torch.bfloat16),
+                             persistent=False)
+        self.register_buffer('ffn_tau', 
+                             torch.empty(1, dtype=torch.bfloat16),
+                             persistent=False)
 
     def forward(
         self,
@@ -353,9 +357,11 @@ class TransformerBlock(nn.Module):
         #     norm.reset_parameters() # umup doesn't have this
         self.attention.init_weights()
         self.feed_forward.init_weights()
-        tau_rule = uu.transformer_residual_scaling_rule()
-        self.attn_tau = torch.tensor(tau_rule(2 * self.layer_id, 2 * self.num_layers), dtype=torch.bfloat16, device=self.feed_forward.w1.weight.device)
-        self.ffn_tau = torch.tensor(tau_rule(2 * self.layer_id + 1, 2 * self.num_layers), dtype=torch.bfloat16, device=self.feed_forward.w1.weight.device)
+
+        # taus must be initialized here to work with meta device init
+        tau_rule = uu.transformer_residual_scaling_rule(1.0, 2**-2) # attn mult from paper
+        self.attn_tau = torch.tensor(tau_rule(2 * self.layer_id, 2 * self.num_layers), dtype=torch.bfloat16)
+        self.ffn_tau = torch.tensor(tau_rule(2 * self.layer_id + 1, 2 * self.num_layers), dtype=torch.bfloat16)
 
 
 
@@ -386,13 +392,6 @@ class Transformer(nn.Module):
 
         self.tok_embeddings = uu.Embedding(model_args.vocab_size, model_args.dim)
 
-        # TODO persistent should be set to false, since this buffer can be recomputed.
-        # however, we set it to true for 2 reasons.  (1) due to pytorch/pytorch#123411,
-        # compile or pipeline-tracer will not correctly handle non-persistent buffers,
-        # so we need to fix that.  (2) if we initialize pipeline-parallel models from
-        # a seed checkpoint rather than calling init_weights, we need freqs_cis to be
-        # initialized by the checkpoint, or we need to add a separate initializer for
-        # just the non-persistent buffers that is called after loading checkpoints.
         self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=False)
 
         self.layers = uu.DepthModuleList([TransformerBlock(layer_id, model_args) for layer_id in range(model_args.n_layers)])

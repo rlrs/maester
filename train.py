@@ -22,6 +22,7 @@ import unit_scaling.functional as U
 from maester.models.umup.registry import register_module
 
 from maester.checkpoint import CheckpointManager
+from maester.data_monitor import DataMonitor
 from maester.config import Config
 from maester.datasets.experimental_otf import build_experimental_data_loader
 from maester.log_utils import init_logger, logger
@@ -181,6 +182,8 @@ def main():
         #                         batch_size=cfg.train_batch_size, num_workers=1, pin_memory=True, shuffle=False, persistent_workers=True)
         data_loader = build_experimental_data_loader(cfg, rank=dp_rank, world_size=dp_degree)
 
+        # data_monitor = DataMonitor(log_freq=cfg.log_freq)
+
         # TODO: very ugly, temporary hack for epoch calc
         # dataset_num_samples = len(data_loader)
         # dataset_samples_per_step = dp_mesh.size() * cfg.train_batch_size # type: ignore (dp_mesh exists)
@@ -205,10 +208,14 @@ def main():
             loss_parallel if parallel_dims.loss_parallel_enabled else contextlib.nullcontext
         )
 
-        def loss_fn(pred, labels):
-            return U.cross_entropy(pred.flatten(0, 1).float(), labels.flatten(0, 1))
+        if cfg.model_name == "umup":
+            def loss_fn(pred, labels):
+                return U.cross_entropy(pred.flatten(0, 1).float(), labels.flatten(0, 1))
+        else:
+            def loss_fn(pred, labels):
+                return F.cross_entropy(pred.flatten(0, 1).float(), labels.flatten(0, 1))
         
-        if cfg.compile:
+        if True: # cfg.compile: # NOTE: always compile loss for memory reasons
             loss_fn = torch.compile(loss_fn)
 
         # training loop
@@ -217,7 +224,7 @@ def main():
         if hasattr(optimizer, 'train'): # some optimizers need to be put in train mode (e.g. schedule free)
             optimizer.train() # type: ignore (.train obviously exists)
 
-        # unit_scale_monitor = UnitScaleMonitor(model, log_freq=cfg.log_freq)
+        unit_scale_monitor = UnitScaleMonitor(model, log_freq=cfg.log_freq)
 
         # checkpointing
         checkpoint = CheckpointManager(
@@ -237,7 +244,7 @@ def main():
         logger.info(f"Training starts at step {train_state.step}")
         with maybe_enable_profiling(
             cfg, global_step=train_state.step
-        ) as torch_profiler:
+        ) as torch_profiler, torch._dynamo.utils.maybe_enable_compiled_autograd(cfg.enable_compiled_autograd):
             checkpoint.reset()
 
             # variables for metric logging
@@ -267,9 +274,18 @@ def main():
 
                 optimizer.zero_grad()
 
+                # Log training samples
+                # data_monitor.log_batch_samples(input_ids, labels, data_loader.dataset)
+                # data_monitor.log_dataset_stats(data_loader.dataset)
+
                 # non-pp loss parallel, pp is not implemented
                 with loss_parallel_ctx():
                     pred = model(input_ids)
+                    
+                    # Log both next-token predictions and longer generations
+                    # data_monitor.log_predictions(pred, labels, data_loader.dataset)
+                    # data_monitor.log_generations(model, input_ids, data_loader.dataset)
+                    
                     loss = loss_fn(pred, labels)
                     # pred.shape=(bs, seq_len, vocab_size)
                     # need to free to before bwd to avoid peaking memory
@@ -281,7 +297,7 @@ def main():
                 )
                 optimizer.step()
                 scheduler.step()
-                # unit_scale_stats = unit_scale_monitor.step_monitor()
+                unit_scale_stats = unit_scale_monitor.step_monitor()
 
                 losses_since_last_log.append(loss)
 
@@ -333,8 +349,8 @@ def main():
                     }
                     for i in range(len(optimizer.param_groups)):
                         metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
-                    # if unit_scale_stats:
-                    #     metrics.update(unit_scale_stats)
+                    if unit_scale_stats:
+                        metrics.update(unit_scale_stats)
                     metric_logger.log(metrics, step=train_state.step)
 
                     logger.info(
