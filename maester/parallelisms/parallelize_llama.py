@@ -262,8 +262,11 @@ def apply_fsdp(
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
 
-    # for layer_id, transformer_block in model.layers.items(): # umup not using ModuleDict
-    for layer_id, transformer_block in enumerate(model.layers):
+    if isinstance(model.layers, nn.ModuleDict):
+        it = model.layers.items()
+    else:
+        it = enumerate(model.layers)
+    for layer_id, transformer_block in it:
         # As an optimization, do not reshard after forward for the last
         # transformer block since FSDP would prefetch it immediately
         # reshard_dim = dp_mesh.shape[1] if dp_mesh.ndim == 2 else True # hpZ
