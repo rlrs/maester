@@ -2,11 +2,13 @@ import contextlib
 import gc
 import json
 import os
-from pathlib import Path
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import timedelta
+from functools import partial
+from pathlib import Path
 from timeit import default_timer as timer
 from typing import Any
 
@@ -117,7 +119,16 @@ def main():
         model_config.norm_type = cfg.norm_type
         model_config.vocab_size = 32000 # 128256 # TODO: automatically set this
         model_config.max_seq_len = cfg.seq_len
-        # del hf_config # only needed for vocab size
+        if cfg.enable_mup:
+            model_config.enable_mup = True
+            model_config.mup_input_alpha = cfg.mup_input_alpha
+            model_config.mup_output_alpha = cfg.mup_output_alpha
+            model_config.mup_width_mul = cfg.model_width / cfg.base_model_width
+            model_config.dim = cfg.model_width
+            head_dim = 128
+            model_config.n_heads = cfg.model_width // head_dim
+            if model_config.n_kv_heads:
+                model_config.n_kv_heads = min(model_config.n_kv_heads, model_config.n_heads)
 
         with torch.device("meta"):
             logger.info(
@@ -156,6 +167,34 @@ def main():
             f"({gpu_mem_stats.max_reserved_pct:.2f}%)"
         )
 
+        if cfg.enable_mup and cfg.mup_log_coord_check:
+            activation_hooks = []
+            activation_stats = defaultdict(list)
+            
+            def fw_hook(mod: torch.nn.Module, inp, out, key: str):
+                if train_state.step % cfg.log_freq == 0:
+                    activation_stats[key].append(out.abs().mean().item())
+            for module_name, module in model.named_modules():
+                if module_name == 'tok_embeddings':
+                    activation_hooks.append(
+                        module.register_forward_hook(partial(fw_hook, key='tok_embed'))
+                    )
+                elif 'attention.' in module_name and module_name.endswith(('.wq', '.wk', '.wv', '.wo')):
+                    activation_hooks.append(
+                        module.register_forward_hook(partial(fw_hook, key='attn'))
+                    )
+                elif 'feed_forward.' in module_name and module_name.endswith(('.w1', '.w2', '.w3')):
+                    activation_hooks.append(
+                        module.register_forward_hook(partial(fw_hook, key='ffn'))
+                    )
+                elif module_name == 'output':
+                    activation_hooks.append(
+                        module.register_forward_hook(partial(fw_hook, key='output'))
+                    )
+                else:
+                    logger.info(f"No activation hook registered for {module_name}")
+            logger.info(f"Activation hooks registered for {len(activation_hooks)} modules")
+
 
         # build dataloader
         # data_loader = build_hf_data_loader(
@@ -182,12 +221,28 @@ def main():
 
         # build optimizer after model parallelization
         # optimizer: torch.optim.Optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg)
-        optimizer: torch.optim.Optimizer = cfg.opt_class([
-            {'params': model.tok_embeddings.parameters(), 'lr': cfg.embedding_lr_mul * cfg.opt_cfg['lr']},
-            {'params': model.layers.parameters(), 'lr': cfg.hidden_lr_mul * cfg.opt_cfg['lr'] * (model.model_args.dim / cfg.base_lr_dim)**-1},
-            {'params': model.norm.parameters(), 'lr': cfg.hidden_lr_mul * cfg.opt_cfg['lr'] * (model.model_args.dim / cfg.base_lr_dim)**-1},
-            {'params': model.output.parameters(), 'lr': cfg.readout_lr_mul * cfg.opt_cfg['lr'] * (model.model_args.dim / cfg.base_lr_dim)**-1},
-        ], **cfg.opt_cfg)
+        if cfg.enable_mup:
+            mup_decay_params = []
+            decay_params = []
+            nodecay_params = []
+            for name, param in model.named_parameters():
+                if param.dim() >= 2:
+                    if 'attention' in name or 'feed_forward' in name:
+                        logger.info(f"Mup weight: {name}")
+                        mup_decay_params.append(param)
+                    else:
+                        logger.info(f"Decay weight: {name}")
+                        decay_params.append(param)
+                else:
+                    logger.info(f"Nodecay weight: {name}")
+                    nodecay_params.append(param)
+            optimizer: torch.optim.Optimizer = cfg.opt_class([
+                {'params': mup_decay_params, 'weight_decay': cfg.opt_cfg['weight_decay'], 'lr': cfg.opt_cfg['lr'] / model_config.mup_width_mul},
+                {'params': decay_params, 'weight_decay': cfg.opt_cfg['weight_decay'], 'lr': cfg.opt_cfg['lr']},
+                {'params': nodecay_params, 'weight_decay': 0.0, 'lr': cfg.opt_cfg['lr']},
+            ], **cfg.opt_cfg)
+        else:
+            optimizer: torch.optim.Optimizer = cfg.opt_class(model.parameters(), **cfg.opt_cfg)
         scheduler = get_lr_scheduler(optimizer, cfg)
 
         metric_logger = build_metric_logger(cfg)
@@ -323,6 +378,11 @@ def main():
                     }
                     for i in range(len(optimizer.param_groups)):
                         metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
+                    if cfg.enable_mup and cfg.mup_log_coord_check:
+                        for key in activation_stats: # type: ignore
+                            if activation_stats[key]: # type: ignore
+                                metrics[f'act/{key}_abs_mean'] = np.mean(activation_stats[key]) # type: ignore
+                        activation_stats = defaultdict(list) # reset
                     metric_logger.log(metrics, step=train_state.step)
 
                     logger.info(

@@ -26,8 +26,8 @@ class Config(BaseSettings):
 
     # submission/job 
     dump_dir: str = "jobs/"
-    job_name: str = "llama-tp2"
-    num_nodes: int = 8
+    job_name: str = "mup-test"
+    num_nodes: int = 1
     partition: str = "standard-g"
     account: str = "project_465000954"
     time: str = "0-01:00:00"
@@ -38,11 +38,11 @@ class Config(BaseSettings):
     gc_freq: int = 4
     data_parallel_shard_degree: int = -1
     data_parallel_replicate_degree: int = 1
-    tensor_parallel_degree: int = 2
+    tensor_parallel_degree: int = 1
     pipeline_parallel_degree: int = 1 # not implemented
-    train_batch_size: int = 6 # per device; 6 * 8 gpus * 64 nodes * 4096 seqlen = 12.6M tokens per batch
-    train_num_steps: int = 10000  # ~200B tokens
-    compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
+    train_batch_size: int = 8 # per device; 6 * 8 gpus * 64 nodes * 4096 seqlen = 12.6M tokens per batch
+    train_num_steps: int = 10  # ~200B tokens
+    compile: bool = False # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
     enable_loss_parallel: bool = True
     init_timeout_seconds: int = 180 # 300 is probably good for large-ish runs, e.g. up to 64 nodes 
     train_timeout_seconds: int = 60
@@ -52,16 +52,16 @@ class Config(BaseSettings):
     tokenizer_name: str = "meta-llama/Llama-2-7B"
 
     # logging/metrics
-    log_freq: int = 10
+    log_freq: int = 1
     log_rank0_only: bool = True
     save_tb_folder: str = "tb"
     enable_tensorboard: bool = False
     enable_wandb: bool = True
     wandb_entity: str = "danish-foundation-models"
-    wandb_project: str = "llama"
+    wandb_project: str = "coord-check"
 
     # checkpointing
-    enable_checkpoint: bool = True
+    enable_checkpoint: bool = False
     checkpoint_folder: str = "checkpoints"
     checkpoint_interval: int = 5000 # ~20B tokens
     model_weights_only: bool = True # just for the final weight export
@@ -69,28 +69,32 @@ class Config(BaseSettings):
 
     # model
     model_name: str = "llama3"
-    flavor: str = "8B"
-    seq_len: int = 4096
+    flavor: str = "sweep"
+    seq_len: int = 1024
     norm_type: str = "compiled_rmsnorm"
+
+    # mup
+    enable_mup: bool = True
+    base_model_width: int = 256
+    model_width: int = 256 # overwrites model width for mup
+    mup_input_alpha: float = 1.0
+    mup_output_alpha: float = 1.0
+    mup_log_coord_check: bool = True 
 
     # optimizer
     opt_class: ImportString[Callable] = 'torch.optim.AdamW'
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
-        lr = 3e-5, # max lr, schedule reduces it at points
+        lr = 1e-3, # max lr, schedule reduces it at points
         betas = (0.9, 0.95),
         weight_decay=0.1,
         eps=1e-8,
         # foreach=True, # foreach might work where fused doesn't
         fused=True
     )
-    embedding_lr_mul: float = 4.0
-    hidden_lr_mul: float = 1.0
-    readout_lr_mul: float = 2.0
-    base_lr_dim: int = 2048 # the model_dim used for tuning lr multipliers
 
     # lr schedule
-    scheduler: str = "linear_warmup_cosine"
-    warmup_steps: int = 500
+    scheduler: str = "constant"
+    warmup_steps: int = 0
 
     # fsdp
     mixed_precision_param: str = 'bfloat16'
@@ -102,7 +106,7 @@ class Config(BaseSettings):
 
     # experimental
     enable_async_tensor_parallel: bool = False
-    enable_compiled_autograd: bool = True
+    enable_compiled_autograd: bool = False
 
     # profiling
     enable_profiling: bool = False
