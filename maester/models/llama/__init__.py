@@ -81,7 +81,7 @@ llama3_configs = {
         n_heads=8,
         n_kv_heads=8,
         ffn_dim_multiplier=1.3,
-        multiple_of=8,
+        multiple_of=256,
         rope_theta=500000,
     ),
     "70B": ModelArgs(

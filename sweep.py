@@ -293,9 +293,9 @@ class SweepValues(BaseModel):
         return cls(values=values)
     
     @classmethod
-    def logspace(cls, start: float, end: float, num: int) -> "SweepValues":
+    def logspace(cls, start: float, end: float, num: int, base: int = 10) -> "SweepValues":
         import numpy as np
-        values = np.logspace(np.log10(start), np.log10(end), num).tolist()
+        values = np.logspace(start, end, num, base=base).tolist()
         return cls(values=values)
 
 class SweepConfig(BaseSettings):

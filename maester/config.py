@@ -26,7 +26,7 @@ class Config(BaseSettings):
 
     # submission/job 
     dump_dir: str = "jobs/"
-    job_name: str = "mup-test"
+    job_name: str = "mutransfer-test"
     num_nodes: int = 1
     partition: str = "standard-g"
     account: str = "project_465000954"
@@ -40,9 +40,9 @@ class Config(BaseSettings):
     data_parallel_replicate_degree: int = 1
     tensor_parallel_degree: int = 1
     pipeline_parallel_degree: int = 1 # not implemented
-    train_batch_size: int = 8 # per device; 6 * 8 gpus * 64 nodes * 4096 seqlen = 12.6M tokens per batch
-    train_num_steps: int = 10  # ~200B tokens
-    compile: bool = False # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
+    train_batch_size: int = 8 # per device; 16 * 8 gpus * 1 nodes * 2048 seqlen = 65.5k tokens per batch
+    train_num_steps: int = 1000  # ~65.5M tokens
+    compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
     enable_loss_parallel: bool = True
     init_timeout_seconds: int = 180 # 300 is probably good for large-ish runs, e.g. up to 64 nodes 
     train_timeout_seconds: int = 60
@@ -52,13 +52,13 @@ class Config(BaseSettings):
     tokenizer_name: str = "meta-llama/Llama-2-7B"
 
     # logging/metrics
-    log_freq: int = 1
+    log_freq: int = 10
     log_rank0_only: bool = True
     save_tb_folder: str = "tb"
     enable_tensorboard: bool = False
     enable_wandb: bool = True
     wandb_entity: str = "danish-foundation-models"
-    wandb_project: str = "coord-check"
+    wandb_project: str = "mutransfer"
 
     # checkpointing
     enable_checkpoint: bool = False
@@ -79,7 +79,7 @@ class Config(BaseSettings):
     model_width: int = 256 # overwrites model width for mup
     mup_input_alpha: float = 1.0
     mup_output_alpha: float = 1.0
-    mup_log_coord_check: bool = True 
+    mup_log_coord_check: bool = False 
 
     # optimizer
     opt_class: ImportString[Callable] = 'torch.optim.AdamW'
@@ -93,8 +93,8 @@ class Config(BaseSettings):
     )
 
     # lr schedule
-    scheduler: str = "constant"
-    warmup_steps: int = 0
+    scheduler: str = "linear_warmup_cosine"
+    warmup_steps: int = 100
 
     # fsdp
     mixed_precision_param: str = 'bfloat16'
