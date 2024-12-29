@@ -82,9 +82,10 @@ if __name__ == "__main__":
         no_dist=True,
     )
     if 'model' in sd: # model-only checkpoints do not have this
+        print(f"Full checkpoint detected, extracting model weights only. All keys: {list(sd.keys())}")
         sd = sd['model']
     sd = {k.replace('._orig_mod', ''): v for k, v in sd.items()} # fix '_orig_mod' thing...
-    print(f"SD keys: {list(sd.keys())}")
+    print(f"Model keys: {list(sd.keys())}")
     if args.type == "hf":
         # Build and save HF Config
         print('#' * 30)

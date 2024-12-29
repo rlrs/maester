@@ -15,7 +15,7 @@ import torch
 import torch.distributed as dist
 import torch.utils.data
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 """
 The following distributed dataloaders are designed around 3 main principles:
@@ -1465,7 +1465,8 @@ def build_experimental_data_loader(cfg, rank, world_size):
         t[:prompt_len] = -100
         return data_seq, t
     
-    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+    # tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=cfg.tokenizer_name)
 
     # Base streaming dataset. Returns doc chunks in sequence.
     # Implements dataset sampling and rescalability.

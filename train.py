@@ -26,13 +26,14 @@ from maester.datasets.experimental_otf import build_experimental_data_loader
 from maester.log_utils import init_logger, logger
 from maester.lr_scheduling import get_lr_scheduler
 from maester.memory import cleanup_before_training
-from maester.metrics import build_gpu_memory_monitor, build_metric_logger
+from maester.metrics import build_gpu_memory_monitor, build_metric_logger, register_logits_monitoring, WeightScaleMonitor
+from maester.data_monitor import DataMonitor
 from maester.models import (model_name_to_cls, model_name_to_tokenizer,
                             models_config)
 from maester.parallelisms import ParallelDims, parallelize_llama
 from maester.profiling import (maybe_enable_memory_snapshot,
                                maybe_enable_profiling)
-from maester.utils import (dist_max, dist_mean, get_num_flop_per_token,
+from maester.utils import (clean_param_name, clip_grad_norm, dist_max, dist_mean, get_num_flop_per_token,
                            get_num_params, get_peak_flops, init_distributed,
                            set_pg_timeouts)
 
@@ -160,6 +161,16 @@ def main():
         model.to_empty(device="cuda")
         model.init_weights()
 
+        # register hooks after compile?
+        # get_logits_metrics, cleanup_monitoring, reinit_storage = register_logits_monitoring(
+        #     model, 
+        #     train_state,
+        #     log_freq=cfg.log_freq,
+        #     monitor_attention=False  # TODO: configurable?
+        # )
+
+        # reinit_storage() # reinitialize logits storage tensors on the gpu 
+
         gpu_mem_stats = gpu_memory_monitor.get_peak_stats()
         logger.info(
             f"GPU memory usage for model: "
@@ -211,6 +222,8 @@ def main():
         #                         batch_size=cfg.train_batch_size, num_workers=1, pin_memory=True, shuffle=False, persistent_workers=True)
         data_loader = build_experimental_data_loader(cfg, rank=dp_rank, world_size=dp_degree)
 
+        # data_monitor = DataMonitor(train_state, log_freq=cfg.log_freq)
+
         # TODO: very ugly, temporary hack for epoch calc
         # dataset_num_samples = len(data_loader)
         # dataset_samples_per_step = dp_mesh.size() * cfg.train_batch_size # type: ignore (dp_mesh exists)
@@ -228,13 +241,13 @@ def main():
             for name, param in model.named_parameters():
                 if param.dim() >= 2:
                     if 'attention' in name or 'feed_forward' in name:
-                        logger.info(f"Mup weight: {name}")
+                        # logger.info(f"Mup weight: {name}")
                         mup_decay_params.append(param)
                     else:
-                        logger.info(f"Decay weight: {name}")
+                        # logger.info(f"Decay weight: {name}")
                         decay_params.append(param)
                 else:
-                    logger.info(f"Nodecay weight: {name}")
+                    # logger.info(f"Nodecay weight: {name}")
                     nodecay_params.append(param)
             optimizer: torch.optim.Optimizer = cfg.opt_class([
                 {'params': mup_decay_params, 'weight_decay': cfg.opt_cfg['weight_decay'], 'lr': cfg.opt_cfg['lr'] / model_config.mup_width_mul},
@@ -264,6 +277,8 @@ def main():
         model.train()
         if hasattr(optimizer, 'train'): # some optimizers need to be put in train mode (e.g. schedule free)
             optimizer.train() # type: ignore (.train obviously exists)
+
+        weight_scale_monitor = WeightScaleMonitor(model, log_freq=cfg.log_freq)
 
         # checkpointing
         checkpoint = CheckpointManager(
@@ -313,20 +328,28 @@ def main():
 
                 optimizer.zero_grad()
 
+                # data_monitor.log_batch_samples(input_ids, labels, data_loader.dataset)
+                # data_monitor.log_dataset_stats(data_loader.dataset)
+
                 # non-pp loss parallel, pp is not implemented
                 with loss_parallel_ctx():
                     pred = model(input_ids)
+
+                    # data_monitor.log_predictions(pred, labels, data_loader.dataset)
+
                     loss = loss_fn(pred, labels)
                     # pred.shape=(bs, seq_len, vocab_size)
                     # need to free to before bwd to avoid peaking memory
                     del pred
                     loss.backward()
 
-                total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                grad_norms = clip_grad_norm( # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
                     model.parameters(), cfg.max_grad_norm, foreach=True
                 )
                 optimizer.step()
                 scheduler.step()
+
+                weight_scale_stats = weight_scale_monitor.step_monitor()
 
                 losses_since_last_log.append(loss)
 
@@ -345,6 +368,20 @@ def main():
                     else:
                         global_avg_loss, global_max_loss = avg_loss, max_loss
 
+                    param_to_name = {param: name for name, param in model.named_parameters()}
+                    exp_avgs, exp_avg_sqs, param_names = [], [], []
+                    for group in optimizer.param_groups:
+                        for p in group['params']:
+                            if p.grad is None:
+                                continue
+                            state = optimizer.state[p]
+                            if 'exp_avg' in state:  # Check if states initialized
+                                exp_avgs.append(state['exp_avg'])
+                                exp_avg_sqs.append(state['exp_avg_sq'])
+                                param_names.append(param_to_name[p])
+                    exp_avg_norms = torch._foreach_norm(exp_avgs, 2)
+                    exp_avg_sq_norms = torch._foreach_norm(exp_avg_sqs, 2)
+
                     time_delta = timer() - time_last_log
 
                     total_tokens += ntokens_since_last_log
@@ -362,7 +399,6 @@ def main():
                         # "epoch": epoch,
                         "loss/global_avg": global_avg_loss,
                         "loss/global_max": global_max_loss,
-                        "grad/norm": total_grad_norm,
                         "tps": tps,
                         "mfu(%)": mfu,
                         "data/total_tokens": total_tokens * parallel_dims.dp_shard * parallel_dims.dp_replicate,
@@ -378,11 +414,21 @@ def main():
                     }
                     for i in range(len(optimizer.param_groups)):
                         metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
+                    for gn, (name, _) in zip(grad_norms, model.named_parameters()):
+                        cn = clean_param_name(name)
+                        metrics[f"{cn}/grad_norm"] = gn
+                    for exp_avg_norm, exp_avg_sq_norm, name in zip(exp_avg_norms, exp_avg_sq_norms, param_names):
+                        cn = clean_param_name(name)
+                        metrics[f"{cn}/exp_avg_norm"] = exp_avg_norm
+                        metrics[f"{cn}/exp_avg_sq_norm"] = exp_avg_sq_norm
                     if cfg.enable_mup and cfg.mup_log_coord_check:
                         for key in activation_stats: # type: ignore
                             if activation_stats[key]: # type: ignore
                                 metrics[f'act/{key}_abs_mean'] = np.mean(activation_stats[key]) # type: ignore
                         activation_stats = defaultdict(list) # reset
+                    # metrics.update(get_logits_metrics())
+                    if weight_scale_stats:
+                        metrics.update(weight_scale_stats)
                     metric_logger.log(metrics, step=train_state.step)
 
                     logger.info(

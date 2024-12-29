@@ -1,5 +1,6 @@
 import os
 import gzip
+import zstandard as zstd
 import orjson
 import pandas as pd
 import pyarrow as pa
@@ -18,12 +19,20 @@ def init_worker(counter):
     global shard_counter
     shard_counter = counter
 
-def read_jsonl_gz(file_path: str):
-    """Read a gzipped JSONL file and yield dictionaries."""
+def read_compressed_jsonl(file_path: str):
+    """Read a compressed JSONL file (gzip or zstd) and yield dictionaries."""
     try:
-        with gzip.open(file_path, 'rt') as gz:
-            for line in gz:
-                yield orjson.loads(line)
+        if file_path.endswith('.gz'):
+            with gzip.open(file_path, 'rt') as f:
+                for line in f:
+                    yield orjson.loads(line)
+        elif file_path.endswith('.zst'):
+            with open(file_path, 'rb') as fh:
+                dctx = zstd.ZstdDecompressor()
+                with dctx.stream_reader(fh) as reader:
+                    text_stream = io.TextIOWrapper(reader, encoding='utf-8')
+                    for line in text_stream:
+                        yield orjson.loads(line)
     except (IOError, orjson.JSONDecodeError) as e:
         print(f"Error reading file {file_path}: {str(e)}")
         return
@@ -32,7 +41,7 @@ def write_parquet_shard(df: pd.DataFrame, output_dir: str, shard_index: int) -> 
     """Write a DataFrame to a Parquet shard."""
     shard_path = os.path.join(output_dir, f"shard_{shard_index:06d}.parquet")
     table = pa.Table.from_pandas(df)
-    pq.write_table(table, shard_path, compression='snappy', row_group_size=1000) # row_group_size=1000 is a good default, same as HuggingFace
+    pq.write_table(table, shard_path, compression='snappy', row_group_size=1000)
     return shard_path
 
 def process_file(args):
@@ -45,11 +54,10 @@ def process_file(args):
     processed_records = 0
     processed_bytes = 0
 
-    for record in read_jsonl_gz(input_path):
-        record_size = len(orjson.dumps(record))
-        if record_size == 0:
-            print(f"Warning: empty record in {input_path}")
+    for record in read_compressed_jsonl(input_path):
+        if len(record["text"]) == 0:
             continue
+        record_size = len(orjson.dumps(record))
         if current_size + record_size > target_shard_size_bytes and current_shard:
             df = pd.DataFrame(current_shard)
             with shard_counter.get_lock():
@@ -77,7 +85,7 @@ def process_file(args):
     return new_shards, processed_records, processed_bytes, file_size
 
 def convert_jsonl_to_parquet(input_dir: str, output_dir: str, target_shard_size_mb: int, mode: str = 'abort'):
-    """Convert all .jsonl.gz files in input_dir to a single set of sharded Parquet files in output_dir."""
+    """Convert all compressed JSONL files (gz or zst) in input_dir to a single set of sharded Parquet files in output_dir."""
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     elif mode == 'abort' and any(f.endswith('.parquet') for f in os.listdir(output_dir)):
@@ -88,19 +96,19 @@ def convert_jsonl_to_parquet(input_dir: str, output_dir: str, target_shard_size_
                 os.remove(os.path.join(output_dir, f))
 
     target_shard_size_bytes = target_shard_size_mb * 1024 * 1024  # Convert MB to bytes
-    jsonl_files = [f for f in os.listdir(input_dir) if f.endswith('.jsonl.gz') or f.endswith('.json.gz')]
+    compressed_files = [f for f in os.listdir(input_dir) if f.endswith(('.jsonl.gz', '.json.gz', '.jsonl.zst', '.json.zst'))]
     
     # Sort files by size to improve load balancing
-    jsonl_files.sort(key=lambda f: os.path.getsize(os.path.join(input_dir, f)), reverse=True)
+    compressed_files.sort(key=lambda f: os.path.getsize(os.path.join(input_dir, f)), reverse=True)
     
-    total_input_size = sum(os.path.getsize(os.path.join(input_dir, f)) for f in jsonl_files)
+    total_input_size = sum(os.path.getsize(os.path.join(input_dir, f)) for f in compressed_files)
 
     # Create a shared counter
     counter = mp.Value('i', 0)
 
     # Prepare arguments for parallel processing
     args_list = [(filename, input_dir, output_dir, target_shard_size_bytes) 
-                 for filename in jsonl_files]
+                 for filename in compressed_files]
 
     total_records = 0
     
@@ -120,8 +128,8 @@ def convert_jsonl_to_parquet(input_dir: str, output_dir: str, target_shard_size_
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Convert JSONL.GZ files to sharded Parquet files.")
-    parser.add_argument("input_dir", help="Input directory containing JSONL.GZ files")
+    parser = argparse.ArgumentParser(description="Convert compressed JSONL files (GZ or ZST) to sharded Parquet files.")
+    parser.add_argument("input_dir", help="Input directory containing compressed JSONL files")
     parser.add_argument("output_dir", help="Output directory for Parquet files")
     parser.add_argument("--shard_size", type=int, default=1000, help="Target shard size in MB (default: 1000)")
     parser.add_argument("--mode", choices=['abort', 'overwrite'], default='abort',

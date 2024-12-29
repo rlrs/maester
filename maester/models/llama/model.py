@@ -212,32 +212,21 @@ class Attention(nn.Module):
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
 
-        # xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        if True: # use sdpa
-            # repeat k/v heads if n_kv_heads < n_heads
-            keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_heads, head_dim)
-            values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_heads, head_dim)
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_heads, head_dim)
+        values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_heads, head_dim)
 
-            xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
-            xk = keys.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
-            xv = values.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+        xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+        xk = keys.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+        xv = values.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
 
-            # we use causal mask for training
-            output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True, scale=self.attn_scale)
-            output = output.transpose(
-                1, 2
-            ).contiguous()  # (bs, seqlen, n_heads, head_dim)
-        else: # use ROCm FA2, SDPA is slow
-            # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
-            # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
-            output = flash_attn_func( # TODO: test that this is correct wrt above!!
-                        xq,
-                        xk,
-                        xv,
-                        dropout_p=0.0,
-                        causal=True,
-                    )
+        # we use causal mask for training
+        output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True, enable_gqa=True, scale=self.attn_scale)
+        output = output.transpose(
+            1, 2
+        ).contiguous()  # (bs, seqlen, n_heads, head_dim)
 
         # assert output.shape == (bs, seqlen, self.n_heads, self.head_dim), f"attn: {output.shape} != {(bs, seqlen, self.n_heads, self.head_dim)}"
         output = output.view(bs, seqlen, -1)

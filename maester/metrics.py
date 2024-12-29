@@ -4,18 +4,24 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import dataclass, fields
+import math
+import json
 import os
-from collections import namedtuple
+import re
+from collections import defaultdict, namedtuple
 from datetime import datetime
 from typing import Any, Dict, Optional
-import json
 
 import torch
 import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
+
 import wandb
 from maester.config import Config
 from maester.log_utils import logger
+from maester.models.llama.model import repeat_kv
+
 
 def is_serializable(obj):
     try:
@@ -163,5 +169,171 @@ def build_metric_logger(config: Config, tag: Optional[str] = None):
         return WandbMetricLogger(config)
     return None # TODO: how to handle?
 
-
+class WeightScaleMonitor:
+    """Monitors RMS statistics to verify unit scaling is maintained during training."""
     
+    def __init__(self, 
+                model: torch.nn.Module,
+                log_freq: int = 100, 
+                ignored_substrings: Optional[set[str]] = None):
+        """
+        Args:
+            model: Model to monitor
+            log_freq: How often to compute and return statistics 
+            ignored_substrings: Parameter names containing these will be ignored
+            include_weight_changes: Track weight changes between steps
+        """
+        self.model = model
+        self.log_freq = log_freq
+        self.step = 0
+        self.ignored_substrings = ignored_substrings or set()
+        
+        # Stats dicts indexed by param/tensor name
+        self.weight_stats = defaultdict(list)
+
+    def _group_name(self, name: str) -> str:
+        """Convert parameter name to a grouped metric name."""
+        # Split on dots and common separators
+        parts = re.split(r'[._]', name)
+        
+        # Handle common transformer layer patterns
+        if 'layers' in parts:
+            layer_idx = parts[parts.index('layers') + 1]
+            # Group by layer type and number
+            if 'attention' in name:
+                return f"layer{layer_idx}/attention/{'/'.join(parts[-2:])}"
+            elif any(x in name for x in ['mlp', 'ffn']):
+                return f"layer{layer_idx}/ffn/{'/'.join(parts[-2:])}"
+            else:
+                return f"layer{layer_idx}/other/{'/'.join(parts[-2:])}"
+        elif 'embedding' in name:
+            return f"embedding/{'/'.join(parts[-2:])}"
+        elif 'norm' in name:
+            return f"norm/{'/'.join(parts[-2:])}"
+        elif 'output' in name:
+            return f"output/{'/'.join(parts[-2:])}"
+        else:
+            return f"other/{'/'.join(parts[-2:])}"
+
+    def _should_track(self, name: str) -> bool:
+        """Returns whether parameter/tensor should be tracked."""
+        return not any(ign in name for ign in self.ignored_substrings)
+
+    def _rms(self, tensor: torch.Tensor) -> float:
+        """Compute root mean square: sqrt(mean(x^2))."""
+        return math.sqrt(torch.mean(tensor ** 2).item())
+
+    def step_monitor(self) -> Optional[Dict[str, float]]:
+        """Call this after each optimization step to collect statistics."""
+        self.step += 1
+        
+        if self.step % self.log_freq == 0:
+            stats = {}
+            
+            for name, param in self.model.named_parameters():
+                if param.requires_grad and self._should_track(name):
+                    grouped_name = self._group_name(name)
+                    
+                    self.weight_stats[grouped_name].append(self._rms(param.data))
+                    stats[f"{grouped_name}/weight_rms"] = self.weight_stats[grouped_name][-1]
+            
+            return stats
+            
+        return None
+
+
+def register_logits_monitoring(model, train_state, log_freq, monitor_attention=False):
+    """Setup monitoring for output logits and optionally attention logits."""
+    n_layers = len(model.layers)
+    device = next(model.parameters()).device
+    output_stats = torch.zeros(4, device=device)
+    attention_stats = torch.zeros(n_layers, 4, device=device) if monitor_attention else None
+    
+    def should_log(step):
+        return step == 1 or step % log_freq == 0
+    
+    def log_output_hook(module, inp, out):
+        if not should_log(train_state.step):
+            return
+            
+        with torch.no_grad():
+            output_stats[0] = out.mean()
+            output_stats[1] = out.std() 
+            output_stats[2] = out.max()
+            output_stats[3] = out.min()
+    
+    output_hook = model.output.register_forward_hook(log_output_hook)
+    hooks = [output_hook]
+    
+    if monitor_attention:
+        def log_attention_hook(module, inp, out, layer_idx):
+            if not should_log(train_state.step):
+                return
+                
+            with torch.no_grad():
+                x = inp[0]
+                xq = module.wq(x)
+                xk = module.wk(x)
+                
+                bs, seqlen, _ = x.shape
+                xq = xq.view(bs, seqlen, -1, module.head_dim)
+                xk = xk.view(bs, seqlen, -1, module.head_dim)
+                
+                xk = repeat_kv(xk, module.n_rep)
+                
+                xq = xq.transpose(1, 2)
+                xk = xk.transpose(1, 2)
+                
+                attn_logits = torch.matmul(xq, xk.transpose(-2, -1)) * module.attn_scale
+                
+                head_means = attn_logits.mean(dim=[0, 2, 3])
+                head_maxes = attn_logits.max(dim=-1)[0].max(dim=-1)[0].mean(dim=0)
+                
+                # Convert layer_idx to tensor using same device as input
+                layer_idx_tensor = torch.tensor(layer_idx, device=x.device)
+                
+                attention_stats[layer_idx_tensor, 0] = attn_logits.mean()
+                attention_stats[layer_idx_tensor, 1] = attn_logits.max()
+                attention_stats[layer_idx_tensor, 2] = head_means.std()
+                attention_stats[layer_idx_tensor, 3] = head_maxes.mean()
+
+        # Use simple integers for hook registration
+        for i, layer in enumerate(model.layers.values()):
+            hook = layer.attention.register_forward_hook(
+                lambda mod, inp, out, idx=i: log_attention_hook(mod, inp, out, idx)
+            )
+            hooks.append(hook)
+    
+    def reinit_storage():
+        """Reinitialize storage tensors on the specified device."""
+        nonlocal output_stats, attention_stats
+        output_stats = torch.zeros(4, device="cuda")
+        if monitor_attention:
+            attention_stats = torch.zeros(n_layers, 4, device="cuda")
+    
+    def get_metrics():
+        metrics = {}
+        
+        metrics.update({
+            "output_logits/mean": output_stats[0].item(),
+            "output_logits/std": output_stats[1].item(),
+            "output_logits/max": output_stats[2].item(),
+            "output_logits/min": output_stats[3].item(),
+        })
+        
+        if attention_stats is not None:
+            for layer_idx in range(attention_stats.shape[0]):
+                metrics.update({
+                    f"attention/layer{layer_idx}/mean": attention_stats[layer_idx, 0].item(),
+                    f"attention/layer{layer_idx}/max": attention_stats[layer_idx, 1].item(),
+                    f"attention/layer{layer_idx}/head_mean_std": attention_stats[layer_idx, 2].item(),
+                    f"attention/layer{layer_idx}/head_max_mean": attention_stats[layer_idx, 3].item(),
+                })
+            
+        return metrics
+
+    def remove_hooks():
+        for hook in hooks:
+            hook.remove()
+    
+    return get_metrics, remove_hooks, reinit_storage

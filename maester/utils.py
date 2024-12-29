@@ -6,12 +6,21 @@
 
 import os
 from datetime import timedelta
+import re
+from typing import Iterable, Optional
 
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.distributed_c10d as c10d
+
 from torch.distributed.device_mesh import DeviceMesh
+from torch.utils._foreach_utils import (
+    _device_has_foreach_support,
+    _group_tensors_by_device_and_dtype,
+    _has_foreach_support,
+)
+from torch.nn.utils.clip_grad import _clip_grads_with_norm_
 
 from maester.log_utils import logger
 
@@ -135,3 +144,155 @@ def init_distributed(cfg):
     # async_op=True hold memory longer than they should
     # such as those in tensor parallelism
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+
+@torch.no_grad()
+def _get_norms(
+    tensors: Iterable[torch.Tensor] | torch.Tensor,
+    norm_type: float = 2.0,
+    error_if_nonfinite: bool = False,
+    foreach: Optional[bool] = None,
+) -> list[torch.Tensor]:
+    if isinstance(tensors, torch.Tensor):
+        tensors = [tensors]
+    else:
+        tensors = list(tensors)
+    norm_type = float(norm_type)
+    if len(tensors) == 0:
+        return []
+    grouped_tensors: dict[
+        tuple[torch.device, torch.dtype], tuple[list[list[torch.Tensor]], list[int]]
+    ] = _group_tensors_by_device_and_dtype(
+        [tensors]  # type: ignore[list-item]
+    )  # type: ignore[assignment]
+
+    norms: list[torch.Tensor] = []
+    for (device, _), ([device_tensors], _) in grouped_tensors.items():  # type: ignore[assignment]
+        if (foreach is None and _has_foreach_support(device_tensors, device)) or (
+            foreach and _device_has_foreach_support(device)
+        ):
+            norms.extend(torch._foreach_norm(device_tensors, norm_type))
+        elif foreach:
+            raise RuntimeError(
+                f"foreach=True was passed, but can't use the foreach API on {device.type} tensors"
+            )
+        else:
+            norms.extend(
+                [torch.linalg.vector_norm(g, norm_type) for g in device_tensors]
+            )
+    return norms
+
+
+@torch.no_grad
+def _get_total_norm(
+    norms: Iterable[torch.Tensor] | torch.Tensor,
+    norm_type: float = 2.0,
+    error_if_nonfinite: bool = False,
+    foreach: Optional[bool] = None,
+) -> torch.Tensor:
+    r"""Compute the norm of an iterable of norms.
+
+    Args:
+        tensors (Iterable[Tensor] or Tensor): an iterable of Tensors or a
+            single Tensor that will be normalized
+        norm_type (float): type of the used p-norm. Can be ``'inf'`` for
+            infinity norm.
+        error_if_nonfinite (bool): if True, an error is thrown if the total
+            norm of :attr:`tensors` is ``nan``, ``inf``, or ``-inf``.
+            Default: ``False``
+        foreach (bool): use the faster foreach-based implementation.
+            If ``None``, use the foreach implementation for CUDA and CPU native tensors and silently
+            fall back to the slow implementation for other device types.
+            Default: ``None``
+
+    Returns:
+        Total norm of the tensors (viewed as a single vector).
+    """
+    if isinstance(norms, torch.Tensor):
+        norms = [norms]
+    else:
+        norms = list(norms)
+    norm_type = float(norm_type)
+    if len(norms) == 0:
+        return torch.tensor(0.0)
+    first_device = norms[0].device
+    total_norm = torch.linalg.vector_norm(
+        torch.stack([norm.to(first_device) for norm in norms]), norm_type
+    )
+
+    if error_if_nonfinite and torch.logical_or(total_norm.isnan(), total_norm.isinf()):
+        raise RuntimeError(
+            f"The total norm of order {norm_type} for gradients from "
+            "`parameters` is non-finite, so it cannot be clipped. To disable "
+            "this error and scale the gradients by the non-finite norm anyway, "
+            "set `error_if_nonfinite=False`"
+        )
+    return total_norm
+
+@torch.no_grad()
+def clip_grad_norm(
+    parameters: Iterable[torch.Tensor] | torch.Tensor,
+    max_norm: float,
+    norm_type: float = 2.0,
+    error_if_nonfinite: bool = False,
+    foreach: Optional[bool] = None,
+) -> list[torch.Tensor]:
+    r"""Clip the gradient norm of an iterable of parameters.
+
+    The norm is computed over the norms of the individual gradients of all parameters,
+    as if the norms of the individual gradients were concatenated into a single vector.
+    Gradients are modified in-place.
+
+    This function is equivalent to :func:`torch.nn.utils.get_total_norm` followed by
+    :func:`torch.nn.utils.clip_grads_with_norm_` with the ``total_norm`` returned by ``get_total_norm``.
+
+    Args:
+        parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
+            single Tensor that will have gradients normalized
+        max_norm (float): max norm of the gradients
+        norm_type (float): type of the used p-norm. Can be ``'inf'`` for
+            infinity norm.
+        error_if_nonfinite (bool): if True, an error is thrown if the total
+            norm of the gradients from :attr:`parameters` is ``nan``,
+            ``inf``, or ``-inf``. Default: False (will switch to True in the future)
+        foreach (bool): use the faster foreach-based implementation.
+            If ``None``, use the foreach implementation for CUDA and CPU native tensors and silently
+            fall back to the slow implementation for other device types.
+            Default: ``None``
+
+    Returns:
+        Norms of each tensor
+    """
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    else:
+        # prevent generators from being exhausted
+        parameters = list(parameters)
+    grads = [p.grad for p in parameters if p.grad is not None]
+    norms = _get_norms(grads, norm_type, error_if_nonfinite, foreach)
+    total_norm = _get_total_norm(norms, norm_type, error_if_nonfinite, foreach)
+    _clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
+    return norms
+
+def clean_param_name(name: str) -> str:
+    """Convert parameter name to a grouped metric name."""
+    # Split on dots and common separators
+    parts = re.split(r'[._]', name)
+    
+    # Handle common transformer layer patterns
+    if 'layers' in parts:
+        layer_idx = parts[parts.index('layers') + 1]
+        # Group by layer type and number
+        if 'attention' in name:
+            return f"layer{layer_idx}/attention/{'/'.join(parts[-2:])}"
+        elif any(x in name for x in ['mlp', 'ffn']):
+            return f"layer{layer_idx}/ffn/{'/'.join(parts[-2:])}"
+        else:
+            return f"layer{layer_idx}/other/{'/'.join(parts[-2:])}"
+    elif 'embedding' in name:
+        return f"embedding/{'/'.join(parts[-2:])}"
+    elif 'norm' in name:
+        return f"norm/{'/'.join(parts[-2:])}"
+    elif 'output' in name:
+        return f"output/{'/'.join(parts[-2:])}"
+    else:
+        return f"other/{'/'.join(parts[-2:])}"
