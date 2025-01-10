@@ -6,7 +6,8 @@ authors = [
     { name = "Rasmus Larsen", email = "rasmus.larsen@alexandra.dk" }
 ]
 dependencies = [
-    "torch>=2.2.2",
+    "torch>=2.5",
+    "transformers>=4.47.1",
     # "hydra-core>=1.3.2",
     "datasets>=2.16.0",
     # "pandas>=2.0,<2.2",
@@ -20,9 +21,13 @@ dependencies = [
     "pydantic",
     # "mosaicml-streaming",
     "tensorboard",
-    "distributed-shampoo",
-    "torchdata>=0.8.0",
+    # "distributed-shampoo",
     "pydantic-settings>=2.6.0",
+    # "pytorch-triton-rocm",
+    "torchvision",
+    "torchdata",
+    "scandeval",
+    "triton",
 ]
 readme = "README.md"
 requires-python = ">= 3.10"
@@ -43,9 +48,10 @@ allow-direct-references = true
 [tool.hatch.build.targets.wheel]
 packages = ["src/maester"]
 
-[[tool.rye.sources]]
-name = "pytorch-nightly"
-url = "https://download.pytorch.org/whl/nightly/cu121"
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/nightly/rocm6.2"
+explicit = true
 
 [tool.pylint."MESSAGES CONTROL"]
 max-line-length = 120
@@ -57,3 +63,18 @@ venv = ".venv"
 
 [tool.uv.sources]
 distributed-shampoo = { git = "https://github.com/facebookresearch/optimizers.git" }
+torch = [
+    { index = "pytorch-rocm", marker = "platform_system == 'Linux'" },
+]
+torchvision = [
+    { index = "pytorch-rocm", marker = "platform_system == 'Linux'" },
+]
+pytorch-triton-rocm = [
+    { index = "pytorch-rocm", marker = "platform_system == 'Linux'" },
+]
+torchdata = [
+    { index = "pytorch-rocm", marker = "platform_system == 'Linux'" },
+]
+triton = [
+    { index = "pytorch-rocm", marker = "platform_system == 'Linux'" },
+]
