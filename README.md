@@ -139,7 +139,8 @@ The framework implements μP (muP) parametrization for principled hyperparameter
 A basic validation of the μP implementation showing expected behavior across different model scales.
 
 ### Learning Rate Transfer
-![Learning Rate Transfer](assets/mutransfer.png)
+<img src="assets/mutransfer.png" width="300" alt="Learning Rate Transfer">
+
 Demonstration of successful learning rate transfer between models of different sizes, a key benefit of μP parametrization.
 
 The plots themselves can be reproduced using the scripts in the `plots/` directory.
