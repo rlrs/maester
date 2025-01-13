@@ -130,6 +130,20 @@ python scripts/convert_dcp_to_hf.py \
     --base base-model-name
 ```
 
+## μP (muP) Validation
+
+The framework implements μP (muP) parametrization for principled hyperparameter transfer between models of different scales. Here are two validation experiments:
+
+### Coordinate Check
+![Coordinate Check](assets/coord-check.png)
+A basic validation of the μP implementation showing expected behavior across different model scales.
+
+### Learning Rate Transfer
+![Learning Rate Transfer](assets/mutransfer.png)
+Demonstration of successful learning rate transfer between models of different sizes, a key benefit of μP parametrization.
+
+The plots themselves can be reproduced using the scripts in the `plots/` directory.
+
 ## Project Structure
 
 - `maester/`: Core library code
