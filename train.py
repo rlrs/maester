@@ -206,34 +206,10 @@ def main():
                     logger.info(f"No activation hook registered for {module_name}")
             logger.info(f"Activation hooks registered for {len(activation_hooks)} modules")
 
-
-        # build dataloader
-        # data_loader = build_hf_data_loader(
-        #     "c4_mini",
-        #     "src/maester/datasets/c4_mini",
-        #     tokenizer,
-        #     cfg.train_batch_size,
-        #     cfg.seq_len,
-        #     dp_degree,
-        #     dp_rank,
-        # )
-        # data_loader = get_data_loader(cfg, rank=dist.get_rank(), world_size=world_size) # IBM
-        #data_loader = MosaicDataLoader(dataset=MosaicDataset(dataset_path="/scratch/project_465000670/2024-v2/tokenized/train", batch_size=cfg.train_batch_size),
-        #                         batch_size=cfg.train_batch_size, num_workers=1, pin_memory=True, shuffle=False, persistent_workers=True)
         data_loader = build_experimental_data_loader(cfg, rank=dp_rank, world_size=dp_degree)
 
         # data_monitor = DataMonitor(train_state, log_freq=cfg.log_freq)
 
-        # TODO: very ugly, temporary hack for epoch calc
-        # dataset_num_samples = len(data_loader)
-        # dataset_samples_per_step = dp_mesh.size() * cfg.train_batch_size # type: ignore (dp_mesh exists)
-        # dataset_steps_in_epoch = dataset_num_samples // dataset_samples_per_step
-        # logger.info(f"Dataset contains {dataset_num_samples} samples.\n\
-        #             A step uses {dataset_samples_per_step} samples.\n\
-        #             There are {dataset_steps_in_epoch} steps in an epoch.")
-
-        # build optimizer after model parallelization
-        # optimizer: torch.optim.Optimizer = cfg.opt_class(sharded_model.parameters(), **cfg.opt_cfg)
         if cfg.enable_mup:
             mup_decay_params = []
             decay_params = []

@@ -11,7 +11,6 @@ class ParallelDims:
     dp_replicate: int
     dp_shard: int
     tp: int
-    pp: int
     world_size: int
     enable_loss_parallel: bool
 
@@ -19,31 +18,30 @@ class ParallelDims:
         self._validate()
 
     def _validate(self):
-        dp_replicate, dp_shard, tp, pp = self.dp_replicate, self.dp_shard, self.tp, self.pp
-        for d in (dp_replicate, tp, pp):
+        dp_replicate, dp_shard, tp = self.dp_replicate, self.dp_shard, self.tp
+        for d in (dp_replicate, tp):
             assert d >= 1, "Parallelism degree should be >= 1, except for dp_shard"
         assert dp_shard == -1 or dp_shard >= 1, " dp_shard must -1 or >=1."
 
         dp = dp_replicate * dp_shard
         if dp < 0:
-            dp = self.world_size // (tp * pp)
+            dp = self.world_size // (tp)
             self.dp_shard = dp_shard = dp // dp_replicate
 
         assert dp_replicate >= 1
         assert dp_shard >= 1
         assert tp >= 1, tp
-        assert pp >= 1, pp
-        assert dp_replicate * dp_shard * tp * pp == self.world_size, (
+        assert dp_replicate * dp_shard * tp == self.world_size, (
             f"Invalid parallel dims: dp_replicate({dp_replicate}) * dp_shard({dp_shard}) * "
-            f"tp({tp}) * pp({pp}) != WORLD_SIZE({self.world_size})"
+            f"tp({tp}) != WORLD_SIZE({self.world_size})"
         )
 
     def build_mesh(self, device_type):
         dims = []
         names = []
         for d, name in zip(
-            [self.pp, self.dp_replicate, self.dp_shard, self.tp],
-            ["pp", "dp_replicate", "dp_shard", "tp"],
+            [self.dp_replicate, self.dp_shard, self.tp],
+            ["dp_replicate", "dp_shard", "tp"],
         ):
             if d > 1:
                 dims.append(d)
@@ -79,13 +77,9 @@ class ParallelDims:
         return self.tp > 1
 
     @property
-    def pp_enabled(self):
-        return self.pp > 1
-
-    @property
     def loss_parallel_enabled(self):
         return self.tp > 1 and self.enable_loss_parallel
 
     @cached_property
     def model_parallel_size(self):
-        return self.tp * self.pp
+        return self.tp
