@@ -34,7 +34,7 @@ uv sync
 #### Configuration System
 
 The framework uses a Pydantic-based configuration system that allows for:
-- Configuration via YAML files, environment variables, and command-line arguments
+- Configuration via JSON files, environment variables, and command-line arguments
 - Strict type checking and validation
 - Nested configurations for model, training, and infrastructure settings
 
@@ -145,7 +145,7 @@ This project builds upon several open-source projects:
 
 - [pytorch/torchtitan](https://github.com/pytorch/torchtitan): Many core features are based on `torchtitan`.
 - [IBM's experimental dataloader](https://github.com/pytorch/torchtitan/pull/376): Distributed dataloader contribution. This framework uses a modified, on-the-fly tokenization pipeline that reads raw texts from Parquet files.
-- [μP (muP)](https://github.com/microsoft/mup): Implementation inspired by Microsoft's muP framework for principled parameter scaling.
+- [μP (muP)](https://github.com/microsoft/mup): Implementation inspired by Microsoft's muP framework for principled hyperparameter transfer.
 
 ## License
 
