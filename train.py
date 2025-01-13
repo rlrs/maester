@@ -85,7 +85,6 @@ def main():
         dp_shard=cfg.data_parallel_shard_degree,
         dp_replicate=cfg.data_parallel_replicate_degree,
         tp=cfg.tensor_parallel_degree,
-        pp=cfg.pipeline_parallel_degree,
         world_size=world_size,
         enable_loss_parallel=cfg.enable_loss_parallel,
     )
@@ -241,7 +240,6 @@ def main():
             loss_parallel if parallel_dims.loss_parallel_enabled else contextlib.nullcontext
         )
 
-        # loss fn can be shared by pipeline-parallel or non-pp execution
         def loss_fn(pred, labels):
             return F.cross_entropy(pred.flatten(0, 1).float(), labels.flatten(0, 1))
         
