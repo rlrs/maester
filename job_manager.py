@@ -25,9 +25,9 @@ class JobManager:
         self.init_db()
         
         # Configuration
-        self.submit_interval = 600
-        self.check_interval = 60
-        self.cancel_threshold = 300
+        self.submit_interval = 60 * 60 # 1 hour
+        self.check_interval = 30
+        self.cancel_threshold = 60 * 10
         self.status_interval = 30
         
         # Scan existing state
@@ -99,9 +99,15 @@ class JobManager:
         else:
             days = 0
             rest = time_str
-            
-        h, m, s = map(int, rest.split(':'))
-        return timedelta(days=days, hours=h, minutes=m, seconds=s)
+        
+        parts = rest.split(':')
+        if len(parts) == 3:
+            h, m, s = map(int, parts)
+            return timedelta(days=days, hours=h, minutes=m, seconds=s)
+        elif len(parts) == 2:
+            m, s = map(int, parts)
+            return timedelta(days=days, minutes=m, seconds=s)
+        raise ValueError(f"Invalid time string: {time_str}")
 
     def find_running_jobs(self) -> List[Tuple[str, timedelta]]: # (job_id, runtime)
         """Find any currently running jobs if any"""
@@ -399,7 +405,7 @@ class JobManager:
                 time.sleep(self.check_interval)
                 
             except Exception as e:
-                logger.error(f"Error in main loop: {e}")
+                logger.error(f"Error in main loop: {e}", exc_info=1)
                 time.sleep(self.check_interval)
 
 if __name__ == "__main__":
