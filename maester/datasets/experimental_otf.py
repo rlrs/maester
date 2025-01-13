@@ -1,3 +1,5 @@
+# IBM experimental dataloader contributed to torchtitan but not merged.
+# Modified here to include on-the-fly tokenization, reading raw texts from Parquet.
 import csv
 import hashlib
 import json
