@@ -100,10 +100,22 @@ Each job gets its own directory under `jobs/` containing:
    python sweep.py status sweeps/my_sweep
    ```
 
-### Training a Model
+### Running Training Jobs
 
+#### On SLURM Systems (Recommended)
+Use the job submission system:
 ```bash
-python train.py
+# Submit a single training job
+python submit.py config.yaml
+
+# Or run a parameter sweep
+python sweep.py submit sweep_config.py
+```
+
+#### Direct Execution
+For development or non-SLURM environments, you can run the training script directly:
+```bash
+torchrun --nproc_per_node=8 train.py
 ```
 
 ### Converting and Uploading Checkpoints
@@ -125,7 +137,7 @@ python scripts/convert_dcp_to_hf.py \
   - `parallelisms/`: Distributed training implementations
 - `scripts/`: Utility scripts for training, conversion, etc.
 - `jobs/`: Job management and configuration
-- `tests/`: Test suite
+- `tests/`: Test suite (WIP)
 
 ## Credits
 
