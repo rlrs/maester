@@ -178,17 +178,21 @@ class CheckpointManager:
                     self.states = self.states["model"]
                 else:
                     self.states = self.states["model"].state_dict()
+            self.states = {"model": self.states}
 
             if self.export_dtype != torch.float32:
-                self.states = {
-                    k: v.to(self.export_dtype) for k, v in self.states.items()
-                }
+                for k, v in self.states.items():
+                    self.states[k] = {
+                        k2: v2.to(self.export_dtype) for k2, v2 in v.items()
+                    }
             logger.info(
                 f"Saving a model weights only checkpoint in {self.export_dtype} at step {curr_step}"
             )
 
         else:
             logger.info(f"Saving a full checkpoint at step {curr_step}")
+
+        logger.info(f"CheckpointManager: State dict keys: {self.states.keys()}")
 
         begin = time.monotonic()
         dcp.save(self.states, checkpoint_id=self._create_checkpoint_id(curr_step))

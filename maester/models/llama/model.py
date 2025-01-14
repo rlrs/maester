@@ -9,6 +9,7 @@
 
 
 from dataclasses import dataclass
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -34,13 +35,17 @@ class ModelArgs:
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
     rope_theta: float = 10000
+    init_std: float = 0.02
 
     max_batch_size: int = 32
     max_seq_len: int = 2048
-    # If `True`, then each transformer block init uses its layer ID, and if
-    # `False`, each uses the total number of transformer blocks
-    depth_init: bool = False
     norm_type: str = "rmsnorm"
+
+    # mup args are set by training config
+    enable_mup: bool = False # if False, these args are ignored
+    mup_input_alpha: float = 1.0
+    mup_output_alpha: float = 1.0
+    mup_width_mul: float = 1.0 # = width / base_width
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
@@ -176,6 +181,7 @@ class Attention(nn.Module):
         self.wo = nn.Linear(
             model_args.n_heads * self.head_dim, model_args.dim, bias=False
         )
+        self.attn_scale = 1.0 / self.head_dim if model_args.enable_mup else 1.0 / math.sqrt(self.head_dim)
 
     def init_weights(self, init_std: float):
         for linear in (self.wq, self.wk, self.wv):
@@ -208,30 +214,19 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        if True: # use sdpa
-            # repeat k/v heads if n_kv_heads < n_heads
-            keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_heads, head_dim)
-            values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_heads, head_dim)
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_heads, head_dim)
+        values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_heads, head_dim)
 
-            xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
-            xk = keys.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
-            xv = values.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+        xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+        xk = keys.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+        xv = values.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
 
-            # we use causal mask for training
-            output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
-            output = output.transpose(
-                1, 2
-            ).contiguous()  # (bs, seqlen, n_heads, head_dim)
-        else: # use ROCm FA2, SDPA is slow
-            # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
-            # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
-            output = flash_attn_func( # TODO: test that this is correct wrt above!!
-                        xq,
-                        xk,
-                        xv,
-                        dropout_p=0.0,
-                        causal=True,
-                    )
+        # we use causal mask for training
+        output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True, enable_gqa=True, scale=self.attn_scale)
+        output = output.transpose(
+            1, 2
+        ).contiguous()  # (bs, seqlen, n_heads, head_dim)
 
         # assert output.shape == (bs, seqlen, self.n_heads, self.head_dim), f"attn: {output.shape} != {(bs, seqlen, self.n_heads, self.head_dim)}"
         output = output.view(bs, seqlen, -1)
@@ -323,10 +318,10 @@ class TransformerBlock(nn.Module):
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
         )
 
-        if model_args.depth_init:
-            self.weight_init_std = 0.02 / (2 * (self.layer_id + 1)) ** 0.5
+        if model_args.enable_mup:
+            self.weight_init_std = model_args.init_std / math.sqrt(model_args.mup_width_mul)
         else:
-            self.weight_init_std = 1. / model_args.dim
+            self.weight_init_std = model_args.init_std
 
     def forward(
         self,
@@ -382,13 +377,6 @@ class Transformer(nn.Module):
 
         self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
 
-        # TODO persistent should be set to false, since this buffer can be recomputed.
-        # however, we set it to true for 2 reasons.  (1) due to pytorch/pytorch#123411,
-        # compile or pipeline-tracer will not correctly handle non-persistent buffers,
-        # so we need to fix that.  (2) if we initialize pipeline-parallel models from
-        # a seed checkpoint rather than calling init_weights, we need freqs_cis to be
-        # initialized by the checkpoint, or we need to add a separate initializer for
-        # just the non-persistent buffers that is called after loading checkpoints.
         self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=False)
 
         self.layers = torch.nn.ModuleDict()
@@ -416,16 +404,11 @@ class Transformer(nn.Module):
         """
         with torch.device(self.freqs_cis.device):
             self.freqs_cis = self._precompute_freqs_cis()
-        nn.init.normal_(self.tok_embeddings.weight)
+        nn.init.normal_(self.tok_embeddings.weight, std=self.model_args.init_std)
         for layer in self.layers.values():
             layer.init_weights()
         self.norm.reset_parameters()
-        readout_std = 1. / self.model_args.dim
-        nn.init.normal_(
-            self.output.weight,
-            mean=0.0,
-            std=readout_std,
-        )
+        nn.init.normal_(self.output.weight, std=self.model_args.init_std)
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
         return precompute_freqs_cis(
@@ -447,13 +430,17 @@ class Transformer(nn.Module):
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
-        h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
+        h = self.tok_embeddings(tokens)
+        if self.model_args.enable_mup:
+            h *= self.model_args.mup_input_alpha
 
         for layer in self.layers.values():
             h = layer(h, self.freqs_cis)
-        h = self.norm(h) if self.norm else h
-        output = self.output(h) if self.output else h
+        h = self.norm(h)
+        if self.model_args.enable_mup:
+            # Scaling `h` instead of `output` allows coord check to log the actual output 
+            h *= self.model_args.mup_output_alpha / self.model_args.mup_width_mul
+        output = self.output(h)
         return output
 
     @classmethod

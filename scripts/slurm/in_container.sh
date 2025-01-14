@@ -17,10 +17,13 @@ source .venv/bin/activate
 
 export NCCL_SOCKET_IFNAME=hsn0,hsn1,hsn2,hsn3
 export OMP_NUM_THREADS=1
+export NCCL_NET_GDR_LEVEL=3
+export NCCL_CROSS_NIC=1
 
 export TORCH_EXTENSIONS_DIR=torch_extensions
 mkdir -p $TORCH_EXTENSIONS_DIR
 
+# export TORCH_LOGS=dynamic,guards # debug torch compile
 # export NCCL_DEBUG=INFO
 # export NCCL_DEBUG_SUBSYS=COLL # to debug a specific NCCL subsystem, default is INIT
 # export NCCL_COMM_BLOCKING=1

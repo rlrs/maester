@@ -1,21 +1,20 @@
 import csv
 import hashlib
 import json
-import logging
 import math
 import os
 import random
 import time
 from typing import Any, Callable, List, Optional, Set
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 import torch.distributed as dist
 import torch.utils.data
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from maester.log_utils import logger
 
 """
 The following distributed dataloaders are designed around 3 main principles:
@@ -250,7 +249,7 @@ class _Wrapper_Dataset(_Stateful_Dataset):
         state = super().state_dict()
         for flag in self.state_params + self.reshard_params:
             if flag in out:
-                logging.warning(
+                logger.warning(
                     f"Loader {self.rank}: flag {flag} already present in state_dict with value {out[flag]}. "
                     + f"Overwriting with value {state[flag]}"
                 )
@@ -699,7 +698,7 @@ class Streaming_Doc_Dataset(_Stateful_Dataset):
         self._len = doccount
 
         if verbose:
-            logging.info(
+            logger.info(
                 f"    Worker {rank} ingested {len(shardfrags)} shard fragments from {dataset}"
             )
 
@@ -751,7 +750,7 @@ class Streaming_Doc_Dataset(_Stateful_Dataset):
         if newpath != path:
             del reader
             if self.verbose:
-                logging.info(f"Worker {self.rank} opening new file {newpath}")
+                logger.info(f"Worker {self.rank} opening new file {newpath}")
             reader = pa.ipc.open_file(newpath)
             path = newpath
         return path, reader
@@ -956,8 +955,8 @@ class ParquetDataset(_Stateful_Dataset):
         self._len = doccount
 
         if verbose:
-            logging.info(f"Worker {rank} responsible for docs: {self.docset}")
-            logging.info(f"Total docs: {doccount}")
+            logger.info(f"Worker {rank} responsible for docs: {self.docset}")
+            logger.info(f"Total docs: {doccount}")
 
         # Shuffle files
         if shuffle:
@@ -996,13 +995,13 @@ class ParquetDataset(_Stateful_Dataset):
         start = time.time()
         with open(cache_file, 'r') as f:
             self.docs_per_file = json.load(f)
-        logging.info(f"Loaded cached document counts in {time.time() - start} seconds")
+        logger.info(f"Loaded cached document counts in {time.time() - start} seconds")
 
     def _save_cached_doc_counts(self, cache_file):
         """Save document counts to a cache file."""
         with open(cache_file, 'w') as f:
             json.dump(self.docs_per_file, f)
-        logging.info(f"Saved document counts cache to {cache_file}")
+        logger.info(f"Saved document counts cache to {cache_file}")
 
     def _gather_doc_counts(self):
         """Gather document counts for each Parquet file."""
@@ -1014,7 +1013,7 @@ class ParquetDataset(_Stateful_Dataset):
             self.docs_per_file[file] = num_rows
             total_rows += num_rows
         assert total_rows > 0, "No rows found in parquet files"
-        logging.info(f"Gathered {total_rows} rows in {time.time() - start} seconds")
+        logger.info(f"Gathered {total_rows} rows in {time.time() - start} seconds")
 
     def _get_docid(self, i):
         """
@@ -1034,7 +1033,7 @@ class ParquetDataset(_Stateful_Dataset):
         if newpath != path:
             del reader
             if self.verbose:
-                logging.info(f"Worker {self.rank} opening new file {newpath}")
+                logger.info(f"Worker {self.rank} opening new file {newpath}")
             reader = pq.ParquetFile(newpath)
             path = newpath
         return path, reader
@@ -1103,7 +1102,7 @@ class ParquetDataset(_Stateful_Dataset):
                 if doc_index == 0:
                     self.epochs_seen += 1
                     if self.verbose:
-                        logging.info(f"ParquetDataset: entering epoch {self.epochs_seen}")
+                        logger.info(f"ParquetDataset: entering epoch {self.epochs_seen}")
                 self.docset_index = doc_index
 
                 # Map docset id to file, owned size and in-doc owned start idx
@@ -1123,7 +1122,7 @@ class ParquetDataset(_Stateful_Dataset):
                 text = table['text'][0].as_py()
                 doc = self.tokenizer.encode(text, add_special_tokens=False, padding=False, truncation=False)
                 if len(doc) < 2:
-                    logging.warning(f"Empty document detected at {file_path}:{local_row}")
+                    logger.warning(f"Empty document detected at {file_path}:{local_row}")
                     continue
 
                 if doc[0] in self.drop:
@@ -1243,7 +1242,7 @@ class Sampling_Dataset(_Stateful_Dataset):
                 )
             )
             if verbose:
-                logging.info(
+                logger.info(
                     f"Worker {rank} assembled subdataset iterator for {d}, {i+1} of {len(data_dirs)}"
                 )
             
@@ -1257,8 +1256,11 @@ class Sampling_Dataset(_Stateful_Dataset):
             if self.current_iterator != -1:
                 # Finish current document
                 out = next(self.iterators[self.current_iterator])
+                if len(out) == 0:
+                    logger.warning(f"Sampling_Dataset: empty document detected in iterator {self.current_iterator}, treating as end of iterator.")
+                    self.current_iterator = -1
+                    continue
                 self.tokens_seen[self.current_iterator] += len(out)
-                # print(f"Sampling_Dataset: yielding from iterator {self.current_iterator}, tokens: {out[:5]}...")
                 if out[-1] == self.delimiter:
                     self.current_iterator = -1
                 yield out
@@ -1272,7 +1274,6 @@ class Sampling_Dataset(_Stateful_Dataset):
                 ]
                 offset_argmax = max((diff, i) for i, diff in enumerate(offset))[1]
                 self.current_iterator = offset_argmax
-                # print(f"Sampling_Dataset: switched to iterator {self.current_iterator}")
 
     def state_dict(self):
         # Manually add state of all subloaders to self state
@@ -1370,7 +1371,7 @@ class Scalable_Shard_Dataset(_Stateful_Dataset):
                 )
             )
             if verbose:
-                logging.info(
+                logger.info(
                     f"Worker {rank} assembled logical shard {self.logicals_owned[i]}, {i+1} of {self.n_logicals}"
                 )
 
@@ -1465,7 +1466,8 @@ def build_experimental_data_loader(cfg, rank, world_size):
         t[:prompt_len] = -100
         return data_seq, t
     
-    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+    # tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=cfg.tokenizer_name)
 
     # Base streaming dataset. Returns doc chunks in sequence.
     # Implements dataset sampling and rescalability.
@@ -1510,7 +1512,7 @@ def build_experimental_data_loader(cfg, rank, world_size):
         )
     # warning: things *will* break with num_workers > 1
     return torch.utils.data.DataLoader(
-        data, num_workers=1, prefetch_factor=2, batch_size=cfg.train_batch_size, pin_memory=True, persistent_workers=True
+        data, num_workers=1, prefetch_factor=8, batch_size=cfg.train_batch_size, pin_memory=True, persistent_workers=True
     )
 
 
