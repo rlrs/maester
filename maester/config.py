@@ -39,7 +39,6 @@ class Config(BaseSettings):
     data_parallel_shard_degree: int = 8
     data_parallel_replicate_degree: int = 128
     tensor_parallel_degree: int = 1
-    pipeline_parallel_degree: int = 1 # not implemented
     train_batch_size: int = 4 # per device; 4 * 8 gpus * 128 nodes * 4096 seqlen = 16.7M tokens per batch
     train_num_steps: int = 100000 # ~1.7T tokens
     compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
