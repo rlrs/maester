@@ -66,11 +66,12 @@ def load_model(model_dir: str, device: str = "cuda") -> tuple[Transformer, PreTr
     model.eval()
     return model, tokenizer, config
 
-def convert_dcp_to_hf(
+def convert_mup_to_hf(
     input_dir: str,
     output_dir: str,
+    do_permute: bool,
 ):
-    print("Loading DCP model...")
+    print("Loading MUP model...")
     model, tokenizer, config = load_model(input_dir, device="cpu")
     
     print("Converting the model to HF format...")
@@ -125,13 +126,27 @@ def convert_dcp_to_hf(
     
     # Embeddings
     state_dict["model.embed_tokens.weight"] = model.tok_embeddings.weight
+
+    dim = model.model_args.dim
+    # permute for sliced rotary
+    def permute(w, n_heads, dim1=dim, dim2=dim):
+        return w.view(n_heads, dim1 // n_heads // 2, 2, dim2).transpose(1, 2).reshape(dim1, dim2)
     
     # Layers
     for i in range(model.n_layers):
         layer = model.layers[str(i)]
         # Attention weights
-        state_dict[f"model.layers.{i}.self_attn.q_proj.weight"] = layer.attention.wq.weight
-        state_dict[f"model.layers.{i}.self_attn.k_proj.weight"] = layer.attention.wk.weight
+        if do_permute:
+            dims_per_head = dim // model.model_args.n_heads
+            num_key_value_heads = model.model_args.n_kv_heads
+            key_value_dim = dims_per_head * num_key_value_heads
+            state_dict[f"model.layers.{i}.self_attn.q_proj.weight"] = permute(layer.attention.wq.weight,
+                                                                              model.model_args.n_heads)
+            state_dict[f"model.layers.{i}.self_attn.k_proj.weight"] = permute(layer.attention.wk.weight,
+                                                                              num_key_value_heads, dim1=key_value_dim)
+        else:
+            state_dict[f"model.layers.{i}.self_attn.q_proj.weight"] = layer.attention.wq.weight
+            state_dict[f"model.layers.{i}.self_attn.k_proj.weight"] = layer.attention.wk.weight
         state_dict[f"model.layers.{i}.self_attn.v_proj.weight"] = layer.attention.wv.weight
         state_dict[f"model.layers.{i}.self_attn.o_proj.weight"] = layer.attention.wo.weight
         
@@ -167,8 +182,9 @@ def convert_dcp_to_hf(
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_dir", type=str, required=True, help="Directory containing DCP model")
+    parser.add_argument("--input_dir", type=str, required=True, help="Directory containing muP model")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save HF model")
+    parser.add_argument("--permute", action="store_true", help="Permute weights for HF-style RoPE")
     args = parser.parse_args()
     
-    convert_dcp_to_hf(args.input_dir, args.output_dir)
+    convert_mup_to_hf(args.input_dir, args.output_dir, do_permute=args.permute)

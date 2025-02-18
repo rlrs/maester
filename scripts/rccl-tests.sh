@@ -2,10 +2,10 @@
 #SBATCH --job-name=rccl_benchmark
 #SBATCH --output=rccl_bench_%j.out
 #SBATCH --error=rccl_bench_%j.err
-#SBATCH --nodes=8
+#SBATCH --nodes=16
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
-#SBATCH --time=00:30:00
+#SBATCH --time=00:20:00
 #SBATCH --partition=standard-g
 #SBATCH --account=project_465000954
 #SBATCH --switches=1
@@ -78,26 +78,26 @@ for node in $NODELIST; do
     srun --nodes=1 --ntasks=1 -w $node hwloc-ls >> ${RESULTS_DIR}/topology.txt 2>&1
     
     # Network interface info
-    echo "Network Interface Info:" >> ${RESULTS_DIR}/topology.txt
-    srun --nodes=1 --ntasks=1 -w $node ibstat >> ${RESULTS_DIR}/topology.txt 2>&1 || true
-    srun --nodes=1 --ntasks=1 -w $node ibv_devinfo >> ${RESULTS_DIR}/topology.txt 2>&1 || true
+    # echo "Network Interface Info:" >> ${RESULTS_DIR}/topology.txt
+    # srun --nodes=1 --ntasks=1 -w $node ibstat >> ${RESULTS_DIR}/topology.txt 2>&1 || true
+    # srun --nodes=1 --ntasks=1 -w $node ibv_devinfo >> ${RESULTS_DIR}/topology.txt 2>&1 || true
 done
 
 # Try to get network topology between nodes
-echo -e "\n=== Network Distance Matrix ===" >> ${RESULTS_DIR}/topology.txt
-for src in $NODELIST; do
-    for dst in $NODELIST; do
-        if [ "$src" != "$dst" ]; then
-            echo "Distance $src -> $dst:" >> ${RESULTS_DIR}/topology.txt
-            # Try different ways to get network distance/hops
-            srun --nodes=1 --ntasks=1 -w $src traceroute $dst >> ${RESULTS_DIR}/topology.txt 2>&1 || true
-        fi
-    done
-done
+# echo -e "\n=== Network Distance Matrix ===" >> ${RESULTS_DIR}/topology.txt
+# for src in $NODELIST; do
+#     for dst in $NODELIST; do
+#         if [ "$src" != "$dst" ]; then
+#             echo "Distance $src -> $dst:" >> ${RESULTS_DIR}/topology.txt
+#             # Try different ways to get network distance/hops
+#             srun --nodes=1 --ntasks=1 -w $src traceroute $dst >> ${RESULTS_DIR}/topology.txt 2>&1 || true
+#         fi
+#     done
+# done
 
 COLLECTIVES=(
-    #"all_reduce"
-    "all_gather"
+    "all_reduce"
+    # "all_gather"
     #"alltoall"
     #"alltoallv" 
     #"broadcast"
