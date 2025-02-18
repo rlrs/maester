@@ -431,8 +431,8 @@ class Transformer(nn.Module):
 
         """
         h = self.tok_embeddings(tokens)
-        if self.model_args.enable_mup:
-            h *= self.model_args.mup_input_alpha
+        # if self.model_args.enable_mup: # TODO: re-enable (disabled because it breaks TP)
+            # h *= self.model_args.mup_input_alpha
 
         for layer in self.layers.values():
             h = layer(h, self.freqs_cis)
