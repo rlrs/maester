@@ -1,9 +1,8 @@
-import pytest
+import time
 import torch
 import os
 from typing import Tuple, Type, Any
 
-from pydantic import BaseModel, ConfigDict
 from maester.log_utils import init_logger, logger
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -67,17 +66,21 @@ def generate(
 @torch.inference_mode()
 def main():
     init_logger()
-    logger.info(f"Starting generation.")
+    logger.info(f"Starting.")
 
-    model_name = "meta-llama/Meta-Llama-3-8B"
+    model_name = "../fineweb-1B-llama2/step-10000"
+    start = time.time()
     model = AutoModelForCausalLM.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    print(f"Loaded model in {time.time() - start:.2f}s")
 
-    tks = tokenizer.encode("Barack Obama is")
+    start = time.time()
+    tks = tokenizer.encode("Donald Trump is")
     input_ids = torch.LongTensor(tks)
-    y = generate(model, input_ids, max_new_tokens=32, temperature=0.0, top_k=200)
+    y = generate(model, input_ids, max_new_tokens=128, temperature=0.2, top_k=200)
     output = tokenizer.decode(y.tolist())
     print(output)
+    print(f"Generated in {time.time() - start:.2f}s")
 
     # inputs = tokenizer("# Barack Obama\n", return_tensors="pt")
     # print(tks)

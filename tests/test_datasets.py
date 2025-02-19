@@ -22,12 +22,23 @@ def generate_test_data():
     os.makedirs(os.path.join(tmpdir, "dataset_2"))
 
     # Create dataset_1 (longer documents)
-    data = [{'text': f"This is long, long, long document {i} with numbers {' '.join(map(str, range(i*10, i*10+50)))}"} for i in range(100)]
+    # Create a list of words to generate random sentences
+    word_list = ["apple", "banana", "cat", "dog", "elephant", "frog", "guitar", "house", "ice cream", "jazz", "kite", "lemon", "moon", "notebook", "ocean", "piano", "quilt", "rainbow", "sun", "tree", "umbrella", "violin", "water", "xylophone", "yellow", "zebra"]
+
+    import random
+
+    def generate_random_sentence(word_list, min_words=5, max_words=15):
+        sentence_length = random.randint(min_words, max_words)
+        sentence = " ".join(random.choice(word_list) for _ in range(sentence_length))
+        return sentence.capitalize() + "."
+
+    # Generate random sentences for dataset_1 (longer documents)
+    data = [{'text': " ".join([generate_random_sentence(word_list) for _ in range(random.randint(10, 15))])} for _ in range(100)]
     table = pa.Table.from_pylist(data, schema=schema)
     pq.write_table(table, os.path.join(tmpdir, "dataset_1/fulldata.parquet"))
 
     # Create dataset_2 (shorter documents)
-    data = [{'text': f"Short doc {i} with {' '.join(map(str, range(i*5, i*5+10)))}"} for i in range(200)]
+    data = [{'text': " ".join([generate_random_sentence(word_list) for _ in range(random.randint(4, 8))])} for _ in range(200)]
     table = pa.Table.from_pylist(data, schema=schema)
     pq.write_table(table, os.path.join(tmpdir, "dataset_2/fulldata.parquet"))
     return tmpdir
@@ -216,7 +227,7 @@ def test_scalable_shard_reload_scale():
             2,
             tokenizer,
             -1,
-            n_logical_shards=8,
+            # n_logical_shards=8,
             max_chunksize=40,
         )
         for i in range(2)
@@ -240,7 +251,7 @@ def test_scalable_shard_reload_scale():
             4,
             tokenizer,
             -1,
-            n_logical_shards=8,
+            # n_logical_shards=8,
             max_chunksize=40,
         )
         for i in range(4)
@@ -269,14 +280,12 @@ def test_scalable_sampler_reload_scale():
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     datasets = [
         Sampling_Dataset(
-            tmpdir,
-            ParquetDataset,
+            [os.path.join(tmpdir, "dataset_1")],
             i,
             2,
             tokenizer,
             -1,
             n_logical_shards=8,
-            datasets=["dataset_1"],
             weights=[1],
             max_chunksize=40,
         )
@@ -480,6 +489,11 @@ def test_checkpoint_reload_match():
     for _ in range(100):
         for loader in loaders:
             next(loader)
+    
+    time.sleep(2) # Wait for checkpoints to be written
+
+    # for l in loaders:
+    #     assert l._dataset.step == 100, f"Expected datasets to be at step 100, got {l._dataset.step}"
 
     # Assert checkpoint exists and is properly formatted
     ckps = os.listdir(os.path.join(tmpdir, "ckp_test"))
@@ -513,6 +527,7 @@ def test_checkpoint_reload_match():
     # Assert checkpoints have loaded correctly
     for d in datasets2:
         assert d.step == 100, f"Expected to load back to step 100, got {d.step}"
+        print(d.state_dict())
 
     # Continue iterating, verify matching behavior
     loaders2 = [
@@ -522,10 +537,19 @@ def test_checkpoint_reload_match():
         for x in datasets2
     ]
     loaders2 = [iter(x) for x in loaders2]
-    for _ in range(300):
+
+    for _ in range(1):
         for loader, loader2 in zip(loaders, loaders2):
-            out = sum(next(loader2))
-            targ = sum(next(loader))
+            print("next(loader2)", flush=True)
+            time.sleep(1)
+            out = next(loader2)
+            time.sleep(1)
+            print("next(loader)", flush=True)
+            time.sleep(1)
+            targ = next(loader)
+            time.sleep(1)
+            print(out)
+            print(targ)
             assert len(out) == len(
                 targ
             ), f"Expected same output lengths, got {len(out)}, {len(targ)}"

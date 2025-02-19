@@ -12,10 +12,10 @@ from typing import Iterator, Optional
 import pyarrow as pa
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 
-def tokenize_batch(batch: dict, tokenizer) -> Iterator[list[int]]:
+def tokenize_batch(batch: dict, tokenizer: PreTrainedTokenizerFast) -> Iterator[list[int]]:
     """Tokenize a batch of documents."""
     texts = batch['text']
     tokenized = tokenizer(texts, padding=False, truncation=False)

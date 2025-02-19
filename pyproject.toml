@@ -1,16 +1,14 @@
 [project]
 name = "maester"
-version = "0.1.0"
+version = "0.2.0"
 description = "Add your description here"
 authors = [
     { name = "Rasmus Larsen", email = "rasmus.larsen@alexandra.dk" }
 ]
 dependencies = [
-    "torch>=2.5",
+    "torch>=2.6",
     "transformers>=4.47.1",
-    # "hydra-core>=1.3.2",
     "datasets>=2.16.0",
-    # "pandas>=2.0,<2.2",
     "numpy<2",
     "matplotlib>=3.8.4",
     "wandb>=0.16.6",
@@ -19,39 +17,70 @@ dependencies = [
     "blobfile",
     "sentencepiece",
     "pydantic",
-    # "mosaicml-streaming",
     "tensorboard",
     # "distributed-shampoo",
     "pydantic-settings>=2.6.0",
     # "pytorch-triton-rocm",
-    "torchvision",
-    "torchdata",
-    "scandeval",
+    # "torchvision",
+    # "torchdata",
+    # "scandeval",
     "triton",
 ]
 readme = "README.md"
-requires-python = ">= 3.10"
+requires-python = ">= 3.10, <3.12"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.rye]
-managed = true
-dev-dependencies = [
-    "pytest>=8.1.1",
-]
-
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/maester"]
+packages = ["maester/"]
+
+[tool.uv]
+conflicts = [
+    #[
+    #    { extra = "rocm" },
+    #    { extra = "cuda" }
+    #],
+    [
+        { extra = "rocm" },
+        { extra = "inference" }
+    ]
+]
 
 [[tool.uv.index]]
 name = "pytorch-rocm"
-url = "https://download.pytorch.org/whl/nightly/rocm6.2"
+url = "https://download.pytorch.org/whl/nightly/rocm6.3"
 explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/nightly/cu124"
+explicit = true
+
+[project.optional-dependencies]
+rocm = [
+    "torch",
+    "torchvision",
+    "torchdata",
+    "triton",
+    "pytorch-triton-rocm"
+]
+# cuda = [
+#     "torch",
+#     "torchvision",
+#     "torchdata",
+#     "triton"
+# ]
+# inference = [
+#     "scandeval",
+#     "vllm",
+#     "scandeval",
+#     "xformers>=0.0.28",
+# ]
 
 [tool.pylint."MESSAGES CONTROL"]
 max-line-length = 120
@@ -64,17 +93,21 @@ venv = ".venv"
 [tool.uv.sources]
 distributed-shampoo = { git = "https://github.com/facebookresearch/optimizers.git" }
 torch = [
-    { index = "pytorch-rocm", marker = "platform_system == 'Linux'" },
+    { index = "pytorch-rocm", extra = "rocm" },
+    #{ index = "pytorch-cuda", extra = "cuda" },
 ]
 torchvision = [
-    { index = "pytorch-rocm", marker = "platform_system == 'Linux'" },
+    { index = "pytorch-rocm", extra = "rocm" },
+    #{ index = "pytorch-cuda", extra = "cuda" },
 ]
 pytorch-triton-rocm = [
-    { index = "pytorch-rocm", marker = "platform_system == 'Linux'" },
+    { index = "pytorch-rocm", extra = "rocm" },
 ]
 torchdata = [
-    { index = "pytorch-rocm", marker = "platform_system == 'Linux'" },
+    { index = "pytorch-rocm", extra = "rocm" },
+    #{ index = "pytorch-cuda", extra = "cuda" },
 ]
-triton = [
-    { index = "pytorch-rocm", marker = "platform_system == 'Linux'" },
-]
+# triton = [
+#     { index = "pytorch-rocm", extra = "rocm" },
+#     { index = "pytorch-cuda", extra = "cuda" },
+# ]

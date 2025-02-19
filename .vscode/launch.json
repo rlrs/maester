@@ -8,6 +8,8 @@
             "name": "Python: Debug Unit Tests",
             "type": "python",
             "request": "launch",
+            "module": "pytest",
+            "args": [],
             "purpose": ["debug-test"],
             "justMyCode": false
         },
