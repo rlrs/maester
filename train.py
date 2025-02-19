@@ -117,7 +117,7 @@ def main():
         # 2. vocab size from tokenizer
         # 3. max_seq_len base on inputs
         model_config.norm_type = cfg.norm_type
-        model_config.vocab_size = 32000 # 128256 # TODO: automatically set this
+        model_config.vocab_size = 128256 # TODO: automatically set this
         model_config.max_seq_len = cfg.seq_len
         if cfg.enable_mup:
             model_config.enable_mup = True
