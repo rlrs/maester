@@ -14,7 +14,7 @@ class DatasetConfig(BaseSettings):
     data_logical_shards: int = 8192
     data_dirs: list[str] = [
                             # "../fineweb-edu-score-2/data/",
-                            "../hplt/train"
+                            "../danweb/parquet"
                             ]
     dataset_weights: str = "1.0"
     bos_token: int = 128000
@@ -27,7 +27,7 @@ class Config(BaseSettings):
     # submission/job 
     dump_dir: str = "jobs/"
     job_name: str = "llama-3.2-3B"
-    num_nodes: int = 4
+    num_nodes: int = 32
     partition: str = "standard-g"
     account: str = "project_465001265"
     time: str = "0-01:00:00"
@@ -37,10 +37,10 @@ class Config(BaseSettings):
     max_grad_norm: float = 2.0
     gc_freq: int = 4
     data_parallel_shard_degree: int = 8
-    data_parallel_replicate_degree: int = 4
+    data_parallel_replicate_degree: int = 32
     tensor_parallel_degree: int = 1
-    train_batch_size: int = 4 # per device; 4 * 8 gpus * 4 nodes * 8192 seqlen = 1M tokens per batch
-    train_num_steps: int = 100000 # ~100B tokens
+    train_batch_size: int = 2 # per device; 2 * 8 gpus * 32 nodes * 8192 seqlen = ~4M tokens per batch
+    train_num_steps: int = 22000 # ~92B tokens
     compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
     enable_loss_parallel: bool = True
     init_timeout_seconds: int = 300 # 300 is probably good for large-ish runs, e.g. up to 64 nodes 
@@ -62,9 +62,10 @@ class Config(BaseSettings):
     # checkpointing
     enable_checkpoint: bool = True
     checkpoint_folder: str = "checkpoints"
-    checkpoint_interval: int = 2500 # ~42B tokens
+    checkpoint_interval: int = 2000 # ~8B tokens
     model_weights_only: bool = True # just for the final weight export
     export_dtype: str = "bfloat16" # just for the final weight export
+    forced_load_path: str | None = None
 
     # model
     model_name: str = "llama3"
@@ -93,7 +94,7 @@ class Config(BaseSettings):
 
     # lr schedule
     scheduler: str = "linear_warmup_cosine"
-    warmup_steps: int = 0
+    warmup_steps: int = 50
 
     # fsdp
     mixed_precision_param: str = 'bfloat16'

@@ -96,7 +96,8 @@ class CheckpointManager:
         states: Dict[str, Any],
         cfg,
     ) -> None:
-        self.enable_checkpoint = cfg.enable_checkpoint
+        self.enable_checkpoint: bool = cfg.enable_checkpoint
+        self.forced_load_path: str | None = cfg.forced_load_path
 
         if self.enable_checkpoint:
             self.states = states
@@ -204,6 +205,17 @@ class CheckpointManager:
     def load(self, step: int = -1) -> bool:
         if not self.enable_checkpoint:
             return False
+        
+        if self.forced_load_path:
+            forced_path = self.forced_load_path
+            logger.info(f"Forcing load from {forced_path}")
+            if not os.path.isdir(forced_path):
+                raise ValueError(f"Checkpoint folder {forced_path} does not exist")
+            begin = time.monotonic()
+            dcp.load({"model": self.states["model"]}, checkpoint_id=forced_path) # forced load only supports model-only checkpoints
+            logger.info(f"Loaded model-only checkpoint from forced path in {time.monotonic() - begin:.2f} seconds")
+            return True
+
         if not os.path.isdir(self.folder):
             return False
         if step != -1 and not os.path.isdir(self._create_checkpoint_id(step)):
