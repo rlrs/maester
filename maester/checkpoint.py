@@ -232,6 +232,7 @@ class CheckpointManager:
             step = max(step_counts)
 
         # We won't have optimizer states to load, if we are loading a seed checkpoint
+        states = self.states
         if step == 0 or model_only:
             states = {"model": self.states["model"]}
         logger.info(f"Loading the checkpoint at step {step}, containing keys {states.keys()}")
