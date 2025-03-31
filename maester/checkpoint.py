@@ -202,7 +202,7 @@ class CheckpointManager:
             f"Finished saving the checkpoint in {time.monotonic() - begin:.2f} seconds"
         )
 
-    def load(self, step: int = -1) -> bool:
+    def load(self, step: int = -1, model_only: bool = False) -> bool:
         if not self.enable_checkpoint:
             return False
         
@@ -232,7 +232,9 @@ class CheckpointManager:
             step = max(step_counts)
 
         # We won't have optimizer states to load, if we are loading a seed checkpoint
-        states = {"model": self.states["model"]} if step == 0 else self.states
+        states = self.states
+        if step == 0 or model_only:
+            states = {"model": self.states["model"]}
         logger.info(f"Loading the checkpoint at step {step}, containing keys {states.keys()}")
 
         begin = time.monotonic()

@@ -1,80 +1,22 @@
-import pytest
 import torch
 import os
-
-from torch.distributed._composable.fsdp import MixedPrecisionPolicy
+import sys
 
 from typing import Tuple, Type, Any
+from pathlib import Path
+import json
+
+from transformers import AutoTokenizer
 
 from pydantic import BaseModel, ConfigDict
 from maester.log_utils import init_logger, logger
 from maester.models import model_name_to_cls, models_config, model_name_to_tokenizer
-from maester.datasets import create_tokenizer
 from maester.models.llama.model import Transformer
-from maester.parallelize_llama import ParallelDims, parallelize_llama
+from maester.parallelisms import parallelize_llama, ParallelDims
+
 from maester.checkpoint import CheckpointManager
 from maester.utils import init_distributed
-
-class Config(BaseModel):
-    model_config = ConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True)
-
-    job_folder: str = "job/"
-    max_grad_norm: float = 1.0
-    gc_freq: int = 4
-    data_parallel_degree: int = -1
-    tensor_parallel_degree: int = 1
-    pipeline_parallel_degree: int = 1
-    train_batch_size: int = 2
-    train_num_batches: int = 1000
-    compile: bool = False # TODO: compile doesn't work lol
-    enable_loss_parallel: bool = False
-    init_timeout_seconds: int = 300
-    train_timeout_seconds: int = 30
-
-    # datasets
-    
-    # logging/metrics
-    log_freq: int = 5
-    save_tb_folder: str = "tb"
-    enable_tensorboard: bool = True
-
-    # checkpointing
-    enable_checkpoint: bool = True
-    checkpoint_folder: str = "checkpoints"
-    checkpoint_interval: int = 50 # steps
-    model_weights_only: bool = True # just for the final weight export
-    export_dtype: str = "bfloat16" # just for the final weight export
-
-    # model
-    model_name: str = "llama3"
-    flavor: str = "8B"
-    seq_len: int = 512
-    norm_type: str = "rmsnorm"
-
-    # optimizer
-    opt_class: Type[Any] = torch.optim.SGD # AdamWScheduleFree
-    opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
-        lr = 3e-4, # initial lr
-        # betas = (0.9, 0.95),
-        foreach=True,
-        fused=False # can't get fused to work with FSDP2
-    )
-
-    # lr schedule
-    scheduler: str = "linear"
-    warmup_steps: int = 200
-
-    # fsdp
-    mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-
-    # activation checkpointing
-    ac_mode: str = "selective" # "full" | "selective" | "none"
-    selective_ac_option: str | int = "op"
-
-    # profiling
-    enable_profiling: bool = False
-    traces_folder: str = "traces"
-    profile_freq: int = 5
+from maester.config import Config
 
 
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
@@ -131,62 +73,92 @@ def generate(
 
 def main():
     init_logger()
-    logger.info(f"Starting generation.")
+    logger.info(f"Starting inference.")
+
+    torch.set_float32_matmul_precision('high')
     
-    cfg = Config()
+    # Load config
+    if len(sys.argv) > 1:
+        config_path = Path(sys.argv[1]) / "config.json"
+        if len(sys.argv) > 2:
+            checkpoint_step = int(sys.argv[2])
+        else:
+            checkpoint_step = 0
+        if not config_path.exists():
+            raise ValueError(f"Config not found: {config_path}")
+        logger.info(f"Loading config from {config_path}")
+        with open(config_path, 'r') as f:
+            cfg = Config(**json.load(f))
+    else:
+        logger.info("Using default configuration")
+        cfg = Config()
+    
+    try:
+        # Check if running in distributed environment
+        if "WORLD_SIZE" in os.environ and "LOCAL_RANK" in os.environ:
+            world_size = int(os.environ["WORLD_SIZE"])
+            local_rank = int(os.environ["LOCAL_RANK"])
+            torch.cuda.set_device(local_rank)
+            distributed = True
+        else:
+            world_size = 1
+            local_rank = 0
+            distributed = False
+            
+        if distributed:
+            init_distributed(cfg)
+        
+        # Build tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
 
-    # init world mesh
-    world_size = int(os.environ["WORLD_SIZE"])
-    parallel_dims = ParallelDims(
-        dp=cfg.data_parallel_degree,
-        tp=cfg.tensor_parallel_degree,
-        pp=cfg.pipeline_parallel_degree,
-        world_size=world_size,
-        enable_loss_parallel=cfg.enable_loss_parallel,
-    )
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    init_distributed(cfg)
+        # Build model
+        model_cls = model_name_to_cls[cfg.model_name]
+        model_config = models_config[cfg.model_name][cfg.flavor]
+        model_config.norm_type = cfg.norm_type
+        model_config.vocab_size = 128256 # TODO: automatically set this
+        model_config.max_seq_len = cfg.seq_len
 
-    world_mesh = parallel_dims.build_mesh(device_type="cuda")
+        with torch.device("meta"):
+            model = model_cls.from_model_args(model_config)
 
-    # build tokenizer
-    tokenizer_type = model_name_to_tokenizer[cfg.model_name]
-    # tokenizer = create_tokenizer(tokenizer_type, job_config.model.tokenizer_path) # TODO: path
-    tokenizer = create_tokenizer(tokenizer_type, "src/maester/datasets/tokenizer/original/tokenizer.model")
+        # if distributed:
+        parallel_dims = ParallelDims(
+            dp_replicate=1,
+            dp_shard=1,
+            tp=1,
+            world_size=world_size,
+            enable_loss_parallel=cfg.enable_loss_parallel,
+        )
+        world_mesh = parallel_dims.build_mesh(device_type="cuda")
+        parallelize_llama(model, world_mesh, parallel_dims, cfg)
 
-    # build model w/ meta init
-    model_cls = model_name_to_cls[cfg.model_name]
-    model_config = models_config[cfg.model_name][cfg.flavor]
-    # set the model configs from training inputs:
-    # 1. norm type to decide which norm layer to use
-    # 2. vocab size from tokenizer
-    # 3. max_seq_len base on inputs
-    model_config.norm_type = cfg.norm_type
-    model_config.vocab_size = tokenizer.n_words
-    model_config.max_seq_len = cfg.seq_len
+        model.to_empty(device="cuda")
+        model.init_weights()
+        
+        # Checkpoint handling
+        checkpoint = CheckpointManager(
+            model=model,
+            optimizer=None,
+            lr_scheduler=None,
+            dataloader=None,
+            states={},
+            cfg=cfg,
+        )
+        
+        success = checkpoint.load(step=checkpoint_step, model_only=True)
+        if not success:
+            logger.warning("Checkpoint not loaded")
+            return False
 
-    with torch.device("meta"):
-        model = model_cls.from_model_args(model_config)
+        # Generate
+        tks = tokenizer.encode("Alexandra Instituttet")
+        input_ids = torch.LongTensor(tks).to("cuda")
+        y = generate(model, input_ids, max_new_tokens=200, temperature=0.7, top_k=200)
+        print(tokenizer.decode(y.tolist()))
 
-    sharded_model = parallelize_llama(model, world_mesh, parallel_dims, cfg)
-
-    sharded_model.to_empty(device="cuda")
-    sharded_model.init_weights()
-
-    checkpoint = CheckpointManager(
-        model=model,
-        optimizer=None,
-        lr_scheduler=None,
-        dataloader=None,
-        states={},
-        cfg=cfg,
-    )
-    assert checkpoint.load(step=0)
-
-    tks = tokenizer.encode("Barack Obama is", bos=True, eos=False)
-    input_ids = torch.LongTensor(tks).to("cuda")
-    y = generate(sharded_model, input_ids, max_new_tokens=32, temperature=0.0, top_k=200)
-    print(tokenizer.decode(y.tolist()))
+    except Exception as e:
+        logger.error(f"Generation failed: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main()
