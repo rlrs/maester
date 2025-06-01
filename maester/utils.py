@@ -68,10 +68,13 @@ def set_pg_timeouts(timeout, world_mesh):
 
 
 def get_num_params(model: torch.nn.Module, exclude_embedding: bool = False) -> int:
-    num_params = sum(p.numel() for p in model.parameters())
-    if exclude_embedding:
-        num_params -= model.tok_embeddings.weight.numel()
-    return num_params
+    nparams = sum(p.numel() for p in model.parameters())
+    nparams_embedding = sum(
+        sum(p.numel() for p in m.parameters())
+        for m in model.children()
+        if isinstance(m, torch.nn.Embedding)
+    )
+    return nparams - nparams_embedding if exclude_embedding else nparams
 
 
 def get_num_flop_per_token(num_params: int, model_config, seq_len) -> int:

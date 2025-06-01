@@ -15,11 +15,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-# from maester.models.flash_attn_op import flash_attn_func
-try:
-    from flash_attn import flash_attn_func
-except:
-    pass
+from cut_cross_entropy import linear_cross_entropy, LinearCrossEntropyImpl
 
 from maester.models.norms import create_norm
 
@@ -419,12 +415,17 @@ class Transformer(nn.Module):
             self.model_args.rope_theta,
         )
 
-    def forward(self, tokens: torch.Tensor):
+    def forward(
+            self, 
+            tokens: torch.Tensor, 
+            labels: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
         """
         Perform a forward pass through the Transformer model.
 
         Args:
             tokens (torch.Tensor): Input token indices.
+            labels (Optional[torch.Tensor]): Target token indices. If provided, the loss will be computed instead of the logits.
 
         Returns:
             torch.Tensor: Output logits after applying the Transformer model.
@@ -440,8 +441,13 @@ class Transformer(nn.Module):
         if self.model_args.enable_mup:
             # Scaling `h` instead of `output` allows coord check to log the actual output 
             h *= self.model_args.mup_output_alpha / self.model_args.mup_width_mul
-        output = self.output(h)
-        return output
+
+        if labels is not None:
+            loss = linear_cross_entropy(h.flatten(0, 1), self.output.weight, labels.flatten(0, 1), impl=LinearCrossEntropyImpl.CCE)
+            return loss
+        else:
+            output = self.output(h)
+            return output
 
     @classmethod
     def from_model_args(cls, model_args: ModelArgs) -> "Transformer":
