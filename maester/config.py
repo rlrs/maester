@@ -43,6 +43,7 @@ class Config(BaseSettings):
     train_num_steps: int = 22000 # ~92B tokens
     compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
     enable_loss_parallel: bool = True
+    enable_cut_cross_entropy: bool = True
     init_timeout_seconds: int = 300 # 300 is probably good for large-ish runs, e.g. up to 64 nodes 
     train_timeout_seconds: int = 100
 

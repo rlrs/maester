@@ -138,14 +138,15 @@ def main():
 
         # log model size
         model_param_count = get_num_params(model)
+        model_param_count_without_embedding = get_num_params(model, exclude_embedding=True)
         num_flop_per_token = get_num_flop_per_token(
-            get_num_params(model, exclude_embedding=True),
+            model_param_count_without_embedding,
             model_config,
             cfg.seq_len,
         )
         logger.info(
             f"Model {cfg.model_name} {cfg.flavor} "
-            f"size: {model_param_count:,} total parameters"
+            f"size: {model_param_count:,} total parameters ({model_param_count_without_embedding:,} without embeddings)"
         )
 
         # initialize GPU memory monitor before applying parallelisms to the model
@@ -307,14 +308,17 @@ def main():
 
                 # non-pp loss parallel, pp is not implemented
                 with loss_parallel_ctx():
-                    pred = model(input_ids)
+                    if cfg.enable_cut_cross_entropy:
+                        loss = model(input_ids, labels) # using cut cross-entropy fused kernel
+                    else:
+                        pred = model(input_ids)
 
-                    # data_monitor.log_predictions(pred, labels, data_loader.dataset)
+                        # data_monitor.log_predictions(pred, labels, data_loader.dataset)
 
-                    loss = loss_fn(pred, labels)
-                    # pred.shape=(bs, seq_len, vocab_size)
-                    # need to free to before bwd to avoid peaking memory
-                    del pred
+                        loss = loss_fn(pred, labels)
+                        # pred.shape=(bs, seq_len, vocab_size)
+                        # need to free to before bwd to avoid peaking memory
+                        del pred
                     loss.backward()
 
                 grad_norms = clip_grad_norm( # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
@@ -329,7 +333,7 @@ def main():
 
                 # log metrics
                 if train_state.step == 1 or train_state.step % cfg.log_freq == 0:
-                    losses = [l.item() for l in losses_since_last_log]
+                    losses = [l.detach().item() for l in losses_since_last_log]
                     avg_loss, max_loss = (
                         np.mean(losses),
                         np.max(losses),

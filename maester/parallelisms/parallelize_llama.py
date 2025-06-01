@@ -62,12 +62,11 @@ def parallelize_llama(
             )
         apply_compile(model)
 
-    if parallel_dims.dp_enabled:
-        if parallel_dims.dp_shard_enabled:
-            if parallel_dims.dp_replicate_enabled:
-                dp_mesh = world_mesh["dp_replicate", "dp_shard"]
-            else:
-                dp_mesh = world_mesh["dp"]
+    if parallel_dims.dp_shard_enabled:
+        if parallel_dims.dp_replicate_enabled:
+            dp_mesh = world_mesh["dp_replicate", "dp_shard"]
+        else:
+            dp_mesh = world_mesh["dp"]
         
         apply_fsdp(model, dp_mesh, param_dtype=TORCH_DTYPE_MAP[config.mixed_precision_param], 
                    reduce_dtype=TORCH_DTYPE_MAP[config.mixed_precision_reduce])
@@ -84,6 +83,7 @@ def parallelize_llama(
             enable_compile=config.compile,
             enable_compiled_autograd=config.enable_compiled_autograd,
         )
+        logger.info("Applied DDP to the model")
 
 # for selective op activation checkpointing
 _save_list = {
@@ -289,6 +289,6 @@ def apply_ddp(
         else:
             torch._dynamo.config.optimize_ddp = "ddp_optimizer"
 
-    replicate(model, device_mesh=dp_mesh, bucket_cap_mb=100)
+    replicate(model, device_mesh=dp_mesh, bucket_cap_mb=10)
 
     logger.info("Applied DDP to the model")

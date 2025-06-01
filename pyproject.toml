@@ -25,6 +25,7 @@ dependencies = [
     # "torchdata",
     # "scandeval",
     "triton",
+    "cut-cross-entropy"
 ]
 readme = "README.md"
 requires-python = ">= 3.10, <3.12"
@@ -92,6 +93,7 @@ venv = ".venv"
 
 [tool.uv.sources]
 distributed-shampoo = { git = "https://github.com/facebookresearch/optimizers.git" }
+cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git" }
 torch = [
     { index = "pytorch-rocm", extra = "rocm" },
     #{ index = "pytorch-cuda", extra = "cuda" },
