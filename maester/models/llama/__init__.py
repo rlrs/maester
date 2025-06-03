@@ -30,6 +30,8 @@ llama2_configs = {
 
 llama3_configs = {
     "debugmodel": ModelArgs(dim=1024, n_layers=4, n_heads=16, rope_theta=500000),
+    "tiny": ModelArgs( # 15M w/o embeddings
+        dim=768, n_layers=3, n_heads=8, multiple_of=256, ffn_dim_multiplier=0.6, max_batch_size=64, tied_embeddings=True),
     "430M": ModelArgs( # "430M" with llama2 vocab size (32000)
         dim=1024,
         n_layers=24,
