@@ -18,6 +18,7 @@ from torch import nn
 from cut_cross_entropy import linear_cross_entropy, LinearCrossEntropyImpl
 
 from maester.models.norms import create_norm
+from maester.models.llama.tied_linear import TiedLinear
 
 
 @dataclass
@@ -32,6 +33,7 @@ class ModelArgs:
     norm_eps: float = 1e-5
     rope_theta: float = 10000
     init_std: float = 0.02
+    tied_embeddings: bool = False
 
     max_batch_size: int = 32
     max_seq_len: int = 2048
@@ -383,7 +385,10 @@ class Transformer(nn.Module):
             model_args.norm_type, dim=model_args.dim, eps=model_args.norm_eps
         )
 
-        self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
+        if model_args.tied_embeddings:
+            self.output = TiedLinear(self.tok_embeddings)
+        else:
+            self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
         self.init_weights()
 
     def init_weights(self):
@@ -404,7 +409,8 @@ class Transformer(nn.Module):
         for layer in self.layers.values():
             layer.init_weights()
         self.norm.reset_parameters()
-        nn.init.normal_(self.output.weight, std=self.model_args.init_std)
+        if not self.model_args.tied_embeddings:
+            nn.init.normal_(self.output.weight, std=self.model_args.init_std)
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
         return precompute_freqs_cis(
@@ -443,7 +449,8 @@ class Transformer(nn.Module):
             h *= self.model_args.mup_output_alpha / self.model_args.mup_width_mul
 
         if labels is not None:
-            loss = linear_cross_entropy(h.flatten(0, 1), self.output.weight, labels.flatten(0, 1), impl=LinearCrossEntropyImpl.CCE)
+            w = self.tok_embeddings.weight if self.model_args.tied_embeddings else self.output.weight
+            loss = linear_cross_entropy(h.flatten(0, 1), w, labels.flatten(0, 1), impl=LinearCrossEntropyImpl.CCE)
             return loss
         else:
             output = self.output(h)

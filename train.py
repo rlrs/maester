@@ -140,7 +140,7 @@ def main():
         model_param_count = get_num_params(model)
         model_param_count_without_embedding = get_num_params(model, exclude_embedding=True)
         num_flop_per_token = get_num_flop_per_token(
-            model_param_count_without_embedding,
+            model_param_count if model.model_args.tied_embeddings else model_param_count_without_embedding, # count lm head matmul only
             model_config,
             cfg.seq_len,
         )
