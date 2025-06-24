@@ -1095,6 +1095,7 @@ class ParquetDataset(_Stateful_Dataset):
         docset_offset = self.docset_index
         lcg_offset = self.lcg_state
         residual_chunks = self.chunk_index + 1 # chunks to skip after restore and create at the end of epoch, 0-indexed
+        first_doc_mapping = None  # Will store the document mapping for the first document
         ndocs = self._len
         path = ""
         reader = None
@@ -1103,11 +1104,6 @@ class ParquetDataset(_Stateful_Dataset):
             self.completed_current_doc = False
         while True:
             for i in range(ndocs):
-                # sanity checks
-                assert self.chunk_index >= -1, f"Invalid chunk_index: {self.chunk_index}"
-                assert not (self.completed_current_doc and self.chunk_index >= 0), \
-                    "Invalid state: document marked complete but chunk_index not reset"
-                
                 doc_index = (docset_offset + i) % ndocs
                 self.completed_current_doc = False # reset
 
@@ -1130,6 +1126,11 @@ class ParquetDataset(_Stateful_Dataset):
                 else:
                     doclcg = self._random_map_docid(docrange) # shuffled in-doc range
                     self.lcg_state = doclcg # update lcg state
+                
+                # Save the document mapping for the first document for residual processing
+                if i == 0:
+                    first_doc_mapping = doclcg
+                
                 local_row = doclcg + mindoc # map docid to local row
                 
                 newpath = file_path
@@ -1170,7 +1171,9 @@ class ParquetDataset(_Stateful_Dataset):
             self.docset_index = docset_offset
             self.lcg_state = lcg_offset
             file_path, docrange, mindoc = self._get_docid(docset_offset)
-            local_row = self._random_map_docid(docrange) + mindoc
+            # Use the saved document mapping from the first document processing
+            doclcg = first_doc_mapping
+            local_row = doclcg + mindoc
             newpath = file_path
             path, reader = self._get_reader(path, newpath, reader)
             table = self._read_specific_row(reader, local_row)

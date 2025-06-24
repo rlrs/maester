@@ -27,7 +27,7 @@ from transformers import AutoTokenizer
 # Add maester to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from maester.datasets.experimental_otf import ParquetDataset
+from maester.datasets.experimental_otf import ParquetDataset, Sampling_Dataset
 
 # Disable tokenizer parallelism to avoid warnings in tests
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -258,6 +258,192 @@ class TestDocumentCompletionState(unittest.TestCase):
                      f"Checkpoint/resume should produce identical content.")
         else:
             print(f"SUCCESS: Content consistency verified across {len(reference_chunks)} chunks")
+
+
+class TestEndOfEpochHandling(unittest.TestCase):
+    """Test end-of-epoch residual chunk handling."""
+    
+    def setUp(self):
+        """Set up test environment."""
+        mock_distributed_calls(0, 1)
+        self.test_dir = Path(tempfile.mkdtemp())
+        # Create small dataset for single-dataset testing
+        self.single_dataset = create_test_parquet_dataset(self.test_dir / "single_data", num_files=1, docs_per_file=3)
+        # Create multiple small datasets for multi-dataset testing
+        self.dataset_a = create_test_parquet_dataset(self.test_dir / "dataset_a", num_files=1, docs_per_file=2)
+        self.dataset_b = create_test_parquet_dataset(self.test_dir / "dataset_b", num_files=1, docs_per_file=3) 
+        self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        self.chunk_size = 50
+        
+    def tearDown(self):
+        """Clean up test environment."""
+        if self.test_dir.exists():
+            shutil.rmtree(self.test_dir)
+    
+    def create_single_dataset(self, rank: int = 0, world_size: int = 1) -> ParquetDataset:
+        """Create a single ParquetDataset for testing."""
+        mock_distributed_calls(rank, world_size)
+        
+        return ParquetDataset(
+            data_dir=str(self.single_dataset),
+            rank=rank,
+            worldsize=world_size,
+            tokenizer=self.tokenizer,
+            delimiter_token=-1,  # EOS token
+            bos_token=None,
+            max_chunksize=self.chunk_size,
+            verbose=False,
+            shuffle=False  # Disable shuffling for deterministic tests
+        )
+    
+    def create_multi_dataset(self, rank: int = 0, world_size: int = 1) -> Sampling_Dataset:
+        """Create a weighted multi-dataset Sampling_Dataset for testing."""
+        mock_distributed_calls(rank, world_size)
+        
+        # Create weighted multi-dataset using Sampling_Dataset
+        data_dirs = [str(self.dataset_a), str(self.dataset_b)]
+        weights = [0.6, 0.4]  # 60% weight for dataset_a, 40% for dataset_b
+        
+        return Sampling_Dataset(
+            data_dirs=data_dirs,
+            rank=rank,
+            worldsize=world_size,
+            tokenizer=self.tokenizer,
+            delimiter_token=-1,  # EOS token
+            bos_token=None,
+            max_chunksize=self.chunk_size,
+            weights=weights,
+            verbose=False,
+            shuffle=False  # Disable shuffling for deterministic tests
+        )
+    
+    def test_single_dataset_end_of_epoch_residual_chunks(self):
+        """Test residual chunk handling with single dataset - simpler case."""
+        # Single dataset with 3 documents, small chunks to force multiple chunks per doc
+        
+        # Reference run: process many chunks to go through multiple epochs
+        reference_dataset = self.create_single_dataset()
+        reference_iterator = iter(reference_dataset)
+        reference_chunks = []
+        
+        # Process enough chunks to go through multiple complete cycles
+        # This should trigger the residual chunk handling code multiple times
+        for i in range(50):  # Process 50 chunks to cycle through the small dataset multiple times
+            chunk = next(reference_iterator)
+            reference_chunks.append(chunk)
+        
+        # Test run: checkpoint mid-document early, then continue processing
+        test_dataset = self.create_single_dataset()
+        test_iterator = iter(test_dataset)
+        
+        # Process chunks until we find a mid-document state (NOT at document boundary)
+        checkpoint_chunks = []
+        max_attempts = 20  # Safety limit
+        found_mid_document = False
+        
+        for i in range(max_attempts):
+            chunk = next(test_iterator)
+            checkpoint_chunks.append(chunk)
+            
+            # Check if we're mid-document: chunk_index >= 0 AND not completed_current_doc
+            if test_dataset.chunk_index >= 0 and not test_dataset.completed_current_doc:
+                found_mid_document = True
+                print(f"Found mid-document state at chunk {i}: chunk_index={test_dataset.chunk_index}, completed_current_doc={test_dataset.completed_current_doc}")
+                break
+        
+        # Ensure we actually found a mid-document state to test residual chunks
+        self.assertTrue(found_mid_document, 
+                       "Could not find mid-document state - test cannot validate residual chunk handling")
+        
+        # Calculate expected residual chunks
+        expected_residual_chunks = test_dataset.chunk_index + 1
+        
+        # Save checkpoint state  
+        saved_state = test_dataset.state_dict()
+        
+        # Restore and continue processing to match reference
+        restored_dataset = self.create_single_dataset()
+        restored_dataset.load_state_dict([saved_state], sharded_input=True)
+        restored_iterator = iter(restored_dataset)
+        
+        # Process remaining chunks to match reference length
+        remaining_chunks = []
+        remaining_count = len(reference_chunks) - len(checkpoint_chunks)
+        for i in range(remaining_count):
+            chunk = next(restored_iterator)
+            remaining_chunks.append(chunk)
+        
+        # Combine all chunks from test run
+        all_test_chunks = checkpoint_chunks + remaining_chunks
+        
+        # Verify content consistency across the long run
+        # This tests that residual chunk handling works correctly when cycling through epochs
+        self.assertEqual(len(reference_chunks), len(all_test_chunks), 
+                        "Different number of chunks processed")
+        
+        for i in range(len(reference_chunks)):
+            self.assertEqual(reference_chunks[i], all_test_chunks[i], 
+                           f"Chunk {i} differs - residual handling may be broken")
+        
+        print(f"SUCCESS: Residual chunk handling verified with {expected_residual_chunks} residual chunks across {len(reference_chunks)} total chunks")
+    
+    def test_multi_dataset_end_of_epoch_residual_chunks(self):
+        """Test residual chunk handling with weighted multi-dataset setup."""
+        # With weighted datasets, each dataset reaches end-of-epoch independently
+        # Dataset A: 2 docs, 60% weight  
+        # Dataset B: 3 docs, 40% weight
+        # We'll process enough chunks to trigger end-of-epoch for both datasets
+        
+        # Reference run: process many chunks to establish baseline
+        reference_dataset = self.create_multi_dataset()
+        reference_iterator = iter(reference_dataset)
+        reference_chunks = []
+        
+        # Process enough chunks to go through multiple epochs of both datasets
+        # This should trigger the residual chunk handling code multiple times
+        for i in range(100):  # Process 100 chunks to ensure we hit end-of-epoch scenarios
+            chunk = next(reference_iterator)
+            reference_chunks.append(chunk)
+        
+        # Test run: checkpoint mid-document early, then continue to trigger residual handling
+        test_dataset = self.create_multi_dataset()
+        test_iterator = iter(test_dataset)
+        
+        # Process a few chunks to get into a state where we'll have residual chunks
+        checkpoint_chunks = []
+        for i in range(5):  # Start with 5 chunks
+            chunk = next(test_iterator)
+            checkpoint_chunks.append(chunk)
+        
+        # Save checkpoint state
+        saved_state = test_dataset.state_dict()
+        
+        # Restore and continue processing to match reference
+        restored_dataset = self.create_multi_dataset()
+        restored_dataset.load_state_dict([saved_state], sharded_input=True)
+        restored_iterator = iter(restored_dataset)
+        
+        # Process remaining chunks to match reference length
+        remaining_chunks = []
+        remaining_count = len(reference_chunks) - len(checkpoint_chunks)
+        for i in range(remaining_count):
+            chunk = next(restored_iterator)
+            remaining_chunks.append(chunk)
+        
+        # Combine all chunks from test run
+        all_test_chunks = checkpoint_chunks + remaining_chunks
+        
+        # Verify content consistency across the long run
+        # This tests that residual chunk handling works correctly when 
+        # individual datasets reach their end-of-epoch boundaries
+        self.assertEqual(len(reference_chunks), len(all_test_chunks), 
+                        "Different number of chunks processed")
+        
+        for i in range(len(reference_chunks)):
+            self.assertEqual(reference_chunks[i], all_test_chunks[i], 
+                           f"Chunk {i} differs - residual handling may be broken")
+        
+        print(f"SUCCESS: Multi-dataset residual chunk handling verified across {len(reference_chunks)} chunks")
 
 
 class TestLCGStateManagement(unittest.TestCase):
