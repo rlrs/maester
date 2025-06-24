@@ -966,6 +966,7 @@ class ParquetDataset(_Stateful_Dataset):
 
         self.docset_index = 0
         self.chunk_index = -1
+        self.completed_current_doc = False
 
         # Stats
         self.epochs_seen = -1
@@ -977,6 +978,7 @@ class ParquetDataset(_Stateful_Dataset):
         self.state_params = [
             "docset_index",
             "chunk_index",
+            "completed_current_doc",
             "epochs_seen",
             "tokens_seen",
             "docs_seen",
@@ -1092,13 +1094,22 @@ class ParquetDataset(_Stateful_Dataset):
     def __iter__(self):
         docset_offset = self.docset_index
         lcg_offset = self.lcg_state
-        residual_chunks = self.chunk_index # + 1 TODO: +1 was likely wrong here...
+        residual_chunks = self.chunk_index # chunks to create at the end of loop, 0-indexed
         ndocs = self._len
         path = ""
         reader = None
+        if self.completed_current_doc: # resuming at the end of a doc
+            docset_offset = (docset_offset + 1) % ndocs
+            self.completed_current_doc = False
         while True:
             for i in range(ndocs):
+                # sanity checks
+                assert self.chunk_index >= -1, f"Invalid chunk_index: {self.chunk_index}"
+                assert not (self.completed_current_doc and self.chunk_index >= 0), \
+                    "Invalid state: document marked complete but chunk_index not reset"
+                
                 doc_index = (docset_offset + i) % ndocs
+                self.completed_current_doc = False # reset
 
                 # Update stats
                 if doc_index == 0:
@@ -1112,10 +1123,14 @@ class ParquetDataset(_Stateful_Dataset):
                 file_path, docrange, mindoc = self._get_docid(doc_index)
 
                 # Map docset ids to consistently shuffled ids
-                doclcg = self._random_map_docid(docrange) # shuffled in-doc range
+                # determine if we need a new document position
+                if i == 0 and not self.completed_current_doc and self.chunk_index >= 0:
+                    # resuming mid-doc, do not advance lcg
+                    doclcg = self.lcg_state
+                else:
+                    doclcg = self._random_map_docid(docrange) # shuffled in-doc range
+                    self.lcg_state = doclcg # update lcg state
                 local_row = doclcg + mindoc # map docid to local row
-                # print(f"ParquetDataset: reading local_row {local_row} of {docrange}")
-                self.lcg_state = doclcg # update lcg state
                 
                 newpath = file_path
                 path, reader = self._get_reader(path, newpath, reader)
@@ -1136,14 +1151,17 @@ class ParquetDataset(_Stateful_Dataset):
                 if doclen >= self.min_length:
                     n_chunks = math.ceil(doclen / self.chunksize)
                     for j in range(n_chunks):
-                        if i == 0 and j < residual_chunks:
-                            pass
+                        if i == 0 and not self.completed_current_doc and j < residual_chunks:
+                            pass # skip already processed chunks
+                            # doclcg = self.lcg_state # use saved lcg state when resuming
                         else:
                             self.chunk_index = j
                             # Document complete, update stats
                             if j == n_chunks - 1:
                                 self.docs_seen += 1
                                 self.percent_seen = (self.docs_seen * 100 / (self._len + 1e-9))
+                                self.chunk_index = -1
+                                self.completed_current_doc = True
                             out = self._construct_chunk(j, doc, n_chunks)
                             # print(f"ParquetDataset: yielding chunk {j}/{n_chunks}, length {len(out)}, first tokens: {out[:5]}...")
                             yield out
