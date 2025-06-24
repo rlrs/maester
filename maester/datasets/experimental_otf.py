@@ -1094,7 +1094,7 @@ class ParquetDataset(_Stateful_Dataset):
     def __iter__(self):
         docset_offset = self.docset_index
         lcg_offset = self.lcg_state
-        residual_chunks = self.chunk_index # chunks to create at the end of loop, 0-indexed
+        residual_chunks = self.chunk_index + 1 # chunks to skip after restore and create at the end of epoch, 0-indexed
         ndocs = self._len
         path = ""
         reader = None
