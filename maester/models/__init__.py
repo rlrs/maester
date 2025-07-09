@@ -5,17 +5,28 @@
 # LICENSE file in the root directory of this source tree.
 
 from maester.models.llama import llama2_configs, llama3_configs, mistral_configs, Transformer
+from maester.models.gemma import gemma_configs, gemma3_configs, GemmaTextModel
 
 models_config = {
     "llama2": llama2_configs,
     "llama3": llama3_configs,
-    "mistral": mistral_configs
+    "mistral": mistral_configs,
+    "gemma": gemma_configs,
+    "gemma3": gemma3_configs,
 }
 
-model_name_to_cls = {"llama2": Transformer, "llama3": Transformer, "mistral": Transformer}
+model_name_to_cls = {
+    "llama2": Transformer, 
+    "llama3": Transformer, 
+    "mistral": Transformer,
+    "gemma": GemmaTextModel,
+    "gemma3": GemmaTextModel,
+}
 
 model_name_to_tokenizer = {
     "llama2": "sentencepiece",
     "llama3": "tiktoken",
-    "mistral": "sentencepiece"
+    "mistral": "sentencepiece",
+    "gemma": "sentencepiece",
+    "gemma3": "sentencepiece",
 }
