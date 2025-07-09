@@ -23,6 +23,7 @@ from torch.distributed.tensor.parallel import loss_parallel
 from maester.checkpoint import CheckpointManager
 from maester.config import Config
 from maester.datasets.experimental_otf import build_experimental_data_loader
+# from maester.datasets.experimental import build_experimental_data_loader
 from maester.log_utils import init_logger, logger
 from maester.lr_scheduling import get_lr_scheduler
 from maester.memory import cleanup_before_training
@@ -107,7 +108,13 @@ def main():
         logger.info(f"world mesh: {world_mesh}")
         logger.info(f"dp mesh: {dp_mesh}")
 
-        # hf_config = AutoConfig.from_pretrained(cfg.tokenizer_name) # for vocab size below TODO: fails on LUMI?
+        # Get tokenizer to determine vocab size
+        if os.path.isfile(cfg.tokenizer_name):
+            from transformers import PreTrainedTokenizerFast
+            tokenizer = PreTrainedTokenizerFast(tokenizer_file=cfg.tokenizer_name)
+        else:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
 
         # build model w/ meta init
         model_cls = model_name_to_cls[cfg.model_name]
@@ -117,7 +124,12 @@ def main():
         # 2. vocab size from tokenizer
         # 3. max_seq_len base on inputs
         model_config.norm_type = cfg.norm_type
-        model_config.vocab_size = 128256 # TODO: automatically set this
+        # Get vocab size from tokenizer (vocab_size is base vocabulary without added tokens)
+        if cfg.model_name not in ["gemma", "gemma3"]: # gemma has vocab sizes in model config, trust it
+            if hasattr(tokenizer, 'vocab_size'):
+                model_config.vocab_size = tokenizer.vocab_size
+            else:
+                model_config.vocab_size = len(tokenizer)
         model_config.max_seq_len = cfg.seq_len
         if cfg.enable_mup:
             model_config.enable_mup = True
@@ -154,7 +166,12 @@ def main():
         # obtain the peak flops of bf16 type for MFU calculation
         gpu_peak_flops = get_peak_flops(torch.cuda.get_device_properties(0).name)
 
-        parallelize_llama(model, world_mesh, parallel_dims, cfg)
+        # Choose parallelization function based on model type
+        if cfg.model_name in ["gemma", "gemma3"]:
+            from maester.parallelisms import parallelize_gemma
+            parallelize_gemma(model, world_mesh, parallel_dims, cfg)
+        else:
+            parallelize_llama(model, world_mesh, parallel_dims, cfg)
         logger.info(f"Model after parallelization {model=}\n")
 
         # allocate sharded model on GPU and initialize weights via DTensor
@@ -407,7 +424,8 @@ def main():
                     # metrics.update(get_logits_metrics())
                     if weight_scale_stats:
                         metrics.update(weight_scale_stats)
-                    metric_logger.log(metrics, step=train_state.step)
+                    if metric_logger is not None:
+                        metric_logger.log(metrics, step=train_state.step)
 
                     logger.info(
                         f"Step {train_state.step:2}: "
@@ -446,7 +464,8 @@ def main():
         if dist.get_rank() == 0:
             logger.info("Sleeping 2 seconds for other ranks to complete")
             time.sleep(2)
-        metric_logger.close()
+        if metric_logger is not None:
+            metric_logger.close()
         logger.info("Training successfully completed!")
         dist.destroy_process_group()
 
