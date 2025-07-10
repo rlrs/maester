@@ -1,7 +1,9 @@
+from functools import partial
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.flex_attention import flex_attention as _flex_attention, create_block_mask
 
 from dataclasses import dataclass
 
@@ -158,39 +160,21 @@ class GemmaMLP(nn.Module):
         nn.init.normal_(self.down_proj.weight, mean=0.0, std=init_std)
 
 
-# Define mask functions outside of class for FlexAttention compatibility with torch.compile
-def _causal_mask(b, h, q_idx, kv_idx):
+def causal_mask(b, h, q_idx, kv_idx):
     return q_idx >= kv_idx
 
-def _make_sliding_window_causal_mask(window_size):
-    def sliding_window_causal_mask(b, h, q_idx, kv_idx):
-        causal = q_idx >= kv_idx
-        in_window = (q_idx - kv_idx) <= window_size
-        return causal & in_window
-    return sliding_window_causal_mask
+def sliding_window_causal(b, h, q_idx, kv_idx, sliding_window_size):
+    return (q_idx >= kv_idx) & (q_idx - kv_idx <= sliding_window_size)
 
-# Pre-compile flex_attention to avoid double compilation issues
-# This is needed when the model itself is compiled
-try:
-    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-    _flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
-    
-    # Wrap both create_block_mask and flex_attention to insulate from outer compilation
-    @torch.compiler.disable(recursive=False)
-    def create_block_mask_uncompiled(mask_mod, B, H, Q_LEN, KV_LEN, device):
-        return create_block_mask(
-            mask_mod,
-            B=B, H=H,
-            Q_LEN=Q_LEN, KV_LEN=KV_LEN,
-            device=device
-        )
-    
-    @torch.compiler.disable(recursive=False)
-    def flex_attention_compiled(q, k, v, block_mask):
-        return _flex_attention_compiled(q, k, v, block_mask=block_mask)
-except ImportError:
-    flex_attention_compiled = None
-    create_block_mask_uncompiled = None
+# Create specific mask functions that can be properly inspected
+def make_sliding_window_mask_fn(window_size):
+    """Create a sliding window mask function with the window size bound."""
+    def mask_fn(b, h, q_idx, kv_idx):
+        return sliding_window_causal(b, h, q_idx, kv_idx, window_size)
+    return mask_fn
+
+
+flex_attention = torch.compile(_flex_attention, dynamic=False)
 
 class GemmaAttention(nn.Module):
 
@@ -237,13 +221,20 @@ class GemmaAttention(nn.Module):
 
         self.attn_type = attn_type
         self.sliding_window_size = config.sliding_window_size
+        self.attention_backend = "flex"  # Set attention backend
         
-        # Pre-create mask functions for FlexAttention
-        if self.attn_type == "local_sliding" and self.sliding_window_size is not None:
-            self.mask_fn = _make_sliding_window_causal_mask(self.sliding_window_size)
-        else:
-            self.mask_fn = _causal_mask
-
+        # Pre-compute block mask for FlexAttention
+        if self.attention_backend == "flex":
+            # Determine mask function based on attention type
+            if self.attn_type == "local_sliding" and self.sliding_window_size is not None:
+                mask_fn = make_sliding_window_mask_fn(self.sliding_window_size)
+            else:
+                mask_fn = causal_mask
+            
+            # Create block mask once during initialization
+            max_seq_len = config.max_position_embeddings
+            self.block_mask = create_block_mask(mask_fn, None, None, max_seq_len, max_seq_len)
+        
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -272,13 +263,8 @@ class GemmaAttention(nn.Module):
         xq = apply_rotary_emb(xq, freqs_cis=freqs_cis)
         xk = apply_rotary_emb(xk, freqs_cis=freqs_cis)
 
-        # Choose attention implementation
-        # Options: "eager", "sdpa", "flex"
-        attention_backend = "eager"
-        
-        if attention_backend == "eager":
-            # Option 1: Original PyTorch implementation (always works, may be slower)
-            # Handles GQA by expanding k,v heads
+        # Select attention implementation based on backend
+        if self.attention_backend == "eager":
             if self.num_kv_heads != self.num_heads:
                 # [batch_size, seq_len, n_heads, head_dim]
                 xk = torch.repeat_interleave(xk, self.num_queries_per_kv, dim=2)
@@ -299,50 +285,34 @@ class GemmaAttention(nn.Module):
             else:
                 attn_mask = mask
             
-            # Manual attention computation
             q = q * self.scaling
             scores = torch.matmul(q, k.transpose(2, 3))
             scores = scores + attn_mask
             scores = F.softmax(scores.float(), dim=-1).type_as(q)
             output = torch.matmul(scores, v)
             
-        elif attention_backend == "flex":
-            # Option 2: FlexAttention implementation (requires PyTorch 2.5.0+)
-            # Better native support for sliding window attention
-            try:
-                if flex_attention_compiled is None or create_block_mask_uncompiled is None:
-                    raise ImportError("FlexAttention not available")
-                
-                # Use uncompiled create_block_mask to avoid compilation issues
-                block_mask = create_block_mask_uncompiled(
-                    self.mask_fn,
-                    B=batch_size, H=None,
-                    Q_LEN=input_len, KV_LEN=input_len,
-                    device=hidden_states.device
-                )
-                
-                # Transpose for FlexAttention: [batch_size, n_heads, seq_len, head_dim]
-                q = xq.transpose(1, 2) * self.scaling
-                k = xk.transpose(1, 2)
-                v = xv.transpose(1, 2)
-                
-                # Use pre-compiled flex_attention to avoid double compilation
-                output = flex_attention_compiled(q, k, v, block_mask)
-                
-            except ImportError:
-                raise ImportError("FlexAttention requires PyTorch 2.5.0 or later")
-                
-        else:  # attention_backend == "sdpa"
-            # Option 3: Standard SDPA with manual masks (compatible with PyTorch 2.0+)
-            # This approach handles GQA by expanding k,v heads before SDPA
+        elif self.attention_backend == "flex":
+            # FlexAttention
             
+            # Transpose to [batch_size, n_heads, seq_len, head_dim]
+            q = xq.transpose(1, 2)
+            k = xk.transpose(1, 2)
+            v = xv.transpose(1, 2)
+
+            # Adjust the pre-computed mask to the current sequence length
+            S = q.shape[2]
+            block_mask = self.block_mask._adjust(S, S) if S != self.block_mask.shape[-1] else self.block_mask
+            
+            output = flex_attention(q, k, v, block_mask=block_mask, scale=self.scaling, enable_gqa=self.num_kv_heads != self.num_heads)
+                
+        else:  # self.attention_backend == "sdpa"
             if self.num_kv_heads != self.num_heads:
-                # Expand KV heads for GQA - SDPA with enable_gqa is experimental
+                # Expand KV heads for GQA
                 # [batch_size, seq_len, n_heads, head_dim]
                 xk = torch.repeat_interleave(xk, self.num_queries_per_kv, dim=2)
                 xv = torch.repeat_interleave(xv, self.num_queries_per_kv, dim=2)
             
-            # Transpose for SDPA: [batch_size, n_heads, seq_len, head_dim]
+            # Transpose to [batch_size, n_heads, seq_len, head_dim]
             q = xq.transpose(1, 2)
             k = xk.transpose(1, 2)
             v = xv.transpose(1, 2)

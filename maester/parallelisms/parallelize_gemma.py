@@ -53,7 +53,7 @@ def parallelize_gemma(
         )
 
     # Apply activation checkpointing
-    if config.enable_checkpoint:
+    if config.ac_mode != "none":
         apply_ac(model)
 
     # Compile each layer individually

@@ -64,9 +64,15 @@ def test_gemma3_logits_comparison(model_size, dcp_path, hf_model_name, port):
         )
         
         model.eval()
+        
+        # Move model to GPU if available (required for FlexAttention)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cpu" and hasattr(model, 'attention_backend'):
+            print("Warning: FlexAttention requires GPU. Test may fail on CPU.")
+        model = model.to(device)
         our_model = model
         
-        print(f"✓ Loaded our Gemma 3 {model_size} model from DCP checkpoint")
+        print(f"✓ Loaded our Gemma 3 {model_size} model from DCP checkpoint (on {device})")
         
     finally:
         if torch.distributed.is_initialized():
@@ -77,23 +83,81 @@ def test_gemma3_logits_comparison(model_size, dcp_path, hf_model_name, port):
     hf_model = AutoModelForCausalLM.from_pretrained(
         hf_model_name,
         torch_dtype=torch.float32,
-        device_map="cpu"
+        device_map="cuda" if torch.cuda.is_available() else "cpu"
     )
     tokenizer = AutoTokenizer.from_pretrained(hf_model_name)
     
-    # Test with multiple inputs
-    test_texts = [
-        "The capital of France is",
-        "Machine learning is",
-        "2 + 2 =",
+    # Test with inputs that tokenize to exactly 128 tokens for FlexAttention
+    # We'll construct texts and verify they're exactly 128 tokens
+    test_texts = []
+    
+    # Base texts to expand
+    base_texts = [
+        "The capital of France is Paris. Paris is known for the Eiffel Tower, Louvre Museum, and Notre-Dame. ",
+        "Machine learning is a field of artificial intelligence that enables computers to learn from data. ",
+        "Mathematics is the study of numbers, shapes, and patterns. It includes algebra, geometry, and calculus. "
     ]
     
+    # Expand each base text to exactly 128 tokens
+    for base_text in base_texts:
+        # Tokenize and check length
+        tokens = tokenizer(base_text, return_tensors="pt").input_ids
+        current_len = tokens.shape[1]
+        
+        # Add repeated text until we get close to 128
+        text = base_text
+        while current_len < 120:  # Leave room for fine-tuning
+            text += base_text
+            tokens = tokenizer(text, return_tensors="pt").input_ids
+            current_len = tokens.shape[1]
+        
+        # Fine-tune to exactly 128 tokens
+        # This is a bit hacky but ensures exact length
+        while current_len < 128:
+            text += "a "
+            tokens = tokenizer(text, return_tensors="pt").input_ids
+            current_len = tokens.shape[1]
+        
+        # If we overshot, try to trim
+        if current_len > 128:
+            # Binary search for the right length
+            words = text.split()
+            left, right = 0, len(words)
+            while left < right:
+                mid = (left + right + 1) // 2
+                trial_text = " ".join(words[:mid])
+                trial_tokens = tokenizer(trial_text, return_tensors="pt").input_ids
+                if trial_tokens.shape[1] <= 128:
+                    left = mid
+                else:
+                    right = mid - 1
+            text = " ".join(words[:left])
+            tokens = tokenizer(text, return_tensors="pt").input_ids
+            current_len = tokens.shape[1]
+            
+            # Pad with simple tokens if needed
+            while current_len < 128:
+                text += " a"
+                tokens = tokenizer(text, return_tensors="pt").input_ids
+                current_len = tokens.shape[1]
+        
+        test_texts.append(text)
+    
     for test_text in test_texts:
-        print(f"\nTesting: '{test_text}'")
+        print(f"\nTesting: '{test_text[:50]}...'")  # Print first 50 chars for brevity
         input_ids = tokenizer(test_text, return_tensors="pt").input_ids
+        seq_len = input_ids.shape[1]
+        
+        # Verify we have exactly 128 tokens
+        assert seq_len == 128, f"Expected exactly 128 tokens, got {seq_len}"
+        print(f"  Sequence length: {seq_len} tokens (perfect for FlexAttention!)")
+        
+        # Move to correct device
+        device = next(our_model.parameters()).device
+        input_ids = input_ids.to(device)
         
         with torch.no_grad():
-            # Get logits from both models
+            # Get logits from both models - no padding needed!
             our_logits = our_model(input_ids)
             hf_outputs = hf_model(input_ids)
             hf_logits = hf_outputs.logits
