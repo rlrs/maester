@@ -78,7 +78,9 @@ gemma3_configs = {
         vision_config=None,
     ),
     "4B": ModelArgs(
-        vocab_size=262_208, # with vision tokens
+        # NON-STANDARD: Using text-only vocab size instead of full multimodal vocab (262,208)
+        # This discards the 64 vision tokens to ensure correct training dynamics
+        vocab_size=262_144,  # Text-only tokens, vision tokens (262,144-262,207) are discarded
         dim=2560,
         n_layers=34,
         n_heads=8,
@@ -93,6 +95,7 @@ gemma3_configs = {
             "local_sliding": 10_000,
             "global": 1_000_000,
         },
+        rope_scaling={"factor": 8.0, "rope_type": "linear"},  # RoPE scaling for 4B model
         use_qk_norm=True,
         vision_config=None,
     ), 

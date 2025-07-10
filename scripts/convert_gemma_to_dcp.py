@@ -30,7 +30,7 @@ import torch.distributed.checkpoint as DCP
 from safetensors import safe_open
 
 @torch.inference_mode()
-def convert_gemma_weights(input_dir: Path, output_dir: Path, model_type: str = "auto", combine_qkv: bool = False):
+def convert_gemma_weights(input_dir: Path, output_dir: Path, model_type: str = "auto", combine_qkv: bool = False, text_only_vocab: bool = False):
     """
     Convert Gemma weights to DCP format.
     
@@ -39,6 +39,7 @@ def convert_gemma_weights(input_dir: Path, output_dir: Path, model_type: str = "
         output_dir: Directory to save DCP checkpoint
         model_type: "text" for text-only, "multimodal" for multimodal, "auto" to detect
         combine_qkv: Whether to combine q, k, v projections into qkv_proj
+        text_only_vocab: Whether to remove vision tokens from embeddings
     """
     
     # Find safetensors files
@@ -80,6 +81,10 @@ def convert_gemma_weights(input_dir: Path, output_dir: Path, model_type: str = "
     if combine_qkv:
         print("Combining Q, K, V projections into QKV...")
         state_dict = combine_qkv_projections(state_dict)
+    
+    # NON-STANDARD: Optionally remove vision tokens from embeddings
+    if text_only_vocab:
+        state_dict = remove_vision_tokens(state_dict)
     
     # Save to DCP format
     print("Writing to DCP format...")
@@ -202,6 +207,30 @@ def map_multimodal_model_key(key: str) -> str:
     return None
 
 
+def remove_vision_tokens(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    NON-STANDARD: Remove vision tokens from embeddings to create text-only vocab.
+    
+    This function slices the embedding tensor from 262,208 tokens to 262,144 tokens,
+    removing the 64 vision tokens that appear at the end of the vocabulary.
+    
+    This is necessary for text-only training to ensure correct softmax computation
+    without wasted probability mass on untrained vision tokens.
+    """
+    new_state_dict = {}
+    text_only_vocab_size = 262_144
+    
+    for key, value in state_dict.items():
+        if key == "tok_embeddings.weight" and value.shape[0] > text_only_vocab_size:
+            print(f"NON-STANDARD: Slicing embeddings from {value.shape[0]} to {text_only_vocab_size} tokens")
+            print(f"Removing {value.shape[0] - text_only_vocab_size} vision tokens")
+            new_state_dict[key] = value[:text_only_vocab_size]
+        else:
+            new_state_dict[key] = value
+    
+    return new_state_dict
+
+
 def combine_qkv_projections(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """
     Combine separate q, k, v projections into qkv_proj for our implementation.
@@ -269,8 +298,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Combine q, k, v projections into qkv_proj"
     )
+    parser.add_argument(
+        "--text-only-vocab",
+        action="store_true",
+        help="NON-STANDARD: Remove vision tokens from embeddings (reduces vocab from 262,208 to 262,144)"
+    )
     
     args = parser.parse_args()
     
     # Convert weights
-    convert_gemma_weights(args.input_dir, args.output_dir, args.model_type, combine_qkv=args.combine_qkv)
+    convert_gemma_weights(
+        args.input_dir, 
+        args.output_dir, 
+        args.model_type, 
+        combine_qkv=args.combine_qkv,
+        text_only_vocab=args.text_only_vocab
+    )

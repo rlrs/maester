@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from dataclasses import dataclass
 
@@ -33,6 +34,7 @@ class ModelArgs:
     use_pre_ffw_norm: bool = True
     use_post_ffw_norm: bool = True
     rope_wave_length: dict[str, float] | None = None
+    rope_scaling: dict[str, float] | None = None  # For RoPE scaling (e.g., {"factor": 8.0, "rope_type": "linear"})
     vision_config: dict | None = None  # For multimodal models
     tied_embeddings: bool = True  # For training compatibility
     init_std: float = 0.02  # For weight initialization
@@ -40,10 +42,10 @@ class ModelArgs:
 def precompute_freqs_cis(dim: int,
                          end: int,
                          theta: float = 10000.0,
-                         rope_scaling_factor:int = 1) -> torch.Tensor:
+                         rope_scaling_factor: float = 1.0) -> torch.Tensor:
     """Precomputes the frequency cis."""
     freqs = 1.0 / (theta**(torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
-    freqs = freqs/rope_scaling_factor
+    freqs = freqs / rope_scaling_factor
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
@@ -94,23 +96,37 @@ class RMSNorm(torch.nn.Module):
         dim: int,
         eps: float = 1e-6,
         add_unit_offset: bool = True,
+        compile: bool = False,  # Enable compilation by default for better performance
     ):
         super().__init__()
         self.eps = eps
         self.add_unit_offset = add_unit_offset
         self.weight = nn.Parameter(torch.zeros(dim))
+        
+        # Optionally compile the normalization function for better performance
+        self.norm_fn = (
+            torch.compile(self._compute_norm, fullgraph=True)
+            if compile
+            else self._compute_norm
+        )
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    @staticmethod
+    def _compute_norm(x: torch.Tensor, weight: torch.Tensor, eps: float, add_unit_offset: bool):
+        # Compute RMS normalization
+        normed = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+        
+        # Apply weight with or without unit offset
+        if add_unit_offset:
+            output = normed * (1 + weight)
+        else:
+            output = normed * weight
+        
+        return output
 
     def forward(self, x):
         # Llama does x.to(float16) * w whilst Gemma2 is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
-        output = self._norm(x.float())
-        if self.add_unit_offset:
-            output = output * (1 + self.weight.float())
-        else:
-            output = output * self.weight.float()
+        output = self.norm_fn(x.float(), self.weight.float(), self.eps, self.add_unit_offset)
         return output.type_as(x)
     
     def reset_parameters(self):
@@ -141,6 +157,40 @@ class GemmaMLP(nn.Module):
         nn.init.normal_(self.up_proj.weight, mean=0.0, std=init_std)
         nn.init.normal_(self.down_proj.weight, mean=0.0, std=init_std)
 
+
+# Define mask functions outside of class for FlexAttention compatibility with torch.compile
+def _causal_mask(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
+
+def _make_sliding_window_causal_mask(window_size):
+    def sliding_window_causal_mask(b, h, q_idx, kv_idx):
+        causal = q_idx >= kv_idx
+        in_window = (q_idx - kv_idx) <= window_size
+        return causal & in_window
+    return sliding_window_causal_mask
+
+# Pre-compile flex_attention to avoid double compilation issues
+# This is needed when the model itself is compiled
+try:
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    _flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
+    
+    # Wrap both create_block_mask and flex_attention to insulate from outer compilation
+    @torch.compiler.disable(recursive=False)
+    def create_block_mask_uncompiled(mask_mod, B, H, Q_LEN, KV_LEN, device):
+        return create_block_mask(
+            mask_mod,
+            B=B, H=H,
+            Q_LEN=Q_LEN, KV_LEN=KV_LEN,
+            device=device
+        )
+    
+    @torch.compiler.disable(recursive=False)
+    def flex_attention_compiled(q, k, v, block_mask):
+        return _flex_attention_compiled(q, k, v, block_mask=block_mask)
+except ImportError:
+    flex_attention_compiled = None
+    create_block_mask_uncompiled = None
 
 class GemmaAttention(nn.Module):
 
@@ -187,6 +237,12 @@ class GemmaAttention(nn.Module):
 
         self.attn_type = attn_type
         self.sliding_window_size = config.sliding_window_size
+        
+        # Pre-create mask functions for FlexAttention
+        if self.attn_type == "local_sliding" and self.sliding_window_size is not None:
+            self.mask_fn = _make_sliding_window_causal_mask(self.sliding_window_size)
+        else:
+            self.mask_fn = _causal_mask
 
     def forward(
         self,
@@ -216,38 +272,104 @@ class GemmaAttention(nn.Module):
         xq = apply_rotary_emb(xq, freqs_cis=freqs_cis)
         xk = apply_rotary_emb(xk, freqs_cis=freqs_cis)
 
-        if self.num_kv_heads != self.num_heads:
-            # [batch_size, max_seq_len, n_local_heads, head_dim]
-            xk = torch.repeat_interleave(xk, self.num_queries_per_kv, dim=2)
-            xv = torch.repeat_interleave(xv,
-                                            self.num_queries_per_kv,
-                                            dim=2)
-
-        # [batch_size, n_local_heads, input_len, head_dim]
-        q = xq.transpose(1, 2)
-        # [batch_size, n_local_heads, input_len, head_dim]
-        k = xk.transpose(1, 2)
-        v = xv.transpose(1, 2)
-
-        # [batch_size, n_local_heads, input_len, input_len]
-        q.mul_(self.scaling)
-        scores = torch.matmul(q, k.transpose(2, 3))
-        if (
-            self.attn_type == "local_sliding"
-            and self.sliding_window_size is not None
-            and local_mask is not None
-        ):
-            mask = local_mask
-
-        scores = scores + mask
-        scores = F.softmax(scores.float(), dim=-1).type_as(q)
-
-        # [batch_size, n_local_heads, input_len, head_dim]
-        output = torch.matmul(scores, v)
-
-        # [batch_size, input_len, hidden_dim]
-        output = (output.transpose(1, 2).contiguous().view(
-            batch_size, input_len, -1))
+        # Choose attention implementation
+        # Options: "eager", "sdpa", "flex"
+        attention_backend = "eager"
+        
+        if attention_backend == "eager":
+            # Option 1: Original PyTorch implementation (always works, may be slower)
+            # Handles GQA by expanding k,v heads
+            if self.num_kv_heads != self.num_heads:
+                # [batch_size, seq_len, n_heads, head_dim]
+                xk = torch.repeat_interleave(xk, self.num_queries_per_kv, dim=2)
+                xv = torch.repeat_interleave(xv, self.num_queries_per_kv, dim=2)
+            
+            # [batch_size, n_heads, seq_len, head_dim]
+            q = xq.transpose(1, 2)
+            k = xk.transpose(1, 2)
+            v = xv.transpose(1, 2)
+            
+            # Select appropriate mask
+            if (
+                self.attn_type == "local_sliding"
+                and self.sliding_window_size is not None
+                and local_mask is not None
+            ):
+                attn_mask = local_mask
+            else:
+                attn_mask = mask
+            
+            # Manual attention computation
+            q = q * self.scaling
+            scores = torch.matmul(q, k.transpose(2, 3))
+            scores = scores + attn_mask
+            scores = F.softmax(scores.float(), dim=-1).type_as(q)
+            output = torch.matmul(scores, v)
+            
+        elif attention_backend == "flex":
+            # Option 2: FlexAttention implementation (requires PyTorch 2.5.0+)
+            # Better native support for sliding window attention
+            try:
+                if flex_attention_compiled is None or create_block_mask_uncompiled is None:
+                    raise ImportError("FlexAttention not available")
+                
+                # Use uncompiled create_block_mask to avoid compilation issues
+                block_mask = create_block_mask_uncompiled(
+                    self.mask_fn,
+                    B=batch_size, H=None,
+                    Q_LEN=input_len, KV_LEN=input_len,
+                    device=hidden_states.device
+                )
+                
+                # Transpose for FlexAttention: [batch_size, n_heads, seq_len, head_dim]
+                q = xq.transpose(1, 2) * self.scaling
+                k = xk.transpose(1, 2)
+                v = xv.transpose(1, 2)
+                
+                # Use pre-compiled flex_attention to avoid double compilation
+                output = flex_attention_compiled(q, k, v, block_mask)
+                
+            except ImportError:
+                raise ImportError("FlexAttention requires PyTorch 2.5.0 or later")
+                
+        else:  # attention_backend == "sdpa"
+            # Option 3: Standard SDPA with manual masks (compatible with PyTorch 2.0+)
+            # This approach handles GQA by expanding k,v heads before SDPA
+            
+            if self.num_kv_heads != self.num_heads:
+                # Expand KV heads for GQA - SDPA with enable_gqa is experimental
+                # [batch_size, seq_len, n_heads, head_dim]
+                xk = torch.repeat_interleave(xk, self.num_queries_per_kv, dim=2)
+                xv = torch.repeat_interleave(xv, self.num_queries_per_kv, dim=2)
+            
+            # Transpose for SDPA: [batch_size, n_heads, seq_len, head_dim]
+            q = xq.transpose(1, 2)
+            k = xk.transpose(1, 2)
+            v = xv.transpose(1, 2)
+            
+            # Select appropriate mask
+            if (
+                self.attn_type == "local_sliding"
+                and self.sliding_window_size is not None
+                and local_mask is not None
+            ):
+                attn_mask = local_mask
+            else:
+                attn_mask = mask
+            
+            # Use PyTorch's scaled_dot_product_attention
+            # Let PyTorch choose the best backend automatically
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                scale=self.scaling,
+                is_causal=False
+            )
+        
+        # [batch_size, seq_len, hidden_dim]
+        output = output.transpose(1, 2).contiguous().view(
+            batch_size, input_len, -1)
         output = self.o_proj(output)
         return output
     
@@ -404,13 +526,21 @@ class GemmaTextModel(nn.Module):
             "global": 10_000,
         }
         
+        # Get rope scaling factor if configured
+        rope_scaling_factor = 1
+        if hasattr(config, 'rope_scaling') and config.rope_scaling:
+            rope_scaling_factor = config.rope_scaling.get('factor', 1)
+            
         # Register frequencies for both attention types
+        # IMPORTANT: rope_scaling_factor is only applied to global attention, not local_sliding
         self._register_freqs_cis('local_freqs_cis', head_dim, max_seq_len, 
-                                theta=rope_lengths.get('local_sliding', defaults['local_sliding']))
+                                theta=rope_lengths.get('local_sliding', defaults['local_sliding']),
+                                rope_scaling_factor=1.0)  # No scaling for local attention
         self._register_freqs_cis('global_freqs_cis', head_dim, max_seq_len, 
-                                theta=rope_lengths.get('global', defaults['global']))
+                                theta=rope_lengths.get('global', defaults['global']),
+                                rope_scaling_factor=rope_scaling_factor)  # Scaling only for global attention
     
-    def _register_freqs_cis(self, name: str, head_dim: int, max_seq_len: int, theta: float, rope_scaling_factor: int = 1):
+    def _register_freqs_cis(self, name: str, head_dim: int, max_seq_len: int, theta: float, rope_scaling_factor: float = 1.0):
         self.register_buffer(name, precompute_freqs_cis(
             dim=head_dim,
             end=max_seq_len*2,
@@ -420,14 +550,22 @@ class GemmaTextModel(nn.Module):
         
     def init_weights(self):
         """Initialize weights following Llama pattern."""
+        # Get rope scaling factor if configured
+        rope_scaling_factor = 1
+        if hasattr(self.config, 'rope_scaling') and self.config.rope_scaling:
+            rope_scaling_factor = self.config.rope_scaling.get('factor', 1)
+            
         # Re-initialize freqs_cis on the correct device
         with torch.device(self.local_freqs_cis.device):
+            # IMPORTANT: rope_scaling_factor is only applied to global attention, not local_sliding
             self._register_freqs_cis('local_freqs_cis', self.config.head_dim, 
                                    self.config.max_position_embeddings,
-                                   theta=self.config.rope_wave_length.get('local_sliding', 10_000) if self.config.rope_wave_length else 10_000)
+                                   theta=self.config.rope_wave_length.get('local_sliding', 10_000) if self.config.rope_wave_length else 10_000,
+                                   rope_scaling_factor=1.0)  # No scaling for local attention
             self._register_freqs_cis('global_freqs_cis', self.config.head_dim,
                                    self.config.max_position_embeddings, 
-                                   theta=self.config.rope_wave_length.get('global', 10_000) if self.config.rope_wave_length else 10_000)
+                                   theta=self.config.rope_wave_length.get('global', 10_000) if self.config.rope_wave_length else 10_000,
+                                   rope_scaling_factor=rope_scaling_factor)  # Scaling only for global attention
         
         # Initialize embeddings
         nn.init.normal_(self.tok_embeddings.weight, std=self.config.init_std)
@@ -538,7 +676,7 @@ class Gemma3MultiModalModel(nn.Module):
         self._register_freqs_cis('local_freqs_cis', head_dim, max_seq_len, theta=rope_lengths.get('local_sliding', defaults['local_sliding']))
         self._register_freqs_cis('global_freqs_cis', head_dim, max_seq_len, theta=rope_lengths.get('global', defaults['global']))
 
-    def _register_freqs_cis(self, name: str, head_dim: int, max_seq_len: int, theta: float, rope_scaling_factor: int = 1):
+    def _register_freqs_cis(self, name: str, head_dim: int, max_seq_len: int, theta: float, rope_scaling_factor: float = 1.0):
         self.register_buffer(name, precompute_freqs_cis(
             dim=head_dim,
             end=max_seq_len*2,
