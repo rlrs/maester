@@ -95,8 +95,31 @@ gemma3_configs = {
             "local_sliding": 10_000,
             "global": 1_000_000,
         },
-        rope_scaling={"factor": 8.0, "rope_type": "linear"},  # RoPE scaling for 4B model
+        rope_scaling={"factor": 8.0},
         use_qk_norm=True,
         vision_config=None,
     ), 
+    "27B": ModelArgs(
+        # NON-STANDARD: Using text-only vocab size instead of full multimodal vocab (262,208)
+        # This discards the 64 vision tokens to ensure correct training dynamics
+        vocab_size=262_144,  # Text-only tokens, vision tokens (262,144-262,207) are discarded
+        dim=5376,
+        n_layers=62,
+        n_heads=32,
+        num_key_value_heads=16,
+        head_dim=128,
+        intermediate_size=21504,
+        attn_types=["local_sliding", "local_sliding", "local_sliding", "local_sliding", "local_sliding", "global"],
+        use_post_ffw_norm=True,
+        use_pre_ffw_norm=True,
+        query_pre_attn_scalar=168,
+        sliding_window_size=1024,
+        rope_wave_length={
+            "local_sliding": 10_000,
+            "global": 1_000_000,
+        },
+        rope_scaling={"factor": 8.0},
+        use_qk_norm=True,
+        vision_config=None,
+    ),
 } 
