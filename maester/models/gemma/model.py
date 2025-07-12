@@ -70,7 +70,7 @@ class Linear(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(
             torch.empty((out_features, in_features)),
-            requires_grad=False,
+            requires_grad=True,
         )
 
     def forward(self, x):
@@ -84,7 +84,7 @@ class Embedding(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(
             torch.empty((num_embeddings, embedding_dim)),
-            requires_grad=False,
+            requires_grad=True,
         )
 
     def forward(self, x):
@@ -98,7 +98,7 @@ class RMSNorm(torch.nn.Module):
         dim: int,
         eps: float = 1e-6,
         add_unit_offset: bool = True,
-        compile: bool = False,  # Enable compilation by default for better performance
+        compile: bool = True,
     ):
         super().__init__()
         self.eps = eps
