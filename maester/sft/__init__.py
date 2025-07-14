@@ -9,16 +9,22 @@ This module provides minimal SFT capabilities including:
 """
 
 from .messages import Message, Role, MaskingStrategy, mask_messages
-from .templates import CHATML_TEMPLATE, add_special_tokens
-from .tokenization import tokenize_messages, create_labels
+from .templates import add_special_tokens, format_message, get_template
+from .tokenization import tokenize_messages, create_labels, pad_sequence, CROSS_ENTROPY_IGNORE_IDX
+from .dataset import ConversationParquetDataset, build_sft_data_loader
 
 __all__ = [
     "Message",
     "Role",
     "MaskingStrategy",
     "mask_messages",
-    "CHATML_TEMPLATE", 
     "add_special_tokens",
+    "format_message",
+    "get_template",
     "tokenize_messages",
     "create_labels",
+    "pad_sequence",
+    "CROSS_ENTROPY_IGNORE_IDX",
+    "ConversationParquetDataset",
+    "build_sft_data_loader",
 ]
