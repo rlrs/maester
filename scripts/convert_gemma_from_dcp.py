@@ -88,6 +88,32 @@ def convert_gemma_from_dcp(
         model_type: "text" or "multimodal"
     """
     
+    # Validate original model directory if provided
+    if original_model_dir:
+        if not original_model_dir.exists():
+            raise ValueError(f"Original model directory does not exist: {original_model_dir}")
+        
+        # Check for essential files
+        has_config = (original_model_dir / "config.json").exists()
+        has_model = (
+            (original_model_dir / "model.safetensors").exists() or 
+            (original_model_dir / "model.safetensors.index.json").exists() or
+            (original_model_dir / "pytorch_model.bin").exists() or
+            (original_model_dir / "pytorch_model.bin.index.json").exists()
+        )
+        
+        if not has_config and not has_model:
+            raise ValueError(
+                f"Original model directory {original_model_dir} does not contain required files. "
+                f"Expected at least one of: config.json, model.safetensors, model.safetensors.index.json, "
+                f"pytorch_model.bin, or pytorch_model.bin.index.json"
+            )
+        
+        if not has_config:
+            print(f"Warning: No config.json found in {original_model_dir}")
+        if not has_model:
+            print(f"Warning: No model weights found in {original_model_dir}")
+    
     print(f"Loading checkpoint from {checkpoint_dir}")
     
     # Load the DCP checkpoint
@@ -205,7 +231,7 @@ def convert_gemma_from_dcp(
         hf_state_dict = convert_to_hf_multimodal_model(state_dict, original_model_dir, config)
     
     # Save in HuggingFace format
-    save_hf_checkpoint(hf_state_dict, output_dir, original_model_dir, config)
+    save_hf_checkpoint(hf_state_dict, output_dir, original_model_dir, job_config)
     
     print(f"Successfully converted to {output_dir}")
 
@@ -462,6 +488,54 @@ def split_qkv_projections(state_dict: Dict[str, torch.Tensor], config: Optional[
     return new_state_dict
 
 
+def update_tokenizer_config_for_sft(output_dir: Path, job_config: Dict[str, Any]):
+    """Update tokenizer_config.json with chat template based on SFT configuration."""
+    tokenizer_config_path = output_dir / "tokenizer_config.json"
+    
+    if not tokenizer_config_path.exists():
+        print("Warning: tokenizer_config.json not found, skipping chat template update")
+        return
+    
+    # Load existing tokenizer config
+    with open(tokenizer_config_path, "r") as f:
+        tokenizer_config = json.load(f)
+    
+    sft_config = job_config.get("sft", {})
+    
+    # Get the template type and tokens
+    template_type = sft_config.get("template", "chatml")
+    im_start_token = sft_config.get("im_start_token", "<start_of_turn>")
+    im_end_token = sft_config.get("im_end_token", "<end_of_turn>")
+    
+    if template_type == "chatml":
+        # Create Gemma-style chat template with our custom tokens
+        # This is a simplified version - you may want to copy the full template from the Gemma config
+        chat_template = (
+            "{{ bos_token }}"
+            "{% for message in messages %}"
+            "{% if message['role'] == 'user' %}"
+            f"{im_start_token}user\n{{{{ message['content'] }}}}{im_end_token}\n"
+            "{% elif message['role'] == 'assistant' %}"
+            f"{im_start_token}model\n{{{{ message['content'] }}}}{im_end_token}\n"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}"
+            f"{im_start_token}model\n"
+            "{% endif %}"
+        )
+        
+        # Update the config
+        tokenizer_config["chat_template"] = chat_template
+        
+        # Save updated config
+        with open(tokenizer_config_path, "w") as f:
+            json.dump(tokenizer_config, f, indent=2)
+        
+        print(f"Updated tokenizer_config.json with {template_type} chat template using tokens: {im_start_token}, {im_end_token}")
+    else:
+        print(f"Warning: Unknown template type '{template_type}', skipping chat template update")
+
+
 def load_vision_components(original_model_dir: Path) -> Dict[str, torch.Tensor]:
     """Load vision components from original model."""
     vision_state_dict = {}
@@ -503,7 +577,7 @@ def save_hf_checkpoint(
     state_dict: Dict[str, torch.Tensor], 
     output_dir: Path, 
     original_model_dir: Optional[Path],
-    config: Optional[Dict[str, Any]] = None
+    job_config: Optional[Dict[str, Any]] = None
 ):
     """Save checkpoint in HuggingFace format."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -555,7 +629,7 @@ def save_hf_checkpoint(
         import shutil
         
         # Config files
-        config_files = ["config.json", "generation_config.json", "tokenizer_config.json"]
+        config_files = ["config.json", "generation_config.json", "tokenizer_config.json", "preprocessor_config.json"]
         
         # Tokenizer files - both standard and Gemma-specific
         tokenizer_files = [
@@ -569,6 +643,10 @@ def save_hf_checkpoint(
             if src.exists():
                 shutil.copy2(src, output_dir / file_name)
                 print(f"Copied {file_name}")
+    
+    # Update tokenizer_config.json with chat template if SFT was enabled
+    if job_config and job_config.get("sft", {}).get("enabled", False):
+        update_tokenizer_config_for_sft(output_dir, job_config)
     
     print(f"Saved checkpoint to {output_dir}")
 
