@@ -5,13 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 from maester.models.llama import llama2_configs, llama3_configs, mistral_configs, Transformer
-from maester.models.gemma import gemma_configs, gemma3_configs, GemmaTextModel
+from maester.models.gemma import gemma3_configs, GemmaTextModel
 
 models_config = {
     "llama2": llama2_configs,
     "llama3": llama3_configs,
     "mistral": mistral_configs,
-    "gemma": gemma_configs,
     "gemma3": gemma3_configs,
 }
 
