@@ -23,6 +23,7 @@ from torch.utils._foreach_utils import (
 from torch.nn.utils.clip_grad import _clip_grads_with_norm_
 
 from maester.log_utils import logger
+from maester.models.gemma.model import Embedding as GemmaEmbedding
 
 def dist_max(x: int | float, mesh: DeviceMesh) -> float:
     tensor = torch.tensor(x).cuda()
@@ -68,7 +69,6 @@ def set_pg_timeouts(timeout, world_mesh):
 
 
 def get_num_params(model: torch.nn.Module, exclude_embedding: bool = False) -> int:
-    from maester.models.gemma.model import Embedding as GemmaEmbedding
     nparams = sum(p.numel() for p in model.parameters())
     nparams_embedding = sum(
         sum(p.numel() for p in m.parameters())

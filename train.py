@@ -76,6 +76,11 @@ def main():
         logger.info("Using configuration from config.py")
         cfg = Config()
 
+    # SFT imports if enabled
+    if cfg.sft is not None:
+        from maester.sft import add_special_tokens, build_sft_data_loader
+        logger.info("SFT mode enabled")
+    
     # take control of garbage collection to avoid stragglers
     gc.disable()
     gc.collect(1)
@@ -106,7 +111,7 @@ def main():
         else:
             dp_degree, dp_rank = 1, 0
         logger.info(f"world mesh: {world_mesh}")
-        logger.info(f"dp mesh: {dp_mesh}")
+        #logger.info(f"dp mesh: {dp_mesh}")
 
         # Get tokenizer to determine vocab size
         if os.path.isfile(cfg.tokenizer_name):
@@ -177,6 +182,11 @@ def main():
         # allocate sharded model on GPU and initialize weights via DTensor
         model.to_empty(device="cuda")
         model.init_weights()
+        
+        # Configure tokenizer for SFT if enabled
+        if cfg.sft is not None:
+            tokenizer = add_special_tokens(tokenizer, model, cfg)
+            logger.info(f"Configured tokenizer for SFT with {cfg.sft.template} template")
 
         # register hooks after compile?
         # get_logits_metrics, cleanup_monitoring, reinit_storage = register_logits_monitoring(
@@ -223,7 +233,11 @@ def main():
                     logger.info(f"No activation hook registered for {module_name}")
             logger.info(f"Activation hooks registered for {len(activation_hooks)} modules")
 
-        data_loader = build_experimental_data_loader(cfg, rank=dp_rank, world_size=dp_degree)
+        # Create appropriate dataloader based on mode
+        if cfg.sft is not None:
+            data_loader = build_sft_data_loader(cfg, rank=dp_rank, world_size=dp_degree)
+        else:
+            data_loader = build_experimental_data_loader(cfg, rank=dp_rank, world_size=dp_degree)
 
         # data_monitor = DataMonitor(train_state, log_freq=cfg.log_freq)
 
@@ -310,7 +324,16 @@ def main():
 
                 data_load_start = timer()
                 batch = next(data_iterator)
-                input_ids, labels = batch
+                
+                # Handle different batch formats
+                if cfg.sft is not None:
+                    input_ids = batch["input_ids"]
+                    labels = batch["labels"]
+                    # attention_mask available in batch["attention_mask"] if needed
+                else:
+                    # TODO: update non-sft data loader to return dict format too?
+                    input_ids, labels = batch
+                
                 # logger.info(f"step {train_state.step} training on input_ids (element 0) {input_ids[0, :]}")
                 ntokens_since_last_log += labels.numel()
                 data_loading_times.append(timer() - data_load_start)

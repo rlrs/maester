@@ -28,7 +28,6 @@ class DatasetConfig(BaseSettings):
 
 class SFTConfig(BaseSettings):
     """Configuration for supervised fine-tuning."""
-    enabled: bool = True 
     template: str = "chatml"
     mask_strategy: str = "assistant_only" 
     max_seq_len: int = 2048
@@ -66,7 +65,7 @@ class Config(BaseSettings):
 
     # datasets
     dataset: DatasetConfig = DatasetConfig()
-    sft: SFTConfig = SFTConfig()
+    sft: SFTConfig | None = None
     tokenizer_name: str = 'google/gemma-3-1b-pt' # "meta-llama/Llama-2-7b-hf" #
 
     # logging/metrics
