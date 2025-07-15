@@ -1,13 +1,6 @@
-"""
-SFT Dataset implementation.
-
-Extends ParquetDataset to handle conversation data with proper
-formatting and masking.
-"""
-
 import json
 import os
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Tuple
 
 import torch
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
@@ -15,20 +8,15 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from ..datasets.experimental_otf import ParquetDataset, Checkpoint_Dataset, parse_data_args
 from ..log_utils import logger
 
-from .messages import Message, Role, MaskingStrategy, mask_messages
-from .templates import get_template
-from .tokenization import tokenize_messages, create_labels, pad_sequence
+CROSS_ENTROPY_IGNORE_IDX = -100
 
 
 class ConversationParquetDataset(ParquetDataset):
     """
-    Dataset for loading conversation data from Parquet files.
+    Dataset for supervised fine-tuning on conversation data.
     
-    Extends ParquetDataset to:
-    - Read conversations from JSON column
-    - Apply chat templates
-    - Create masked labels
-    - Output dict format for training
+    Uses raw_data_mode to get conversations directly from parent,
+    then processes them with proper masking.
     """
     
     def __init__(
@@ -45,171 +33,138 @@ class ConversationParquetDataset(ParquetDataset):
         verbose: bool = False,
         shuffle: bool = True,
     ):
-        # Don't pass delimiter_token to parent - we handle formatting differently
-        super().__init__(
-            data_dir=data_dir,
-            rank=rank,
-            worldsize=worldsize,
-            tokenizer=tokenizer,
-            delimiter_token=tokenizer.eos_token_id,  # Use EOS as delimiter
-            bos_token=None,  # We handle BOS in formatting
-            strip_tokens=set(),
-            seed=seed,
-            min_length=1,
-            max_chunksize=max_seq_len,  # One conversation per sequence
-            verbose=verbose,
-            shuffle=shuffle,
-        )
-        
         self.template = template
-        self.mask_strategy = MaskingStrategy(mask_strategy)
+        self.mask_strategy = mask_strategy
         self.max_seq_len = max_seq_len
         self.conversation_column = conversation_column
         self.im_start = None  # Will be set by build_sft_data_loader
         self.im_end = None    # Will be set by build_sft_data_loader
         
-        # Get pad token ID
+        self._tokenizer = tokenizer
+        
         self.pad_token_id = tokenizer.pad_token_id
         if self.pad_token_id is None:
             self.pad_token_id = tokenizer.eos_token_id
-            
-    def _process_conversation(self, conversation_data: List[Dict]) -> Dict[str, List[int]]:
+        
+        super().__init__(
+            data_dir=data_dir,
+            rank=rank,
+            worldsize=worldsize,
+            tokenizer=None,  # Don't tokenize in parent
+            delimiter_token=None,  # Not needed in raw mode
+            bos_token=None,
+            strip_tokens=set(),
+            seed=seed,
+            min_length=1,
+            max_chunksize=1,  # Not used in raw mode
+            verbose=verbose,
+            shuffle=shuffle,
+            data_column=conversation_column,
+            process_fn=None,  # No processing in parent
+            raw_data_mode=True,  # Get raw conversations
+        )
+    
+    def _format_message(self, role: str, content: str) -> str:
+        """Format a message according to template."""
+        if self.template == "chatml":
+            return f"{self.im_start}{role}\n{content}{self.im_end}\n"
+        else:
+            raise ValueError(f"Unknown template: {self.template}")
+    
+    def _process_conversation(self, conversation_data) -> Dict[str, List[int]]:
         """
         Process a conversation into tokens with masking.
         
-        Args:
-            conversation_data: List of message dicts with 'role' and 'content'
-            
-        Returns:
-            Dict with input_ids, labels, attention_mask
+        This is the full processing pipeline that creates training-ready data.
         """
-        # Convert to Message objects
-        messages = []
+        # Parse JSON if needed
+        if isinstance(conversation_data, str):
+            conversation_data = json.loads(conversation_data)
+        
+        tokens = []
+        token_spans = []  # List of (start, end, role) for each message
+        
+        # Add BOS token if available
+        if self._tokenizer.bos_token_id is not None:
+            tokens.append(self._tokenizer.bos_token_id)
+        
+        # Process each message and track boundaries
         for msg in conversation_data:
-            role = Role(msg['role'])
+            role = msg['role']
             content = msg['content']
-            messages.append(Message(role=role, content=content))
+            
+            # Format and tokenize
+            formatted = self._format_message(role, content)
+            msg_tokens = self._tokenizer.encode(formatted, add_special_tokens=False)
+            
+            # Track span
+            start = len(tokens)
+            tokens.extend(msg_tokens)
+            end = len(tokens)
+            token_spans.append((start, end, role))
         
-        # Apply masking strategy
-        messages = mask_messages(messages, self.mask_strategy)
+        # Add EOS
+        tokens.append(self._tokenizer.eos_token_id)
         
-        # Tokenize with template
-        tokenized = tokenize_messages(
-            messages, 
-            self.tokenizer,
-            self.template,
-            max_seq_len=None,  # Don't truncate yet
-            add_bos=True,
-            im_start=self.im_start,
-            im_end=self.im_end
-        )
+        # Create input/label pairs for causal LM
+        if len(tokens) < 2:
+            # Too short, return empty
+            return {
+                "input_ids": [self.pad_token_id] * self.max_seq_len,
+                "labels": [CROSS_ENTROPY_IGNORE_IDX] * self.max_seq_len,
+                "attention_mask": [0] * self.max_seq_len
+            }
         
-        # Get tokens and mask
-        tokens = tokenized["tokens"]
-        mask = tokenized["mask"]
+        # Truncate if too long (keeping space for shifting)
+        if len(tokens) > self.max_seq_len + 1:
+            tokens = tokens[:self.max_seq_len + 1]
         
-        # For causal LM, we need to create input/label pairs:
-        # input_ids = tokens[:-1]  (all but last)
-        # labels = tokens[1:]      (all but first)
-        # This way: labels[i] corresponds to predicting tokens[i+1] from input_ids[i]
-        
-        input_tokens = tokens[:-1]
+        input_ids = tokens[:-1]
         label_tokens = tokens[1:]
-        label_mask = mask[1:]
         
-        # Create labels with masking applied
-        labels = create_labels(label_tokens, label_mask)
+        # Apply masking based on strategy and spans
+        labels = []
+        for i, token in enumerate(label_tokens):
+            # Find which span this position belongs to (accounting for shift)
+            is_masked = True  # Default to masked
+            
+            for start, end, role in token_spans:
+                if start <= i + 1 < end:  # +1 because labels are shifted
+                    if self.mask_strategy == "assistant_only":
+                        is_masked = (role != "assistant")
+                    elif self.mask_strategy == "all":
+                        is_masked = False
+                    break
+            
+            labels.append(CROSS_ENTROPY_IGNORE_IDX if is_masked else token)
         
-        # Pad sequences - all three should have the same length
-        padded = pad_sequence(
-            input_tokens,
-            label_mask,  # Use label mask since it corresponds to the labels
-            labels,
-            self.max_seq_len,
-            self.pad_token_id
-        )
+        # Pad sequences
+        current_len = len(input_ids)
+        if current_len < self.max_seq_len:
+            pad_len = self.max_seq_len - current_len
+            input_ids = input_ids + [self.pad_token_id] * pad_len
+            labels = labels + [CROSS_ENTROPY_IGNORE_IDX] * pad_len
+            attention_mask = [1] * current_len + [0] * pad_len
+        else:
+            input_ids = input_ids[:self.max_seq_len]
+            labels = labels[:self.max_seq_len]
+            attention_mask = [1] * self.max_seq_len
         
-        return padded
-        
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask
+        }
+    
     def __iter__(self):
         """
         Override parent's __iter__ to handle conversation data.
         
-        Yields dicts with input_ids, labels, attention_mask.
+        With raw_data_mode=True, parent yields raw conversation data directly.
         """
-        # Most of the logic is the same as parent
-        docset_offset = self.docset_index
-        lcg_offset = self.lcg_state
-        residual_chunks = self.chunk_index + 1
-        first_doc_mapping = None
-        ndocs = self._len
-        path = ""
-        reader = None
-        
-        if self.completed_current_doc:
-            docset_offset = (docset_offset + 1) % ndocs
-            self.completed_current_doc = False
-            
-        while True:
-            for i in range(ndocs):
-                doc_index = (docset_offset + i) % ndocs
-                self.completed_current_doc = False
-                
-                # Update stats
-                if doc_index == 0:
-                    self.epochs_seen += 1
-                    if self.verbose:
-                        logger.info(f"ConversationParquetDataset: entering epoch {self.epochs_seen}")
-                self.docset_index = doc_index
-                
-                # Get file and row info
-                file_path, docrange, mindoc = self._get_docid(doc_index)
-                
-                # Get document position
-                if i == 0 and not self.completed_current_doc and self.chunk_index >= 0:
-                    doclcg = self.lcg_state
-                else:
-                    doclcg = self._random_map_docid(docrange)
-                    self.lcg_state = doclcg
-                    
-                if i == 0:
-                    first_doc_mapping = doclcg
-                    
-                local_row = doclcg + mindoc
-                
-                # Read conversation data
-                newpath = file_path
-                path, reader = self._get_reader(path, newpath, reader)
-                
-                table = self._read_specific_row(reader, local_row)
-                
-                # Get conversation JSON
-                try:
-                    conversations = table[self.conversation_column][0].as_py()
-                    if isinstance(conversations, str):
-                        conversations = json.loads(conversations)
-                except Exception as e:
-                    logger.warning(f"Failed to read conversation at {file_path}:{local_row}: {e}")
-                    continue
-                    
-                # Process conversation
-                try:
-                    processed = self._process_conversation(conversations)
-                except Exception as e:
-                    logger.warning(f"Failed to process conversation at {file_path}:{local_row}: {e}")
-                    continue
-                
-                # Update stats and yield
-                self.docs_seen += 1
-                self.percent_seen = (self.docs_seen * 100 / (self._len + 1e-9))
-                self.tokens_seen += len(processed["input_ids"])
-                self.completed_current_doc = True
-                self.chunk_index = -1
-                
-                yield processed
-                
-            # Since we don't chunk conversations, residual handling is not needed
-            # Each conversation is atomic - we either process it fully or not at all
+        for conv_data in super().__iter__():
+            # Process the conversation with proper masking
+            yield self._process_conversation(conv_data)
 
 
 def build_sft_data_loader(cfg, rank, world_size):
@@ -234,6 +189,16 @@ def build_sft_data_loader(cfg, rank, world_size):
         tokenizer = PreTrainedTokenizerFast(tokenizer_file=cfg.tokenizer_name)
     else:
         tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
+    
+    # Set pad token if not already set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        
+    # Verify the tokens we want to use exist in vocabulary
+    for token in [cfg.sft.im_start_token, cfg.sft.im_end_token]:
+        if token not in tokenizer.get_vocab():
+            raise ValueError(f"Token '{token}' not found in tokenizer vocabulary. "
+                           f"Please choose existing tokens for im_start_token and im_end_token.")
     
     # For now, only support single dataset
     if len(data_dirs) > 1:
