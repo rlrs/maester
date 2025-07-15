@@ -18,7 +18,6 @@ model_name_to_cls = {
     "llama2": Transformer, 
     "llama3": Transformer, 
     "mistral": Transformer,
-    "gemma": GemmaTextModel,
     "gemma3": GemmaTextModel,
 }
 
@@ -26,6 +25,5 @@ model_name_to_tokenizer = {
     "llama2": "sentencepiece",
     "llama3": "tiktoken",
     "mistral": "sentencepiece",
-    "gemma": "sentencepiece",
     "gemma3": "sentencepiece",
 }
