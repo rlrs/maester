@@ -20,6 +20,8 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor.parallel import loss_parallel
 
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
 from maester.checkpoint import CheckpointManager
 from maester.config import Config
 from maester.datasets.experimental_otf import build_experimental_data_loader
@@ -109,10 +111,8 @@ def main():
 
         # Get tokenizer to determine vocab size
         if os.path.isfile(cfg.tokenizer_name):
-            from transformers import PreTrainedTokenizerFast
             tokenizer = PreTrainedTokenizerFast(tokenizer_file=cfg.tokenizer_name)
         else:
-            from transformers import AutoTokenizer
             tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
 
         # build model w/ meta init
@@ -124,11 +124,10 @@ def main():
         # 3. max_seq_len base on inputs
         model_config.norm_type = cfg.norm_type
         # Get vocab size from tokenizer (vocab_size is base vocabulary without added tokens)
-        if cfg.model_name not in ["gemma", "gemma3"]: # gemma has vocab sizes in model config, trust it
-            if hasattr(tokenizer, 'vocab_size'):
-                model_config.vocab_size = tokenizer.vocab_size
-            else:
-                model_config.vocab_size = len(tokenizer)
+        if hasattr(model_config, 'vocab_size') and model_config.vocab_size > 0:
+            model_config.vocab_size = tokenizer.vocab_size
+        else: # rely on tokenizer to provide vocab size
+            model_config.vocab_size = len(tokenizer)
         model_config.max_seq_len = cfg.seq_len
         if cfg.enable_mup:
             model_config.enable_mup = True

@@ -65,7 +65,7 @@ gemma3_configs = {
         rope_scaling={"factor": 8.0},
         use_qk_norm=True,
         vision_config=None,
-    )
+    ),
     "27B": ModelArgs(
         # NON-STANDARD: Using text-only vocab size instead of full multimodal vocab (262,208)
         # This discards the 64 vision tokens to ensure correct training dynamics
