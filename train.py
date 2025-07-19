@@ -32,7 +32,11 @@ from maester.metrics import build_gpu_memory_monitor, build_metric_logger, regis
 from maester.data_monitor import DataMonitor
 from maester.models import (model_name_to_cls, model_name_to_tokenizer,
                             models_config)
-from maester.parallelisms import ParallelDims, parallelize_llama
+from maester.parallelisms import (
+    ParallelDims,
+    parallelize_gemma,
+    parallelize_llama,
+)
 from maester.profiling import (maybe_enable_memory_snapshot,
                                maybe_enable_profiling)
 from maester.utils import (clean_param_name, clip_grad_norm, dist_max, dist_mean, get_num_flop_per_token,
@@ -166,7 +170,6 @@ def main():
 
         # Choose parallelization function based on model type
         if cfg.model_name in ["gemma", "gemma3"]:
-            from maester.parallelisms import parallelize_gemma
             parallelize_gemma(model, world_mesh, parallel_dims, cfg)
         else:
             parallelize_llama(model, world_mesh, parallel_dims, cfg)
