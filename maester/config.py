@@ -14,7 +14,7 @@ class DatasetConfig(BaseSettings):
     data_logical_shards: int = 8192
     data_dirs: list[str] = [
                             # "../fineweb-edu-score-2/data/",
-                            "../danweb/parquet"
+                            "../danish-dynaword/"
                             ]
     dataset_weights: str = "1.0"
     bos_token: int = 128000

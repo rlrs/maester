@@ -73,7 +73,7 @@ BIND_MASK="$BIND_MASK_1"
 
 # echo $CMD
 
-echo "START $SLURM_JOBID: $(date)"
+echo "START $SLURM_JOB_ID: $(date)"
 
 srun \
     --label \
@@ -81,4 +81,4 @@ srun \
     /scratch/{account}/maester/scripts/slurm/in_container.sh \
     train.py "{dump_dir}/{job_name}"
 
-echo "END $SLURM_JOBID: $(date)"
+echo "END $SLURM_JOB_ID: $(date)"
