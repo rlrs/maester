@@ -30,13 +30,12 @@ from maester.lr_scheduling import get_lr_scheduler
 from maester.memory import cleanup_before_training
 from maester.metrics import build_gpu_memory_monitor, build_metric_logger, register_logits_monitoring, WeightScaleMonitor
 from maester.data_monitor import DataMonitor
-from maester.models import (model_name_to_cls, model_name_to_tokenizer,
-                            models_config)
-from maester.parallelisms import (
-    ParallelDims,
-    parallelize_gemma,
-    parallelize_llama,
+from maester.models import (
+    model_name_to_cls,
+    models_config,
+    model_name_to_parallelize,
 )
+from maester.parallelisms import ParallelDims
 from maester.profiling import (maybe_enable_memory_snapshot,
                                maybe_enable_profiling)
 from maester.utils import (clean_param_name, clip_grad_norm, dist_max, dist_mean, get_num_flop_per_token,
@@ -169,10 +168,8 @@ def main():
         gpu_peak_flops = get_peak_flops(torch.cuda.get_device_properties(0).name)
 
         # Choose parallelization function based on model type
-        if cfg.model_name in ["gemma", "gemma3"]:
-            parallelize_gemma(model, world_mesh, parallel_dims, cfg)
-        else:
-            parallelize_llama(model, world_mesh, parallel_dims, cfg)
+        parallelize = model_name_to_parallelize[cfg.model_name]
+        parallelize(model, world_mesh, parallel_dims, cfg)
         logger.info(f"Model after parallelization {model=}\n")
 
         # allocate sharded model on GPU and initialize weights via DTensor
