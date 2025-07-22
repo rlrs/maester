@@ -23,6 +23,7 @@ from torch.utils._foreach_utils import (
 from torch.nn.utils.clip_grad import _clip_grads_with_norm_
 
 from maester.log_utils import logger
+from maester.models.gemma.model import Embedding as GemmaEmbedding
 
 def dist_max(x: int | float, mesh: DeviceMesh) -> float:
     tensor = torch.tensor(x).cuda()
@@ -72,7 +73,7 @@ def get_num_params(model: torch.nn.Module, exclude_embedding: bool = False) -> i
     nparams_embedding = sum(
         sum(p.numel() for p in m.parameters())
         for m in model.children()
-        if isinstance(m, torch.nn.Embedding)
+        if isinstance(m, (torch.nn.Embedding, GemmaEmbedding))
     )
     return nparams - nparams_embedding if exclude_embedding else nparams
 
@@ -99,6 +100,8 @@ def get_peak_flops(device_name: str) -> int:
     if "A100" in device_name:
         # data from https://www.nvidia.com/en-us/data-center/a100/
         return 312e12
+    elif "B200" in device_name:
+        return 2250e12
     elif "H100" in device_name:
         # data from https://www.nvidia.com/en-us/data-center/h100/
         # NOTE: Specifications are one-half lower without sparsity.
