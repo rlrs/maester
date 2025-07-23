@@ -321,14 +321,8 @@ def main():
                 data_load_start = timer()
                 batch = next(data_iterator)
                 
-                # Handle different batch formats
-                if cfg.sft is not None:
-                    input_ids = batch["input_ids"]
-                    labels = batch["labels"]
-                    # attention_mask available in batch["attention_mask"] if needed
-                else:
-                    # TODO: update non-sft data loader to return dict format too?
-                    input_ids, labels = batch
+                input_ids = batch["input_ids"]
+                labels = batch["labels"]
                 
                 # logger.info(f"step {train_state.step} training on input_ids (element 0) {input_ids[0, :]}")
                 ntokens_since_last_log += labels.numel()

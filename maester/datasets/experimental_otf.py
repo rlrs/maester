@@ -1507,7 +1507,7 @@ def build_experimental_data_loader(cfg, rank, world_size):
         t = data_seq.clone()[1:]
         data_seq = data_seq[:-1]
         t[:prompt_len] = -100
-        return data_seq, t
+        return {"input_ids": data_seq, "labels": t}
     
     if os.path.isfile(cfg.tokenizer_name):
         tokenizer = PreTrainedTokenizerFast(tokenizer_file=cfg.tokenizer_name)
