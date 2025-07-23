@@ -113,7 +113,6 @@ def convert_gemma_from_dcp(
             print(f"Warning: No config.json found in {original_model_dir}")
         if not has_model:
             print(f"Warning: No model weights found in {original_model_dir}")
-    
     print(f"Loading checkpoint from {checkpoint_dir}")
     
     # Load the DCP checkpoint
@@ -535,7 +534,6 @@ def update_tokenizer_config_for_sft(output_dir: Path, job_config: Dict[str, Any]
     else:
         print(f"Warning: Unknown template type '{template_type}', skipping chat template update")
 
-
 def load_vision_components(original_model_dir: Path) -> Dict[str, torch.Tensor]:
     """Load vision components from original model."""
     vision_state_dict = {}
@@ -647,7 +645,7 @@ def save_hf_checkpoint(
     # Update tokenizer_config.json with chat template if SFT was enabled
     if job_config and job_config.get("sft", {}).get("enabled", False):
         update_tokenizer_config_for_sft(output_dir, job_config)
-    
+        
     print(f"Saved checkpoint to {output_dir}")
 
 

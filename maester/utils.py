@@ -73,7 +73,7 @@ def get_num_params(model: torch.nn.Module, exclude_embedding: bool = False) -> i
     nparams_embedding = sum(
         sum(p.numel() for p in m.parameters())
         for m in model.children()
-        if isinstance(m, torch.nn.Embedding) or isinstance(m, GemmaEmbedding)
+        if isinstance(m, (torch.nn.Embedding, GemmaEmbedding))
     )
     return nparams - nparams_embedding if exclude_embedding else nparams
 

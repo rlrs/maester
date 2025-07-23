@@ -20,6 +20,8 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor.parallel import loss_parallel
 
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
 from maester.checkpoint import CheckpointManager
 from maester.config import Config
 from maester.data_monitor import DataMonitor
@@ -28,11 +30,14 @@ from maester.datasets.experimental_otf import build_experimental_data_loader
 from maester.log_utils import init_logger, logger
 from maester.lr_scheduling import get_lr_scheduler
 from maester.memory import cleanup_before_training
-from maester.metrics import (WeightScaleMonitor, build_gpu_memory_monitor,
-                             build_metric_logger, register_logits_monitoring)
-from maester.models import (model_name_to_cls, model_name_to_tokenizer,
-                            models_config)
-from maester.parallelisms import ParallelDims, parallelize_llama
+from maester.metrics import build_gpu_memory_monitor, build_metric_logger, register_logits_monitoring, WeightScaleMonitor
+from maester.data_monitor import DataMonitor
+from maester.models import (
+    model_name_to_cls,
+    models_config,
+    model_name_to_parallelize,
+)
+from maester.parallelisms import ParallelDims
 from maester.profiling import (maybe_enable_memory_snapshot,
                                maybe_enable_profiling)
 from maester.sft import build_sft_data_loader
@@ -116,10 +121,8 @@ def main():
 
         # Get tokenizer to determine vocab size
         if os.path.isfile(cfg.tokenizer_name):
-            from transformers import PreTrainedTokenizerFast
             tokenizer = PreTrainedTokenizerFast(tokenizer_file=cfg.tokenizer_name)
         else:
-            from transformers import AutoTokenizer
             tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
 
         # build model w/ meta init
@@ -131,11 +134,10 @@ def main():
         # 3. max_seq_len base on inputs
         model_config.norm_type = cfg.norm_type
         # Get vocab size from tokenizer (vocab_size is base vocabulary without added tokens)
-        if cfg.model_name not in ["gemma", "gemma3"]: # gemma has vocab sizes in model config, trust it
-            if hasattr(tokenizer, 'vocab_size'):
-                model_config.vocab_size = tokenizer.vocab_size
-            else:
-                model_config.vocab_size = len(tokenizer)
+        if hasattr(model_config, 'vocab_size') and model_config.vocab_size > 0:
+            model_config.vocab_size = tokenizer.vocab_size
+        else: # rely on tokenizer to provide vocab size
+            model_config.vocab_size = len(tokenizer)
         model_config.max_seq_len = cfg.seq_len
         if cfg.enable_mup:
             model_config.enable_mup = True
@@ -173,11 +175,8 @@ def main():
         gpu_peak_flops = get_peak_flops(torch.cuda.get_device_properties(0).name)
 
         # Choose parallelization function based on model type
-        if cfg.model_name in ["gemma", "gemma3"]:
-            from maester.parallelisms import parallelize_gemma
-            parallelize_gemma(model, world_mesh, parallel_dims, cfg)
-        else:
-            parallelize_llama(model, world_mesh, parallel_dims, cfg)
+        parallelize = model_name_to_parallelize[cfg.model_name]
+        parallelize(model, world_mesh, parallel_dims, cfg)
         logger.info(f"Model after parallelization {model=}\n")
 
         # allocate sharded model on GPU and initialize weights via DTensor
