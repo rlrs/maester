@@ -22,21 +22,23 @@ from torch.distributed.tensor.parallel import loss_parallel
 
 from maester.checkpoint import CheckpointManager
 from maester.config import Config
+from maester.data_monitor import DataMonitor
 from maester.datasets.experimental_otf import build_experimental_data_loader
-# from maester.datasets.experimental import build_experimental_data_loader
+# from maester.datasets.experimental import build_experimental_data_loader # TODO: clean up datasets integration
 from maester.log_utils import init_logger, logger
 from maester.lr_scheduling import get_lr_scheduler
 from maester.memory import cleanup_before_training
-from maester.metrics import build_gpu_memory_monitor, build_metric_logger, register_logits_monitoring, WeightScaleMonitor
-from maester.data_monitor import DataMonitor
+from maester.metrics import (WeightScaleMonitor, build_gpu_memory_monitor,
+                             build_metric_logger, register_logits_monitoring)
 from maester.models import (model_name_to_cls, model_name_to_tokenizer,
                             models_config)
 from maester.parallelisms import ParallelDims, parallelize_llama
 from maester.profiling import (maybe_enable_memory_snapshot,
                                maybe_enable_profiling)
-from maester.utils import (clean_param_name, clip_grad_norm, dist_max, dist_mean, get_num_flop_per_token,
-                           get_num_params, get_peak_flops, init_distributed,
-                           set_pg_timeouts)
+from maester.sft import build_sft_data_loader
+from maester.utils import (clean_param_name, clip_grad_norm, dist_max,
+                           dist_mean, get_num_flop_per_token, get_num_params,
+                           get_peak_flops, init_distributed, set_pg_timeouts)
 
 
 # Training state that is saved in checkpoints
@@ -78,7 +80,6 @@ def main():
 
     # SFT imports if enabled
     if cfg.sft is not None:
-        from maester.sft import add_special_tokens, build_sft_data_loader
         logger.info("SFT mode enabled")
     
     # take control of garbage collection to avoid stragglers
@@ -183,11 +184,6 @@ def main():
         model.to_empty(device="cuda")
         model.init_weights()
         
-        # Configure tokenizer for SFT if enabled
-        if cfg.sft is not None:
-            tokenizer = add_special_tokens(tokenizer, model, cfg)
-            logger.info(f"Configured tokenizer for SFT with {cfg.sft.template} template")
-
         # register hooks after compile?
         # get_logits_metrics, cleanup_monitoring, reinit_storage = register_logits_monitoring(
         #     model, 
