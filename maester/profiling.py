@@ -71,7 +71,7 @@ def maybe_enable_profiling(config: Config, *pos_args, **kwargs):
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active),
+            schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=3),
             on_trace_ready=trace_handler,
         ) as torch_profiler:
             yield torch_profiler
