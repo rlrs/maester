@@ -23,9 +23,7 @@ gemma3_configs = {
         vision_config=None,
     ),
     "4B": ModelArgs(
-        # NON-STANDARD: Using text-only vocab size instead of full multimodal vocab (262,208)
-        # This discards the 64 vision tokens to ensure correct training dynamics
-        vocab_size=262_144,  # Text-only tokens, vision tokens (262,144-262,207) are discarded
+        vocab_size=262_208
         dim=2560,
         n_layers=34,
         n_heads=8,
@@ -45,9 +43,7 @@ gemma3_configs = {
         vision_config=None,
     ), 
     "12B": ModelArgs(
-        # NON-STANDARD: Using text-only vocab size instead of full multimodal vocab (262,208)
-        # This discards the 64 vision tokens to ensure correct training dynamics
-        vocab_size=262_144,  # Text-only tokens, vision tokens (262,144-262,207) are discarded
+        vocab_size=262_208
         dim=3840,
         n_layers=48,
         n_heads=16,
@@ -67,9 +63,7 @@ gemma3_configs = {
         vision_config=None,
     ),
     "27B": ModelArgs(
-        # NON-STANDARD: Using text-only vocab size instead of full multimodal vocab (262,208)
-        # This discards the 64 vision tokens to ensure correct training dynamics
-        vocab_size=262_144,  # Text-only tokens, vision tokens (262,144-262,207) are discarded
+        vocab_size=262_208
         dim=5376,
         n_layers=62,
         n_heads=32,
