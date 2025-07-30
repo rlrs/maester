@@ -11,10 +11,9 @@ TORCH_DTYPE_MAP = {
 }
 
 class DatasetConfig(BaseSettings):
-    data_logical_shards: int = 8192
     data_dirs: list[str] = [
                             # "../fineweb-edu-score-2/data/",
-                            "../danweb/parquet"
+                            "data/shuffled_datasets_better"
                             ]
     dataset_weights: str = "1.0"
     bos_token: int = 128000
@@ -26,8 +25,8 @@ class Config(BaseSettings):
 
     # submission/job 
     dump_dir: str = "jobs/"
-    job_name: str = "llama-3.2-3B"
-    num_nodes: int = 32
+    job_name: str = "gemma-muon-test"
+    num_nodes: int = 1
     partition: str = "standard-g"
     account: str = "project_465001265"
     time: str = "0-01:00:00"
@@ -37,7 +36,7 @@ class Config(BaseSettings):
     max_grad_norm: float = 2.0
     gc_freq: int = 4
     data_parallel_shard_degree: int = 8
-    data_parallel_replicate_degree: int = 32
+    data_parallel_replicate_degree: int = 1
     tensor_parallel_degree: int = 1
     train_batch_size: int = 2 # per device; 2 * 8 gpus * 32 nodes * 8192 seqlen = ~4M tokens per batch
     train_num_steps: int = 22000 # ~92B tokens
@@ -49,16 +48,16 @@ class Config(BaseSettings):
 
     # datasets
     dataset: DatasetConfig = DatasetConfig()
-    tokenizer_name: str = 'meta-llama/Llama-3.2-3B' # "meta-llama/Llama-2-7B"
+    tokenizer_name: str = 'google/gemma-3-4B-pt' # "meta-llama/Llama-2-7B"
 
     # logging/metrics
     log_freq: int = 10
     log_rank0_only: bool = True
     save_tb_folder: str = "tb"
     enable_tensorboard: bool = False
-    enable_wandb: bool = True
+    enable_wandb: bool = False
     wandb_entity: str = "danish-foundation-models"
-    wandb_project: str = "llama-3.2-3B"
+    wandb_project: str = "gemma-muon-test"
 
     # checkpointing
     enable_checkpoint: bool = True
@@ -69,8 +68,8 @@ class Config(BaseSettings):
     forced_load_path: str | None = None
 
     # model
-    model_name: str = "llama3"
-    flavor: str = "3B"
+    model_name: str = "gemma3"
+    flavor: str = "4B"
     seq_len: int = 8192
     norm_type: str = "compiled_rmsnorm"
 
@@ -83,19 +82,35 @@ class Config(BaseSettings):
     mup_log_coord_check: bool = False
 
     # optimizer
-    opt_class: ImportString[Callable] = 'torch.optim.AdamW'
-    opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
-        lr = 3e-4, # max lr, schedule reduces it at points
-        betas = (0.9, 0.95),
-        weight_decay=0.1,
-        eps=1e-8,
-        # foreach=True, # foreach might work where fused doesn't
-        fused=True
-    )
+    # Muon for 2D+ params (except embeddings/output), AdamW for embeddings/output/1D params
+    optimizer_groups: list[dict[str, Any]] = [
+        {
+            'opt_class': 'maester.optimizers.Muon',
+            'opt_cfg': {
+                'lr': 0.02,
+                'momentum': 0.95,
+                'ns_steps': 5,
+                'wd': 0.01
+            },
+            'min_dim': 2,
+            'exclude_names': ['tok_embeddings', 'output']  # These use AdamW instead
+        },
+        {
+            'opt_class': 'torch.optim.AdamW',
+            'opt_cfg': {
+                'lr': 3e-4,
+                'betas': (0.9, 0.95),
+                'weight_decay': 0.0,  # No weight decay for embeddings/output/1D params
+                'eps': 1e-9,
+                'fused': True
+            },
+            'min_dim': 0  # Catches everything not assigned to first group
+        }
+    ]
 
     # lr schedule
     scheduler: str = "linear_warmup_cosine"
-    warmup_steps: int = 50
+    warmup_steps: int = 100
 
     # fsdp
     mixed_precision_param: str = 'bfloat16'
