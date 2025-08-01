@@ -65,7 +65,7 @@ def _fill_indices_kernel(
 # wrapper
 # ==============
 
-
+@torch.library.triton_op("moe_indices::fill_indices", mutates_args={})
 def fill_indices_wrapper(
     tokens_per_expert_group: torch.Tensor,
     start_index_values: torch.Tensor,
@@ -87,7 +87,7 @@ def fill_indices_wrapper(
     grid = (num_blocks,)
 
     # launch kernel
-    _fill_indices_kernel[grid](
+    torch.library.wrap_triton(_fill_indices_kernel)[grid](
         tokens_per_expert_group,
         start_index_values,
         write_offsets,
