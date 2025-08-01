@@ -34,6 +34,7 @@ from maester.models import (
     model_name_to_cls,
     models_config,
     model_name_to_parallelize,
+    model_name_to_optimizers_builder,
 )
 from maester.parallelisms import ParallelDims
 from maester.profiling import (maybe_enable_memory_snapshot,
@@ -79,6 +80,7 @@ def main():
     else:
         logger.info("Using configuration from config.py")
         cfg = Config()
+    logger.info(f"Configuration: {cfg}")
 
     # take control of garbage collection to avoid stragglers
     gc.disable()
@@ -90,6 +92,7 @@ def main():
         dp_shard=cfg.data_parallel_shard_degree,
         dp_replicate=cfg.data_parallel_replicate_degree,
         tp=cfg.tensor_parallel_degree,
+        ep=cfg.expert_parallel_degree,
         world_size=world_size,
         enable_loss_parallel=cfg.enable_loss_parallel,
     )
@@ -102,7 +105,7 @@ def main():
     ) as memory_profiler:
 
         # build meshes
-        world_mesh = parallel_dims.build_mesh(device_type="cuda")
+        world_mesh = parallel_dims.world_mesh
         if parallel_dims.dp_enabled:
             dp_mesh = world_mesh["dp"]
             dp_degree = dp_mesh.size()
@@ -110,7 +113,8 @@ def main():
         else:
             dp_degree, dp_rank = 1, 0
         logger.info(f"world mesh: {world_mesh}")
-        logger.info(f"dp mesh: {dp_mesh}")
+        if parallel_dims.dp_enabled:
+            logger.info(f"dp mesh: {dp_mesh}")
 
         # Get tokenizer to determine vocab size
         if os.path.isfile(cfg.tokenizer_name):
@@ -127,9 +131,9 @@ def main():
         # 3. max_seq_len base on inputs
         model_config.norm_type = cfg.norm_type
         # Get vocab size from tokenizer (vocab_size is base vocabulary without added tokens)
-        if hasattr(model_config, 'vocab_size') and model_config.vocab_size > 0:
-            model_config.vocab_size = tokenizer.vocab_size
-        else: # rely on tokenizer to provide vocab size
+        # If model config already has a vocab_size set, respect it (e.g. for padded vocabularies)
+        if not hasattr(model_config, 'vocab_size') or model_config.vocab_size <= 0:
+            # Only set vocab size from tokenizer if not already configured
             model_config.vocab_size = len(tokenizer)
         model_config.max_seq_len = cfg.seq_len
         if cfg.enable_mup:
@@ -150,13 +154,15 @@ def main():
             model = model_cls.from_model_args(model_config)
 
         # log model size
-        model_param_count = get_num_params(model)
-        model_param_count_without_embedding = get_num_params(model, exclude_embedding=True)
-        num_flop_per_token = get_num_flop_per_token(
-            model_param_count if model.model_args.tied_embeddings else model_param_count_without_embedding, # count lm head matmul only
-            model_config,
-            cfg.seq_len,
-        )
+        # model_param_count = get_num_params(model)
+        # model_param_count_without_embedding = get_num_params(model, exclude_embedding=True)
+        # num_flop_per_token = get_num_flop_per_token(
+        #     model_param_count if model.model_args.tied_embeddings else model_param_count_without_embedding, # count lm head matmul only
+        #     model_config,
+        #     cfg.seq_len,
+        # )
+        model_param_count, num_flop_per_token = model_config.get_nparams_and_flops(model, cfg.seq_len)
+        model_param_count_without_embedding = 0
         logger.info(
             f"Model {cfg.model_name} {cfg.flavor} "
             f"size: {model_param_count:,} total parameters ({model_param_count_without_embedding:,} without embeddings)"
@@ -225,29 +231,11 @@ def main():
 
         # data_monitor = DataMonitor(train_state, log_freq=cfg.log_freq)
 
-        if cfg.enable_mup:
-            mup_decay_params = []
-            decay_params = []
-            nodecay_params = []
-            for name, param in model.named_parameters():
-                if param.dim() >= 2:
-                    if 'attention' in name or 'feed_forward' in name:
-                        # logger.info(f"Mup weight: {name}")
-                        mup_decay_params.append(param)
-                    else:
-                        # logger.info(f"Decay weight: {name}")
-                        decay_params.append(param)
-                else:
-                    # logger.info(f"Nodecay weight: {name}")
-                    nodecay_params.append(param)
-            optimizer: torch.optim.Optimizer = cfg.opt_class([
-                {'params': mup_decay_params, 'weight_decay': cfg.opt_cfg['weight_decay'], 'lr': cfg.opt_cfg['lr'] / model_config.mup_width_mul},
-                {'params': decay_params, 'weight_decay': cfg.opt_cfg['weight_decay'], 'lr': cfg.opt_cfg['lr']},
-                {'params': nodecay_params, 'weight_decay': 0.0, 'lr': cfg.opt_cfg['lr']},
-            ], **cfg.opt_cfg)
-        else:
-            optimizer: torch.optim.Optimizer = cfg.opt_class(model.parameters(), **cfg.opt_cfg)
-        scheduler = get_lr_scheduler(optimizer, cfg)
+        # Build optimizers using model-specific builder
+        optimizers_builder = model_name_to_optimizers_builder[cfg.model_name]
+        optimizers = optimizers_builder(model, cfg, parallel_dims)
+        
+        scheduler = get_lr_scheduler(optimizers, cfg)
 
         metric_logger = build_metric_logger(cfg)
 
@@ -265,15 +253,15 @@ def main():
         # training loop
         cleanup_before_training()
         model.train()
-        if hasattr(optimizer, 'train'): # some optimizers need to be put in train mode (e.g. schedule free)
-            optimizer.train() # type: ignore (.train obviously exists)
+        if hasattr(optimizers, 'train'): # some optimizers need to be put in train mode (e.g. schedule free)
+            optimizers.train() # type: ignore (.train obviously exists)
 
         weight_scale_monitor = WeightScaleMonitor(model, log_freq=cfg.log_freq)
 
         # checkpointing
         checkpoint = CheckpointManager(
             model=model,
-            optimizer=optimizer,
+            optimizer=optimizers,
             lr_scheduler=scheduler,
             dataloader=data_loader,
             states={"train_state": train_state},
@@ -316,7 +304,7 @@ def main():
                 input_ids = input_ids.cuda()
                 labels = labels.cuda()
 
-                optimizer.zero_grad()
+                optimizers.zero_grad()
 
                 # data_monitor.log_batch_samples(input_ids, labels, data_loader.dataset)
                 # data_monitor.log_dataset_stats(data_loader.dataset)
@@ -336,10 +324,12 @@ def main():
                         del pred
                     loss.backward()
 
-                grad_norms = clip_grad_norm( # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
-                    model.parameters(), cfg.max_grad_norm, foreach=True
-                )
-                optimizer.step()
+
+                # TODO: re-enable grad clipping (broken w/ MoE) and/or monitoring?
+                # grad_norms = clip_grad_norm( # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
+                #     model.parameters(), cfg.max_grad_norm, foreach=True
+                # )
+                optimizers.step()
                 scheduler.step()
 
                 weight_scale_stats = weight_scale_monitor.step_monitor()
@@ -361,19 +351,20 @@ def main():
                     else:
                         global_avg_loss, global_max_loss = avg_loss, max_loss
 
-                    param_to_name = {param: name for name, param in model.named_parameters()}
-                    exp_avgs, exp_avg_sqs, param_names = [], [], []
-                    for group in optimizer.param_groups:
-                        for p in group['params']:
-                            if p.grad is None:
-                                continue
-                            state = optimizer.state[p]
-                            if 'exp_avg' in state:  # Check if states initialized
-                                exp_avgs.append(state['exp_avg'])
-                                exp_avg_sqs.append(state['exp_avg_sq'])
-                                param_names.append(param_to_name[p])
-                    exp_avg_norms = torch._foreach_norm(exp_avgs, 2)
-                    exp_avg_sq_norms = torch._foreach_norm(exp_avg_sqs, 2)
+                    # TODO: re-enable grad norm logging?
+                    # param_to_name = {param: name for name, param in model.named_parameters()}
+                    # exp_avgs, exp_avg_sqs, param_names = [], [], []
+                    # for group in optimizer.param_groups:
+                    #     for p in group['params']:
+                    #         if p.grad is None:
+                    #             continue
+                    #         state = optimizer.state[p]
+                    #         if 'exp_avg' in state:  # Check if states initialized
+                    #             exp_avgs.append(state['exp_avg'])
+                    #             exp_avg_sqs.append(state['exp_avg_sq'])
+                    #             param_names.append(param_to_name[p])
+                    # exp_avg_norms = torch._foreach_norm(exp_avgs, 2)
+                    # exp_avg_sq_norms = torch._foreach_norm(exp_avg_sqs, 2)
 
                     time_delta = timer() - time_last_log
 
@@ -405,23 +396,29 @@ def main():
                         "memory/num_alloc_retries": gpu_mem_stats.num_alloc_retries,
                         "memory/num_ooms": gpu_mem_stats.num_ooms,
                     }
-                    for i in range(len(optimizer.param_groups)):
+                    for i in range(len(optimizers.param_groups)):
                         metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
-                    for gn, (name, _) in zip(grad_norms, model.named_parameters()):
-                        cn = clean_param_name(name)
-                        metrics[f"{cn}/grad_norm"] = gn
-                    for exp_avg_norm, exp_avg_sq_norm, name in zip(exp_avg_norms, exp_avg_sq_norms, param_names):
-                        cn = clean_param_name(name)
-                        metrics[f"{cn}/exp_avg_norm"] = exp_avg_norm
-                        metrics[f"{cn}/exp_avg_sq_norm"] = exp_avg_sq_norm
+                    # for gn, (name, _) in zip(grad_norms, model.named_parameters()):
+                    #     cn = clean_param_name(name)
+                    #     metrics[f"{cn}/grad_norm"] = gn
+                    # for exp_avg_norm, exp_avg_sq_norm, name in zip(exp_avg_norms, exp_avg_sq_norms, param_names):
+                    #     cn = clean_param_name(name)
+                    #     metrics[f"{cn}/exp_avg_norm"] = exp_avg_norm
+                    #     metrics[f"{cn}/exp_avg_sq_norm"] = exp_avg_sq_norm
                     if cfg.enable_mup and cfg.mup_log_coord_check:
                         for key in activation_stats: # type: ignore
                             if activation_stats[key]: # type: ignore
                                 metrics[f'act/{key}_abs_mean'] = np.mean(activation_stats[key]) # type: ignore
                         activation_stats = defaultdict(list) # reset
                     # metrics.update(get_logits_metrics())
-                    if weight_scale_stats:
+                    if weight_scale_stats is not None:
                         metrics.update(weight_scale_stats)
+                    
+                    # Collect optimizer hook statistics if available
+                    # TODO: This is a temporary solution - consider refactoring for cleaner API
+                    if hasattr(optimizers, '_hook_stats') and optimizers._hook_stats:
+                        metrics.update(optimizers._hook_stats)
+                    
                     if metric_logger is not None:
                         metric_logger.log(metrics, step=train_state.step)
 
