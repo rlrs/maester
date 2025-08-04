@@ -1,5 +1,11 @@
 from pydantic import BaseModel, ConfigDict, Field, ImportString
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
+from pydantic.fields import FieldInfo
 from typing import Callable, Type, Any
 from pathlib import Path
 import torch
@@ -14,12 +20,30 @@ class DatasetConfig(BaseSettings):
     data_logical_shards: int = 8192
     data_dirs: list[str] = [
                             # "../fineweb-edu-score-2/data/",
-                            "../danweb/parquet"
+                            # "../danweb/parquet"
+                            "data/toy"
                             ]
     dataset_weights: str = "1.0"
     bos_token: int = 128000
     eos_token: int = 128001
     drop_tokens: str = ""
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            init_settings,
+            TomlConfigSettingsSource(settings_cls, Path("configs/dataset.toml")),
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        )
 
 class Config(BaseSettings):
     model_config = SettingsConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True, cli_parse_args=False)
@@ -115,3 +139,20 @@ class Config(BaseSettings):
     traces_folder: str = "traces"
     memory_snapshot_folder: str = "snapshots"
     profile_freq: int = 10
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            init_settings,
+            TomlConfigSettingsSource(settings_cls, Path("configs/config.toml")),
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        )
