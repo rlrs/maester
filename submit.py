@@ -1,3 +1,13 @@
+"""Submit a job to SLURM.
+
+Usage:
+    >>> python submit.py
+
+    or using `configs/*.toml` to override the default config like:
+    >>> CONFIG_TOML_PATH=configs/config_override.toml DATASET_TOML_PATH=configs/dataset_override.toml python submit.py
+"""
+
+
 import subprocess
 from maester.config import Config
 from maester.models import models_config
