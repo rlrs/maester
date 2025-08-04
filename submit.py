@@ -1,4 +1,4 @@
-"""Submit a job to SLURM.
+"""Submit a job to Slurm.
 
 Usage:
     >>> python submit.py
