@@ -38,8 +38,7 @@ from torch.distributed.checkpoint._traverse import set_element
 from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.state_dict_loader import _load_state_dict
 
-# Import our model configs
-from maester.models.gemma import gemma_configs, gemma3_configs
+from maester.models.gemma import gemma3_configs
 
 
 class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
@@ -216,9 +215,6 @@ def convert_gemma_from_dcp(
             model_type = "text"
         print(f"Detected model type: {model_type}")
     
-    # For multimodal models, restore vision tokens if needed
-    if model_type == "multimodal":
-        state_dict = restore_vision_tokens(state_dict, original_model_dir)
     
     # Split any qkv projections in the state dict
     state_dict = split_qkv_projections(state_dict, config)
@@ -343,61 +339,6 @@ def map_to_hf_multimodal_key(key: str, tensor: torch.Tensor) -> Optional[str]:
     
     return None
 
-
-def restore_vision_tokens(state_dict: Dict[str, torch.Tensor], original_model_dir: Optional[Path] = None) -> Dict[str, torch.Tensor]:
-    """
-    Restore vision tokens to embeddings for multimodal models.
-    
-    During training, we removed the 64 vision tokens to create text-only vocab (262,144).
-    Now we need to restore them from the original model to match the original size (262,208).
-    """
-    new_state_dict = {}
-    text_only_vocab_size = 262_144
-    original_vocab_size = 262_208
-    
-    for key, value in state_dict.items():
-        if key == "tok_embeddings.weight" and value.shape[0] == text_only_vocab_size:
-            if original_model_dir:
-                # Load vision token embeddings from original model
-                print("Loading vision token embeddings from original model...")
-                from safetensors import safe_open
-                
-                # Find the file containing embeddings
-                index_path = original_model_dir / "model.safetensors.index.json"
-                if index_path.exists():
-                    with open(index_path, 'r') as f:
-                        index = json.load(f)
-                    
-                    embed_key = "language_model.model.embed_tokens.weight"
-                    if embed_key in index["weight_map"]:
-                        file_name = index["weight_map"][embed_key]
-                        file_path = original_model_dir / file_name
-                        
-                        with safe_open(file_path, framework="pt", device="cpu") as f:
-                            orig_embeddings = f.get_tensor(embed_key)
-                            # Extract vision tokens (last 64)
-                            vision_embeddings = orig_embeddings[text_only_vocab_size:original_vocab_size]
-                            # Convert to same dtype as our embeddings
-                            vision_embeddings = vision_embeddings.to(value.dtype)
-                            
-                            # Concatenate text embeddings with vision embeddings
-                            new_value = torch.cat([value, vision_embeddings], dim=0)
-                            print(f"Restored embeddings from {value.shape[0]} to {new_value.shape[0]} tokens (added {vision_embeddings.shape[0]} vision tokens from original)")
-                            new_state_dict[key] = new_value
-                            continue
-                
-                print("Warning: Could not find embeddings in original model, padding with zeros")
-            
-            # Fallback: pad with zeros if we can't load from original
-            num_vision_tokens = original_vocab_size - text_only_vocab_size
-            padding = torch.zeros(num_vision_tokens, value.shape[1], dtype=value.dtype)
-            new_value = torch.cat([value, padding], dim=0)
-            print(f"Restored embeddings from {value.shape[0]} to {new_value.shape[0]} tokens (padded with zeros)")
-            new_state_dict[key] = new_value
-        else:
-            new_state_dict[key] = value
-    
-    return new_state_dict
 
 
 def split_qkv_projections(state_dict: Dict[str, torch.Tensor], config: Optional[Dict[str, Any]] = None) -> Dict[str, torch.Tensor]:

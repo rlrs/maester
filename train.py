@@ -134,9 +134,7 @@ def main():
         # 3. max_seq_len base on inputs
         model_config.norm_type = cfg.norm_type
         # Get vocab size from tokenizer (vocab_size is base vocabulary without added tokens)
-        if hasattr(model_config, 'vocab_size') and model_config.vocab_size > 0:
-            model_config.vocab_size = tokenizer.vocab_size
-        else: # rely on tokenizer to provide vocab size
+        if not hasattr(model_config, 'vocab_size') or model_config.vocab_size <= 0:
             model_config.vocab_size = len(tokenizer)
         model_config.max_seq_len = cfg.seq_len
         if cfg.enable_mup:
