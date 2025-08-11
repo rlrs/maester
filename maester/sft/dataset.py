@@ -28,7 +28,7 @@ class ConversationParquetDataset(ParquetDataset):
         template: str = "chatml",
         mask_strategy: str = "assistant_only",
         max_seq_len: int = 2048,
-        conversation_column: str = "conversations",
+        conversation_column: str = "messages",
         seed: int = 42,
         verbose: bool = False,
         shuffle: bool = True,

@@ -584,7 +584,7 @@ def save_hf_checkpoint(
                 print(f"Copied {file_name}")
     
     # Update tokenizer_config.json with chat template if SFT was enabled
-    if job_config and job_config.get("sft", {}).get("enabled", False):
+    if job_config and job_config.get("sft", {}):
         update_tokenizer_config_for_sft(output_dir, job_config)
         
     print(f"Saved checkpoint to {output_dir}")
