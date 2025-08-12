@@ -3,8 +3,8 @@
 Usage:
     >>> python submit.py
 
-    or using `configs/*.toml` to override the default config like:
-    >>> CONFIG_TOML_PATH=configs/config_override.toml DATASET_TOML_PATH=configs/dataset_override.toml python submit.py
+    Override config by passing a config file and/or parsing CLI arguments:
+    >>> python submit.py --config-file=configs/base.toml --dataset.override-something=1
 """
 
 
@@ -12,14 +12,50 @@ import subprocess
 from maester.config import Config
 from maester.models import models_config
 from pathlib import Path
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
+from pydantic_settings import (
+    BaseSettings, 
+    SettingsConfigDict, 
+    TomlConfigSettingsSource,
+    PydanticBaseSettingsSource
+)
+from typing import Optional
 
 class SubmitConfig(Config):
-    model_config = SettingsConfigDict(frozen=True, env_prefix="SUBMIT_", cli_parse_args=True) # these are pydantic settings for the config
+    model_config = SettingsConfigDict(
+        frozen=True,
+        env_prefix="SUBMIT_",
+        protected_namespaces=(),
+        arbitrary_types_allowed=True,
+        cli_parse_args=True,
+        cli_kebab_case=True,
+    ) # these are pydantic settings
 
     # submission options
     dry_run: bool = False
     validate_only: bool = False
+    config_file: Optional[str] = Field(None, exclude=True)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        import argparse
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument('--config-file', type=str)
+        args, _ = parser.parse_known_args()
+
+        sources = [init_settings]
+        if args.config_file and Path(args.config_file).exists():
+            sources.append(TomlConfigSettingsSource(settings_cls, args.config_file))
+
+        sources.extend([env_settings, dotenv_settings, file_secret_settings])
+        return tuple(sources)
 
 
 with open("templates/slurm.sh") as f:

@@ -9,7 +9,7 @@ from pydantic.fields import FieldInfo
 from typing import Callable, Type, Any
 from pathlib import Path
 import torch
-import os
+
 
 TORCH_DTYPE_MAP = {
     "float16": torch.float16,
@@ -38,10 +38,9 @@ class DatasetConfig(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        toml_path = os.getenv("DATASET_TOML_PATH", "configs/dataset_override.toml")
         return (
             init_settings,
-            TomlConfigSettingsSource(settings_cls, toml_path),
+            TomlConfigSettingsSource(settings_cls),
             env_settings,
             dotenv_settings,
             file_secret_settings,
@@ -151,10 +150,9 @@ class Config(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        toml_path = os.getenv("CONFIG_TOML_PATH", "configs/config_default.toml")
         return (
             init_settings,
-            TomlConfigSettingsSource(settings_cls, toml_path),
+            TomlConfigSettingsSource(settings_cls),
             env_settings,
             dotenv_settings,
             file_secret_settings,
