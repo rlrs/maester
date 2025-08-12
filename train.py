@@ -401,6 +401,12 @@ def main():
                     time_end_to_end = time_delta / cfg.log_freq
                     time_data_loading = np.mean(data_loading_times)
                     time_data_loading_pct = 100 * np.sum(data_loading_times) / time_delta
+                    
+                    # Aggregate data loading times across ALL ranks (TP ranks load redundantly)
+                    global_avg_data_loading = dist_mean(time_data_loading).item()
+                    global_max_data_loading = dist_max(time_data_loading).item()
+                    global_avg_data_loading_pct = dist_mean(time_data_loading_pct).item()
+                    global_max_data_loading_pct = dist_max(time_data_loading_pct).item()
 
                     gpu_mem_stats = gpu_memory_monitor.get_peak_stats()
 
@@ -413,8 +419,10 @@ def main():
                         "mfu(%)": mfu,
                         "data/total_tokens": total_tokens * parallel_dims.dp_shard * parallel_dims.dp_replicate,
                         "time/end_to_end(s)": time_end_to_end,
-                        "time/data_loading(s)": time_data_loading,
-                        "time/data_loading(%)": time_data_loading_pct,
+                        "time/data_loading_avg(s)": global_avg_data_loading,
+                        "time/data_loading_max(s)": global_max_data_loading,
+                        "time/data_loading_avg(%)": global_avg_data_loading_pct,
+                        "time/data_loading_max(%)": global_max_data_loading_pct,
                         "memory/max_active(GiB)": gpu_mem_stats.max_active_gib,
                         "memory/max_active(%)": gpu_mem_stats.max_active_pct,
                         "memory/max_reserved(GiB)": gpu_mem_stats.max_reserved_gib,
@@ -466,7 +474,7 @@ def main():
                         f"mfu={mfu:.2f}%, "
                         f"memory: {gpu_mem_stats.max_reserved_gib:5.2f}GiB"
                         f"({gpu_mem_stats.max_reserved_pct:.2f}%) "
-                        f"time/data_loading={time_data_loading:.2f}s ({time_data_loading_pct:.2f}%)"
+                        f"time/data_loading={global_avg_data_loading:.2f}s (max={global_max_data_loading:.2f}s, {global_max_data_loading_pct:.2f}%)"
                     )
 
                     losses_since_last_log.clear()
