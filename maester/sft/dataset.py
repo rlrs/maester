@@ -235,10 +235,15 @@ def build_sft_data_loader(cfg, rank, world_size):
     # Custom collation function for dict format
     def sft_collate_fn(batch):
         """Collate batch of dicts into tensors."""
+        attention_masks = torch.stack([torch.LongTensor(x["attention_mask"]) for x in batch])
+        
         return {
             "input_ids": torch.stack([torch.LongTensor(x["input_ids"]) for x in batch]),
             "labels": torch.stack([torch.LongTensor(x["labels"]) for x in batch]),
-            "attention_mask": torch.stack([torch.LongTensor(x["attention_mask"]) for x in batch])
+            "attention_mask": attention_masks,
+            "stats": {
+                "actual_lengths": attention_masks.sum(dim=1)
+            }
         }
     
     # Create dataloader

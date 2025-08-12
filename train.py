@@ -302,6 +302,7 @@ def main():
 
             # variables for metric logging
             losses_since_last_log: list[torch.Tensor] = []
+            padding_lengths_since_last_log: list[torch.Tensor] = []
             ntokens_since_last_log = 0
             total_tokens = 0
             data_loading_times: list[float] = []
@@ -320,6 +321,10 @@ def main():
                 
                 input_ids = batch["input_ids"]
                 labels = batch["labels"]
+                
+                # Collect padding stats if available (SFT mode)
+                if "stats" in batch and "actual_lengths" in batch["stats"]:
+                    padding_lengths_since_last_log.append(batch["stats"]["actual_lengths"])
                 
                 # logger.info(f"step {train_state.step} training on input_ids (element 0) {input_ids[0, :]}")
                 ntokens_since_last_log += labels.numel()
@@ -417,6 +422,22 @@ def main():
                         "memory/num_alloc_retries": gpu_mem_stats.num_alloc_retries,
                         "memory/num_ooms": gpu_mem_stats.num_ooms,
                     }
+                    
+                    # Add padding stats if available (SFT mode)
+                    if padding_lengths_since_last_log:
+                        all_lengths = torch.cat(padding_lengths_since_last_log)
+                        seq_len = input_ids.shape[1]  # Max sequence length
+                        
+                        # Calculate efficiency: what % of tokens are actual content (not padding)
+                        total_actual_tokens = all_lengths.sum().item()
+                        total_batch_tokens = all_lengths.numel() * seq_len
+                        efficiency = total_actual_tokens / total_batch_tokens
+                        
+                        metrics.update({
+                            "padding/efficiency": efficiency,  # % of tokens that are actual content
+                            "padding/avg_length": all_lengths.float().mean().item(),
+                            "padding/std_length": all_lengths.float().std().item(),
+                        })
                     for i in range(len(optimizer.param_groups)):
                         metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
                     for gn, (name, _) in zip(grad_norms, model.named_parameters()):
@@ -449,6 +470,7 @@ def main():
                     )
 
                     losses_since_last_log.clear()
+                    padding_lengths_since_last_log.clear()
                     ntokens_since_last_log = 0
                     data_loading_times.clear()
                     time_last_log = timer()
