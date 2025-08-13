@@ -212,7 +212,7 @@ def build_sft_data_loader(cfg, rank, world_size):
         tokenizer=tokenizer,
         template=cfg.sft.template,
         mask_strategy=cfg.sft.mask_strategy,
-        max_seq_len=cfg.sft.max_seq_len,
+        max_seq_len=cfg.seq_len,
         conversation_column=cfg.sft.conversation_column,
         seed=42,
         verbose=(rank == 0),

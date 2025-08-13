@@ -29,8 +29,7 @@ class DatasetConfig(BaseSettings):
 class SFTConfig(BaseSettings):
     """Configuration for supervised fine-tuning."""
     template: str = "chatml"
-    mask_strategy: str = "assistant_only" 
-    max_seq_len: int = 2048
+    mask_strategy: str = "assistant_only"
     conversation_column: str = "conversations"
     im_start_token: str = "<start_of_turn>"  # Token to use for <|im_start|>
     im_end_token: str = "<end_of_turn>"  # Token to use for <|im_end|>
