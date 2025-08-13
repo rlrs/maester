@@ -322,6 +322,13 @@ def main():
                 input_ids = batch["input_ids"]
                 labels = batch["labels"]
                 
+                # Get position_ids if available (currently only from packed SFT data)
+                # TODO: Consider generating position_ids for all data loaders for consistency
+                position_ids = batch.get("position_ids", None)
+                
+                # Get document_ids if available (for flex attention document masking in packed data)
+                document_ids = batch.get("document_ids", None)
+                
                 # Collect padding stats if available (SFT mode)
                 if "stats" in batch and "actual_lengths" in batch["stats"]:
                     padding_lengths_since_last_log.append(batch["stats"]["actual_lengths"])
@@ -332,6 +339,10 @@ def main():
 
                 input_ids = input_ids.cuda()
                 labels = labels.cuda()
+                if position_ids is not None:
+                    position_ids = position_ids.cuda()
+                if document_ids is not None:
+                    document_ids = document_ids.cuda()
 
                 optimizer.zero_grad()
 
@@ -341,9 +352,9 @@ def main():
                 # non-pp loss parallel, pp is not implemented
                 with loss_parallel_ctx():
                     if cfg.enable_cut_cross_entropy:
-                        loss = model(input_ids, labels) # using cut cross-entropy fused kernel
+                        loss = model(input_ids, labels, position_ids=position_ids, document_ids=document_ids) # using cut cross-entropy fused kernel
                     else:
-                        pred = model(input_ids)
+                        pred = model(input_ids, position_ids=position_ids, document_ids=document_ids)
 
                         # data_monitor.log_predictions(pred, labels, data_loader.dataset)
 

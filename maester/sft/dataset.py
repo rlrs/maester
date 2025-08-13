@@ -171,6 +171,8 @@ def build_sft_data_loader(cfg, rank, world_size):
     """
     Build dataloader for SFT training.
     
+    Supports both regular (unpacked) and pre-packed data based on config.
+    
     Args:
         cfg: Config object with dataset and SFT settings
         rank: Current process rank
@@ -179,6 +181,40 @@ def build_sft_data_loader(cfg, rank, world_size):
     Returns:
         DataLoader configured for SFT
     """
+    # Check if we should use packed data
+    if hasattr(cfg.sft, 'use_packed') and cfg.sft.use_packed:
+        logger.info(f"Using pre-packed SFT data from {cfg.sft.packed_path}")
+        from .packed_dataset import PackedSFTDataset
+        
+        dataset = PackedSFTDataset(
+            data_path=cfg.sft.packed_path,
+            rank=rank,
+            world_size=world_size,
+            infinite=True,
+            seed=cfg.sft.seed if hasattr(cfg.sft, 'seed') else 42,
+        )
+        
+        # Simple collation - data is already prepared
+        def packed_collate_fn(batch):
+            """Collate pre-packed data."""
+            return {
+                "input_ids": torch.stack([x["input_ids"] for x in batch]),
+                "labels": torch.stack([x["labels"] for x in batch]),
+                "attention_mask": torch.stack([x["attention_mask"] for x in batch]),
+                "position_ids": torch.stack([x["position_ids"] for x in batch]),
+            }
+        
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=cfg.train_batch_size,
+            shuffle=False,  # Dataset handles shuffling
+            collate_fn=packed_collate_fn,
+            num_workers=1,
+            pin_memory=True,
+            drop_last=True,
+        )
+    
+    # Original unpacked data loading
     # Parse data directories and weights
     data_dirs, weights = parse_data_args(
         cfg.dataset.data_dirs, cfg.dataset.dataset_weights

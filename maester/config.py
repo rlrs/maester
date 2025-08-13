@@ -33,7 +33,12 @@ class SFTConfig(BaseSettings):
     conversation_column: str = "conversations"
     im_start_token: str = "<start_of_turn>"  # Token to use for <|im_start|>
     im_end_token: str = "<end_of_turn>"  # Token to use for <|im_end|>
-    # Future: packing_mode: str = "none"  # "none", "simple"
+    
+    # Packing configuration
+    use_packed: bool = False  # Whether to use pre-packed data
+    packed_path: str = "data/packed_sft.parquet"  # Path to packed data file
+    seed: int = 42  # Random seed for shuffling epochs in packed data
+    
     # Future: distillation settings?
 
 class Config(BaseSettings):

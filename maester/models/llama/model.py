@@ -425,6 +425,8 @@ class Transformer(nn.Module):
             self, 
             tokens: torch.Tensor, 
             labels: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.Tensor] = None,
+            document_ids: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         """
         Perform a forward pass through the Transformer model.
@@ -432,17 +434,36 @@ class Transformer(nn.Module):
         Args:
             tokens (torch.Tensor): Input token indices.
             labels (Optional[torch.Tensor]): Target token indices. If provided, the loss will be computed instead of the logits.
+            position_ids (Optional[torch.Tensor]): Custom position IDs for RoPE. If not provided, uses sequential positions.
+            document_ids (Optional[torch.Tensor]): Document IDs for attention masking (currently unused in Llama).
 
         Returns:
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
+        # Warn if document_ids are provided (not supported in Llama yet)
+        if document_ids is not None:
+            from maester.utils import logger
+            logger.warning(
+                "document_ids provided to Llama model but document masking is not yet implemented. "
+                "Ignoring document_ids - attention may cross document boundaries in packed sequences."
+            )
+        
         h = self.tok_embeddings(tokens)
         # if self.model_args.enable_mup: # TODO: re-enable (disabled because it breaks TP)
             # h *= self.model_args.mup_input_alpha
 
+        # Get freqs_cis based on position_ids if provided
+        if position_ids is not None:
+            # Index into precomputed freqs_cis using custom position_ids
+            # position_ids shape: [batch_size, seq_len]
+            freqs_cis = self.freqs_cis[position_ids].squeeze(0)
+        else:
+            # Use default sequential positions (current behavior)
+            freqs_cis = self.freqs_cis
+        
         for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
+            h = layer(h, freqs_cis)
         h = self.norm(h)
         if self.model_args.enable_mup:
             # Scaling `h` instead of `output` allows coord check to log the actual output 
