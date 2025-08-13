@@ -403,10 +403,12 @@ def main():
                     time_data_loading_pct = 100 * np.sum(data_loading_times) / time_delta
                     
                     # Aggregate data loading times across ALL ranks (TP ranks load redundantly)
-                    global_avg_data_loading = dist_mean(time_data_loading).item()
-                    global_max_data_loading = dist_max(time_data_loading).item()
-                    global_avg_data_loading_pct = dist_mean(time_data_loading_pct).item()
-                    global_max_data_loading_pct = dist_max(time_data_loading_pct).item()
+                    # Flatten world mesh to get all ranks
+                    global_mesh = world_mesh._flatten() if hasattr(world_mesh, '_flatten') else world_mesh
+                    global_avg_data_loading = dist_mean(time_data_loading, global_mesh).item()
+                    global_max_data_loading = dist_max(time_data_loading, global_mesh).item()
+                    global_avg_data_loading_pct = dist_mean(time_data_loading_pct, global_mesh).item()
+                    global_max_data_loading_pct = dist_max(time_data_loading_pct, global_mesh).item()
 
                     gpu_mem_stats = gpu_memory_monitor.get_peak_stats()
 
