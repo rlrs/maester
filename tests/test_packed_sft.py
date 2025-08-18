@@ -63,7 +63,7 @@ class TestDocumentMasking:
     def test_document_mask_prevents_cross_attention(self):
         """Verify attention cannot cross document boundaries."""
         # Document structure: [0, 0, 0, 1, 1, 2, 2, 2]
-        document_ids = torch.tensor([0, 0, 0, 1, 1, 2, 2, 2])
+        document_ids = torch.tensor([[0, 0, 0, 1, 1, 2, 2, 2]]) # bsz=1
         
         # Create document-aware causal mask
         doc_mask = make_document_mask_wrapper(causal_mask, document_ids)
@@ -131,7 +131,8 @@ class TestModelIntegration:
         assert sample['attention_mask'].dtype == torch.bool
         assert sample['position_ids'].dtype == torch.long
         assert sample['document_ids'].dtype == torch.long
-    
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Flex attention requires CUDA")
     def test_model_accepts_packed_inputs(self):
         """Verify models can process packed data inputs."""
         from maester.models.gemma.model import GemmaTextModel, ModelArgs
@@ -142,23 +143,41 @@ class TestModelIntegration:
             dim=64,
             n_layers=1,
             n_heads=2,
+            num_key_value_heads=2,
             head_dim=32,
             max_seq_len=128
         )
         
-        model = GemmaTextModel(config)
+        device = torch.device("cuda")
+        model = GemmaTextModel(config).to(device)
         model.eval()
         
         # Create test inputs
-        batch_size = 1
-        seq_len = 32
-        input_ids = torch.randint(0, 100, (batch_size, seq_len))
-        labels = torch.randint(0, 100, (batch_size, seq_len))
-        position_ids = torch.arange(seq_len).unsqueeze(0)
-        document_ids = torch.zeros(seq_len, dtype=torch.long)
+        batch_size = 2
+        seq_len = 128
+        input_ids = torch.randint(0, 100, (batch_size, seq_len), device=device)
+        labels = torch.randint(0, 100, (batch_size, seq_len), device=device)
+
+        # Create different position_ids for each batch item to test batching
+        position_ids = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
+        # First batch item: reset at position 30
+        position_ids[0, :30] = torch.arange(30)
+        position_ids[0, 30:] = torch.arange(seq_len - 30)
+        # Second batch item: reset at position 20 and 50
+        position_ids[1, :20] = torch.arange(20)
+        position_ids[1, 20:50] = torch.arange(30)
+        position_ids[1, 50:] = torch.arange(seq_len - 50)
+
+        # Create different document_ids for each batch item
+        document_ids = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
+        # First batch item: two documents split at position 30
+        document_ids[0, 30:] = 1
+        # Second batch item: three documents split at positions 20 and 50
+        document_ids[1, 20:50] = 1
+        document_ids[1, 50:] = 2
         
+
         with torch.no_grad():
-            # Should not raise an error
             loss = model(input_ids, labels, position_ids, document_ids)
             assert loss.ndim == 0, "Loss should be a scalar"
             assert not torch.isnan(loss), "Loss should not be NaN"

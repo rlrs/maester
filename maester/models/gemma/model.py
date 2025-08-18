@@ -179,7 +179,7 @@ def make_document_mask_wrapper(base_mask_fn, document_ids):
     
     Args:
         base_mask_fn: The base mask function (e.g., causal or sliding window)
-        document_ids: Tensor of document IDs for each position
+        document_ids: Tensor of document IDs for each position [batch_size, seq_len]
     
     Returns:
         A mask function that combines base mask with document boundaries
@@ -190,7 +190,8 @@ def make_document_mask_wrapper(base_mask_fn, document_ids):
     # For packed sequences, we need to ensure attention doesn't cross document boundaries
     def wrapped_mask_fn(b, h, q_idx, kv_idx):
         # Check if query and key are in the same document
-        same_doc = document_ids[q_idx] == document_ids[kv_idx]
+        batch_doc_ids = document_ids[b]
+        same_doc = batch_doc_ids[q_idx] == batch_doc_ids[kv_idx]
         # Apply base mask (causal or sliding window) within documents
         base_mask = base_mask_fn(b, h, q_idx, kv_idx)
         # Combine: both must be true (same document AND base mask allows)
@@ -597,11 +598,11 @@ class GemmaTextModel(nn.Module):
         # Use provided position_ids or create default sequential positions
         if position_ids is not None:
             # position_ids shape: [batch_size, seq_len]
-            # For now we assume batch_size=1 for simplicity
-            input_positions = position_ids.squeeze(0) if position_ids.dim() > 1 else position_ids
+            input_positions = position_ids
         else:
-            # Create default sequential position indices
+            # Create default sequential position indices [batch_size, seq_len]
             input_positions = torch.arange(0, seq_len, dtype=torch.long, device=tokens.device)
+            input_positions = input_positions.unsqueeze(0).expand(batch_size, -1)
         
         # Create masks based on whether we have document_ids (packed data)
         if document_ids is not None:
@@ -639,9 +640,11 @@ class GemmaTextModel(nn.Module):
                 local_block_mask = None
         
         # Select frequencies based on positions
+        assert input_positions.shape == (batch_size, seq_len), "input_positions must match tokens shape"
+
         freqs_cis_dict = {
-            "local_sliding": self.local_freqs_cis.index_select(0, input_positions),
-            "global": self.global_freqs_cis.index_select(0, input_positions),
+            "local_sliding": self.local_freqs_cis[input_positions].unsqueeze(1), # unsqueeze for head dim
+            "global": self.global_freqs_cis[input_positions].unsqueeze(1),
         }
         
         # Forward through transformer
