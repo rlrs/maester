@@ -3,7 +3,10 @@
 import torch
 import pytest
 from pathlib import Path
+import pandas as pd
+import tempfile
 from maester.sft.packed_dataset import PackedSFTDataset
+from maester.sft.dataset import build_sft_data_loader
 from maester.models.gemma.model import make_document_mask_wrapper, causal_mask
 
 
@@ -181,3 +184,160 @@ class TestModelIntegration:
             loss = model(input_ids, labels, position_ids, document_ids)
             assert loss.ndim == 0, "Loss should be a scalar"
             assert not torch.isnan(loss), "Loss should not be NaN"
+
+
+class TestDataloaderIntegration:
+    """Test dataloader properly passes all fields including document_ids."""
+    
+    def test_packed_collate_function(self):
+        """Test that collate function returns all expected fields including stats."""
+        # Create mock packed data with realistic multi-conversation packing
+        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
+            # Simulate 2 packed sequences, each with multiple conversations
+            # Sequence 1: 3 conversations packed together (85% full)
+            # Sequence 2: 2 conversations + padding (60% full)
+            seq_len = 100
+            
+            # First sequence: 3 conversations tightly packed
+            seq1_input = list(range(10, 40)) + list(range(100, 130)) + list(range(200, 225)) + [0] * 15
+            seq1_labels = seq1_input[1:] + [-100] * 16  # Shifted + padding masked
+            seq1_mask = [True] * 85 + [False] * 15
+            seq1_boundaries = [(1, 0, 30), (2, 30, 30), (3, 60, 25)]  # conv_id, start, length
+            
+            # Second sequence: 2 conversations with more padding
+            seq2_input = list(range(50, 85)) + list(range(150, 175)) + [0] * 40
+            seq2_labels = seq2_input[1:] + [-100] * 41  # Shifted + padding masked
+            seq2_mask = [True] * 60 + [False] * 40
+            seq2_boundaries = [(4, 0, 35), (5, 35, 25)]
+            
+            data = {
+                'input_ids': [seq1_input[:seq_len], seq2_input[:seq_len]],
+                'labels': [seq1_labels[:seq_len], seq2_labels[:seq_len]],
+                'attention_mask': [seq1_mask[:seq_len], seq2_mask[:seq_len]],
+                'boundaries': [seq1_boundaries, seq2_boundaries],
+                'conversation_ids': [['conv1', 'conv2', 'conv3'], ['conv4', 'conv5']],
+            }
+            df = pd.DataFrame(data)
+            df.to_parquet(tmp.name)
+            
+            # Create config mock
+            cfg = type('Config', (), {
+                'sft': type('SFT', (), {
+                    'use_packed': True,
+                    'packed_path': tmp.name,
+                    'seed': 42
+                })(),
+                'train_batch_size': 2  # Batch both sequences
+            })()
+            
+            # Build dataloader
+            dataloader = build_sft_data_loader(cfg, rank=0, world_size=1)
+            
+            # Get a batch
+            batch = next(iter(dataloader))
+            
+            # Verify all expected fields are present
+            expected_fields = ['input_ids', 'labels', 'attention_mask', 'position_ids', 'document_ids', 'stats']
+            for field in expected_fields:
+                assert field in batch, f"Missing field: {field}"
+            
+            # Verify batch shape
+            assert batch['input_ids'].shape == (2, seq_len), f"Wrong batch shape: {batch['input_ids'].shape}"
+            
+            # Verify stats contains actual_lengths
+            assert 'actual_lengths' in batch['stats'], "Missing actual_lengths in stats"
+            
+            # Verify actual_lengths calculation is correct
+            # Dataset shuffles internally, so we need to check both possible orders
+            actual_lengths = batch['stats']['actual_lengths']
+            assert set(actual_lengths.tolist()) == {85, 60}, f"Wrong actual_lengths: {actual_lengths.tolist()}"
+            
+            # Identify which sequence is which based on actual lengths
+            if actual_lengths[0] == 85:
+                seq1_idx, seq2_idx = 0, 1
+            else:
+                seq1_idx, seq2_idx = 1, 0
+            
+            # Verify position_ids reset at conversation boundaries
+            pos_ids = batch['position_ids']
+            # For sequence with 3 conversations (85 tokens)
+            assert pos_ids[seq1_idx, 0] == 0, "First conversation should start at position 0"
+            assert pos_ids[seq1_idx, 30] == 0, "Second conversation should reset to position 0"
+            assert pos_ids[seq1_idx, 60] == 0, "Third conversation should reset to position 0"
+            # For sequence with 2 conversations (60 tokens)
+            assert pos_ids[seq2_idx, 0] == 0, "First conversation in seq2 should start at position 0"
+            assert pos_ids[seq2_idx, 35] == 0, "Second conversation in seq2 should reset to position 0"
+            
+            # Verify document_ids properly segment conversations
+            doc_ids = batch['document_ids']
+            # Seq1 (85 tokens): 3 documents
+            assert (doc_ids[seq1_idx, :30] == 0).all(), "First 30 tokens should be document 0"
+            assert (doc_ids[seq1_idx, 30:60] == 1).all(), "Next 30 tokens should be document 1"
+            assert (doc_ids[seq1_idx, 60:85] == 2).all(), "Next 25 tokens should be document 2"
+            assert (doc_ids[seq1_idx, 85:] == -1).all(), "Padding should have document_id -1"
+            
+            # Seq2 (60 tokens): 2 documents
+            assert (doc_ids[seq2_idx, :35] == 0).all(), "First 35 tokens should be document 0"
+            assert (doc_ids[seq2_idx, 35:60] == 1).all(), "Next 25 tokens should be document 1"
+            assert (doc_ids[seq2_idx, 60:] == -1).all(), "Padding should have document_id -1"
+            
+            # Clean up
+            Path(tmp.name).unlink()
+    
+    def test_attention_masking_with_documents(self):
+        """Test that attention properly respects document boundaries."""
+        # Create two documents: [doc0: tokens 0-2] [doc1: tokens 3-5]
+        document_ids = torch.tensor([[0, 0, 0, 1, 1, 1]])
+        
+        # Create document-aware mask
+        doc_mask = make_document_mask_wrapper(causal_mask, document_ids)
+        
+        # Test cases: (batch, head, query_idx, key_idx)
+        # Within-document causal attention should work
+        assert doc_mask(0, 0, 1, 0) == True, "Should attend to earlier token in same doc"
+        assert doc_mask(0, 0, 2, 1) == True, "Should attend to earlier token in same doc"
+        assert doc_mask(0, 0, 4, 3) == True, "Should attend to earlier token in same doc"
+        
+        # Cross-document attention should be blocked
+        assert doc_mask(0, 0, 3, 2) == False, "Should NOT attend across doc boundary"
+        assert doc_mask(0, 0, 4, 1) == False, "Should NOT attend to different doc"
+        
+        # Anti-causal should be blocked even within doc
+        assert doc_mask(0, 0, 0, 1) == False, "Should NOT attend to future token"
+        assert doc_mask(0, 0, 3, 4) == False, "Should NOT attend to future token"
+    
+    def test_loss_masking_preserved(self):
+        """Test that loss masking (labels=-100) is preserved through pipeline."""
+        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
+            # Create packed data with specific label pattern
+            # Conv1: "A B C" (train on all)
+            # Padding: 0 0
+            # Labels should be: [B, C, -100, -100, -100] (shifted by 1)
+            data = {
+                'input_ids': [[10, 11, 12, 0, 0]],  
+                'labels': [[11, 12, 13, -100, -100]],  # 13 is EOS, -100 for padding
+                'attention_mask': [[True, True, True, False, False]],
+                'boundaries': [[(0, 0, 3)]],
+                'conversation_ids': [['conv1']],
+            }
+            df = pd.DataFrame(data)
+            df.to_parquet(tmp.name)
+            
+            cfg = type('Config', (), {
+                'sft': type('SFT', (), {
+                    'use_packed': True,
+                    'packed_path': tmp.name,
+                    'seed': 42
+                })(),
+                'train_batch_size': 1
+            })()
+            
+            dataloader = build_sft_data_loader(cfg, rank=0, world_size=1)
+            batch = next(iter(dataloader))
+            
+            # Verify labels preserve -100 for padding
+            labels = batch['labels'][0]
+            assert (labels[3:] == -100).all(), "Padding positions should have -100 labels"
+            assert (labels[:3] != -100).all(), "Non-padding should have valid labels"
+            
+            Path(tmp.name).unlink()
