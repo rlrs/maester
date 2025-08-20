@@ -35,7 +35,7 @@ class SFTConfig(BaseSettings):
     im_end_token: str = "<end_of_turn>"  # Token to use for <|im_end|>
     
     # Packing configuration
-    use_packed: bool = False  # Whether to use pre-packed data
+    use_packed: bool = True  # Whether to use pre-packed data
     packed_path: str = "data/packed_sft.parquet"  # Path to packed data file
     seed: int = 42  # Random seed for shuffling epochs in packed data
     
@@ -50,7 +50,7 @@ class Config(BaseSettings):
     num_nodes: int = 1
     partition: str = "standard-g"
     account: str = "project_465001265"
-    time: str = "2-00:00:00"
+    time: str = "0-12:00:00"
     container: str = "/appl/local/containers/sif-images/lumi-rocm-rocm-6.2.2.sif"
     load_config: Path | None = None
 
@@ -69,7 +69,7 @@ class Config(BaseSettings):
 
     # datasets
     dataset: DatasetConfig = DatasetConfig()
-    sft: SFTConfig | None = None
+    sft: SFTConfig | None = SFTConfig()
     tokenizer_name: str = 'google/gemma-3-1b-pt' # "meta-llama/Llama-2-7b-hf" #
 
     # logging/metrics
