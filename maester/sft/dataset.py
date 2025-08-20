@@ -197,11 +197,26 @@ def build_sft_data_loader(cfg, rank, world_size):
         # Simple collation - data is already prepared
         def packed_collate_fn(batch):
             """Collate pre-packed data."""
+            # Stack the main tensors
+            input_ids = torch.stack([x["input_ids"] for x in batch])
+            labels = torch.stack([x["labels"] for x in batch])
+            attention_mask = torch.stack([x["attention_mask"] for x in batch])
+            position_ids = torch.stack([x["position_ids"] for x in batch])
+            document_ids = torch.stack([x["document_ids"] for x in batch])
+            
+            # Calculate actual lengths for each sequence in the batch
+            # For packed data, actual length = number of non-padding tokens
+            actual_lengths = attention_mask.sum(dim=1)  # Sum across sequence dimension
+            
             return {
-                "input_ids": torch.stack([x["input_ids"] for x in batch]),
-                "labels": torch.stack([x["labels"] for x in batch]),
-                "attention_mask": torch.stack([x["attention_mask"] for x in batch]),
-                "position_ids": torch.stack([x["position_ids"] for x in batch]),
+                "input_ids": input_ids,
+                "labels": labels,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "document_ids": document_ids,
+                "stats": {
+                    "actual_lengths": actual_lengths  # Tensor of actual token counts per sequence
+                }
             }
         
         return torch.utils.data.DataLoader(
