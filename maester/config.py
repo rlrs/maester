@@ -1,8 +1,15 @@
 from pydantic import BaseModel, ConfigDict, Field, ImportString
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
+from pydantic.fields import FieldInfo
 from typing import Callable, Type, Any
 from pathlib import Path
 import torch
+
 
 TORCH_DTYPE_MAP = {
     "float16": torch.float16,
@@ -11,25 +18,40 @@ TORCH_DTYPE_MAP = {
 }
 
 class DatasetConfig(BaseSettings):
-    data_logical_shards: int = 8192
     data_dirs: list[str] = [
-                            # "../fineweb-edu-score-2/data/",
-                            "../danweb/parquet"
+                            "data/toy"
                             ]
     dataset_weights: str = "1.0"
     bos_token: int = 128000
     eos_token: int = 128001
     drop_tokens: str = ""
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            init_settings,
+            TomlConfigSettingsSource(settings_cls),
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        )
+
 class Config(BaseSettings):
     model_config = SettingsConfigDict(frozen=True, protected_namespaces=(), arbitrary_types_allowed=True, cli_parse_args=False)
 
     # submission/job 
     dump_dir: str = "jobs/"
-    job_name: str = "llama-3.2-3B"
-    num_nodes: int = 32
+    job_name: str = "default_job"
+    num_nodes: int = 1
     partition: str = "standard-g"
-    account: str = "project_465001265"
+    account: str = ""
     time: str = "0-01:00:00"
     container: str = "/appl/local/containers/sif-images/lumi-rocm-rocm-6.2.2.sif"
     load_config: Path | None = None
@@ -37,19 +59,19 @@ class Config(BaseSettings):
     max_grad_norm: float = 2.0
     gc_freq: int = 4
     data_parallel_shard_degree: int = 8
-    data_parallel_replicate_degree: int = 32
+    data_parallel_replicate_degree: int = 1
     tensor_parallel_degree: int = 1
     train_batch_size: int = 2 # per device; 2 * 8 gpus * 32 nodes * 8192 seqlen = ~4M tokens per batch
-    train_num_steps: int = 22000 # ~92B tokens
-    compile: bool = True # TODO: only compiles TransformerBlocks until PyTorch supports full fsdp2
+    train_num_steps: int = 1000
+    compile: bool = True
     enable_loss_parallel: bool = True
     enable_cut_cross_entropy: bool = True
-    init_timeout_seconds: int = 300 # 300 is probably good for large-ish runs, e.g. up to 64 nodes 
+    init_timeout_seconds: int = 300
     train_timeout_seconds: int = 100
 
     # datasets
     dataset: DatasetConfig = DatasetConfig()
-    tokenizer_name: str = 'meta-llama/Llama-3.2-3B' # "meta-llama/Llama-2-7B"
+    tokenizer_name: str = 'meta-llama/Llama-3.2-3B'
 
     # logging/metrics
     log_freq: int = 10
@@ -58,14 +80,14 @@ class Config(BaseSettings):
     enable_tensorboard: bool = False
     enable_wandb: bool = True
     wandb_entity: str = "danish-foundation-models"
-    wandb_project: str = "llama-3.2-3B"
+    wandb_project: str = "default-project"
 
     # checkpointing
     enable_checkpoint: bool = True
     checkpoint_folder: str = "checkpoints"
-    checkpoint_interval: int = 2000 # ~8B tokens
-    model_weights_only: bool = True # just for the final weight export
-    export_dtype: str = "bfloat16" # just for the final weight export
+    checkpoint_interval: int = 1000
+    model_weights_only: bool = True  # just for the final weight export
+    export_dtype: str = "bfloat16"  # just for the final weight export
     forced_load_path: str | None = None
 
     # model
@@ -102,7 +124,7 @@ class Config(BaseSettings):
     mixed_precision_reduce: str = 'float32'
 
     # activation checkpointing
-    ac_mode: str = "none" # "full" | "selective" | "none"
+    ac_mode: str = "none"  # "full" | "selective" | "none"
     selective_ac_option: str | int = "op"
 
     # experimental
@@ -110,8 +132,25 @@ class Config(BaseSettings):
     enable_compiled_autograd: bool = True
 
     # profiling
-    enable_profiling: bool = False
+    enable_profiling: bool = True
     enable_memory_snapshot: bool = False
     traces_folder: str = "traces"
     memory_snapshot_folder: str = "snapshots"
     profile_freq: int = 10
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        return (
+            init_settings,
+            TomlConfigSettingsSource(settings_cls),
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        )
