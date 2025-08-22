@@ -25,12 +25,12 @@ from torch.nn.utils.clip_grad import _clip_grads_with_norm_
 from maester.log_utils import logger
 from maester.models.gemma.model import Embedding as GemmaEmbedding
 
-def dist_max(x: int | float, mesh: DeviceMesh) -> float:
+def dist_max(x: int | float, mesh: DeviceMesh) -> torch.Tensor:
     tensor = torch.tensor(x).cuda()
     return funcol.all_reduce(tensor, reduceOp=c10d.ReduceOp.MAX.name, group=mesh)
 
 
-def dist_mean(x: int | float, mesh: DeviceMesh) -> float:
+def dist_mean(x: int | float, mesh: DeviceMesh) -> torch.Tensor:
     tensor = torch.tensor(x).cuda()
     return funcol.all_reduce(tensor, reduceOp=c10d.ReduceOp.AVG.name, group=mesh)
 

@@ -31,10 +31,10 @@ class SubmitConfig(Config):
         cli_kebab_case=True,
     ) # these are pydantic settings
 
-    # submission options
+    # submission options TODO: exclude these the right way?
     dry_run: bool = False
     validate_only: bool = False
-    config_file: Optional[str] = Field(None, exclude=True)
+    config_file: Optional[str] = Field(None, exclude=False)
 
     @classmethod
     def settings_customise_sources(

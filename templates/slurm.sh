@@ -29,7 +29,9 @@ export SINGULARITY_BIND=/var/spool/slurmd,/opt/cray,/usr/lib64/libcxi.so.1,/usr/
 export LC_ALL=C
 export HF_HOME="${{PROJECT_SCRATCH}}/.cache/huggingface"
 export UV_CACHE_DIR="${{PROJECT_SCRATCH}}/.uv"
-export SINGULARITYENV_LD_LIBRARY_PATH=/opt/ompi/lib:/opt/cray/xpmem/2.5.2-2.4_3.47__gd0f7936.shasta/lib64:/opt/aws-ofi-rccl:${{SINGULARITYENV_LD_LIBRARY_PATH}}
+
+# Note: This used to be needed, but now it breaks aws-ofi-rccl - keeping in comment for now
+# export SINGULARITYENV_LD_LIBRARY_PATH=/opt/ompi/lib:/opt/cray/xpmem/2.5.2-2.4_3.47__gd0f7936.shasta/lib64:/opt/aws-ofi-rccl:${{SINGULARITYENV_LD_LIBRARY_PATH}}
 
 # values for distributed setup
 GPUS_PER_NODE=$SLURM_GPUS_PER_NODE
@@ -78,7 +80,7 @@ echo "START $SLURM_JOBID: $(date)"
 srun \
     --label \
     singularity exec -B "$SING_BIND" "{container}" \
-    /scratch/{account}/maester/scripts/slurm/in_container.sh \
+    /scratch/{account}/rasmus/maester/scripts/slurm/in_container.sh \
     train.py "{dump_dir}/{job_name}"
 
 echo "END $SLURM_JOBID: $(date)"

@@ -21,8 +21,7 @@ class ModelArgs:
     num_key_value_heads: int = 32
     head_dim: int = 128
     intermediate_size: int = 11008
-    max_position_embeddings: int = 8192
-    type_vocab_size: int = 1
+    max_seq_len: int = 8192
     layer_norm_eps: float = 1e-5
     initializer_range: float = 0.02
     pad_token_id: int = 0
@@ -173,6 +172,32 @@ def make_sliding_window_mask_fn(window_size):
         return sliding_window_causal(b, h, q_idx, kv_idx, window_size)
     return mask_fn
 
+def make_document_mask_wrapper(base_mask_fn, document_ids):
+    """
+    Wrap a base mask function to also enforce document boundaries.
+    
+    Args:
+        base_mask_fn: The base mask function (e.g., causal or sliding window)
+        document_ids: Tensor of document IDs for each position [batch_size, seq_len]
+    
+    Returns:
+        A mask function that combines base mask with document boundaries
+    """
+    if document_ids is None:
+        return base_mask_fn
+    
+    # For packed sequences, we need to ensure attention doesn't cross document boundaries
+    def wrapped_mask_fn(b, h, q_idx, kv_idx):
+        # Check if query and key are in the same document
+        batch_doc_ids = document_ids[b]
+        same_doc = batch_doc_ids[q_idx] == batch_doc_ids[kv_idx]
+        # Apply base mask (causal or sliding window) within documents
+        base_mask = base_mask_fn(b, h, q_idx, kv_idx)
+        # Combine: both must be true (same document AND base mask allows)
+        return same_doc & base_mask
+    
+    return wrapped_mask_fn
+
 
 flex_attention = torch.compile(_flex_attention, dynamic=False)
 
@@ -232,7 +257,7 @@ class GemmaAttention(nn.Module):
                 mask_fn = causal_mask
             
             # Create block mask once during initialization
-            max_seq_len = config.max_position_embeddings
+            max_seq_len = config.max_seq_len
             self.block_mask = create_block_mask(mask_fn, None, None, max_seq_len, max_seq_len)
         
     def forward(
@@ -483,7 +508,7 @@ class GemmaTextModel(nn.Module):
         
         # Precompute RoPE frequencies following multimodal pattern
         head_dim = config.head_dim
-        max_seq_len = config.max_position_embeddings
+        max_seq_len = config.max_seq_len
         
         # Use rope_wave_length if provided, otherwise use defaults
         if hasattr(config, 'rope_wave_length') and config.rope_wave_length:
@@ -529,11 +554,11 @@ class GemmaTextModel(nn.Module):
         with torch.device(self.local_freqs_cis.device):
             # IMPORTANT: rope_scaling_factor is only applied to global attention, not local_sliding
             self._register_freqs_cis('local_freqs_cis', self.config.head_dim, 
-                                   self.config.max_position_embeddings,
+                                   self.config.max_seq_len,
                                    theta=self.config.rope_wave_length.get('local_sliding', 10_000) if self.config.rope_wave_length else 10_000,
                                    rope_scaling_factor=1.0)  # No scaling for local attention
             self._register_freqs_cis('global_freqs_cis', self.config.head_dim,
-                                   self.config.max_position_embeddings, 
+                                   self.config.max_seq_len, 
                                    theta=self.config.rope_wave_length.get('global', 10_000) if self.config.rope_wave_length else 10_000,
                                    rope_scaling_factor=rope_scaling_factor)  # Scaling only for global attention
         
@@ -547,8 +572,17 @@ class GemmaTextModel(nn.Module):
         self,
         tokens: torch.Tensor,
         labels: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        document_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass compatible with training loop."""
+        """Forward pass compatible with training loop.
+        
+        Args:
+            tokens: Input token indices.
+            labels: Target token indices. If provided, returns loss instead of logits.
+            position_ids: Custom position IDs for RoPE. If not provided, uses sequential positions.
+            document_ids: Document IDs for flex attention masking in packed sequences.
+        """
         batch_size, seq_len = tokens.shape
         
         # Get embeddings and apply normalization
@@ -560,36 +594,64 @@ class GemmaTextModel(nn.Module):
         )
         hidden_states = hidden_states * normalizer
         
-        # Create position indices
-        input_positions = torch.arange(0, seq_len, dtype=torch.long, device=tokens.device)
-        
-        # Create causal mask
-        mask = torch.triu(
-            torch.full((seq_len, seq_len), float('-inf'), device=tokens.device),
-            diagonal=1
-        ).unsqueeze(0).unsqueeze(0)
-        
-        # Create local sliding window mask if sliding window is configured
-        if self.config.sliding_window_size:
-            local_mask = mask + torch.tril(
-                torch.full((seq_len, seq_len), float('-inf'), device=tokens.device),
-                diagonal=-self.config.sliding_window_size,
-            ).unsqueeze(0).unsqueeze(0)
+        # Use provided position_ids or create default sequential positions
+        if position_ids is not None:
+            # position_ids shape: [batch_size, seq_len]
+            input_positions = position_ids
         else:
-            local_mask = None
+            # Create default sequential position indices [batch_size, seq_len]
+            input_positions = torch.arange(0, seq_len, dtype=torch.long, device=tokens.device)
+            input_positions = input_positions.unsqueeze(0).expand(batch_size, -1)
+        
+        # Create masks based on whether we have document_ids (packed data)
+        if document_ids is not None:
+            # For packed data, create block masks with document boundaries
+            # These will be passed through all layers for efficiency
+            
+            # Global attention mask with document boundaries
+            global_mask_fn = make_document_mask_wrapper(causal_mask, document_ids)
+            global_block_mask = create_block_mask(global_mask_fn, None, None, seq_len, seq_len)
+            
+            # Local sliding window mask with document boundaries
+            if self.config.sliding_window_size:
+                local_mask_fn = make_document_mask_wrapper(
+                    make_sliding_window_mask_fn(self.config.sliding_window_size),
+                    document_ids
+                )
+                local_block_mask = create_block_mask(local_mask_fn, None, None, seq_len, seq_len)
+            else:
+                local_block_mask = None
+        else:
+            # For unpacked data, use regular masks (backward compatibility)
+            mask = torch.triu(
+                torch.full((seq_len, seq_len), float('-inf'), device=tokens.device),
+                diagonal=1
+            ).unsqueeze(0).unsqueeze(0)
+            global_block_mask = mask
+            
+            if self.config.sliding_window_size:
+                local_mask = mask + torch.tril(
+                    torch.full((seq_len, seq_len), float('-inf'), device=tokens.device),
+                    diagonal=-self.config.sliding_window_size,
+                ).unsqueeze(0).unsqueeze(0)
+                local_block_mask = local_mask
+            else:
+                local_block_mask = None
         
         # Select frequencies based on positions
+        assert input_positions.shape == (batch_size, seq_len), "input_positions must match tokens shape"
+
         freqs_cis_dict = {
-            "local_sliding": self.local_freqs_cis.index_select(0, input_positions),
-            "global": self.global_freqs_cis.index_select(0, input_positions),
+            "local_sliding": self.local_freqs_cis[input_positions].unsqueeze(1), # unsqueeze for head dim
+            "global": self.global_freqs_cis[input_positions].unsqueeze(1),
         }
         
         # Forward through transformer
         hidden_states = self.model(
             hidden_states=hidden_states,
             freqs_cis=freqs_cis_dict,
-            mask=mask,
-            local_mask=local_mask,
+            mask=global_block_mask,
+            local_mask=local_block_mask,
         )
         
         # Compute loss or logits
@@ -617,7 +679,7 @@ class Gemma3MultiModalModel(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
-        max_seq_len = config.max_position_embeddings
+        max_seq_len = config.max_seq_len
         head_dim = config.head_dim
         vocab_size = config.vocab_size
         self.text_token_embedder = Embedding(
