@@ -22,7 +22,6 @@ class ModelArgs:
     head_dim: int = 128
     intermediate_size: int = 11008
     max_seq_len: int = 8192
-    type_vocab_size: int = 1
     layer_norm_eps: float = 1e-5
     initializer_range: float = 0.02
     pad_token_id: int = 0

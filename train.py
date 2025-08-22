@@ -41,10 +41,10 @@ from maester.parallelisms import ParallelDims
 from maester.profiling import (maybe_enable_memory_snapshot,
                                maybe_enable_profiling)
 from maester.sft import build_sft_data_loader
-from maester.utils import (clean_param_name, clip_grad_norm, dist_max,
-                           dist_mean, get_num_flop_per_token, get_num_params,
-                           get_peak_flops, init_distributed, set_pg_timeouts)
-
+from maester.utils import (clean_param_name, clip_grad_norm, dist_max, dist_mean, get_num_flop_per_token,
+                           get_num_params, get_peak_flops, init_distributed,
+                           set_pg_timeouts)
+from nccl_preflight import run_nccl_preflight
 
 # Training state that is saved in checkpoints
 @dataclass
@@ -103,6 +103,8 @@ def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     init_distributed(cfg)
 
+    run_nccl_preflight()
+
     train_state = TrainState()
     with maybe_enable_memory_snapshot(
         cfg, global_step=train_state.step
@@ -133,8 +135,7 @@ def main():
         # 2. vocab size from tokenizer
         # 3. max_seq_len base on inputs
         model_config.norm_type = cfg.norm_type
-        # Get vocab size from tokenizer (vocab_size is base vocabulary without added tokens)
-        if not hasattr(model_config, 'vocab_size') or model_config.vocab_size <= 0:
+        if not hasattr(model_config, 'vocab_size') or model_config.vocab_size <= 0: 
             model_config.vocab_size = len(tokenizer)
         model_config.max_seq_len = cfg.seq_len
         if cfg.enable_mup:
