@@ -19,7 +19,7 @@ dependencies = [
     "pydantic",
     "tensorboard",
     # "distributed-shampoo",
-    "pydantic-settings>=2.6.0",
+    "pydantic-settings[toml]>=2.6.0",
     # "pytorch-triton-rocm",
     # "torchvision",
     # "torchdata",

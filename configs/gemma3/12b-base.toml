@@ -1,0 +1,7 @@
+model_name = "gemma3"
+flavor = "12B"
+tokenizer_name = "google/gemma-3-12b-pt"
+
+[dataset]
+bos_token = 2
+eos_token = 1
