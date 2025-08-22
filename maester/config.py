@@ -118,6 +118,7 @@ class Config(BaseSettings):
     # lr schedule
     scheduler: str = "linear_warmup_cosine"
     warmup_steps: int = 50
+    cooldown_steps: int = 100  # used for some schedules
 
     # fsdp
     mixed_precision_param: str = 'bfloat16'
