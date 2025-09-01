@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:8
 #SBATCH --time=00:20:00
 #SBATCH --partition=standard-g
-#SBATCH --account=project_465000954
+#SBATCH --account=project_465001265
 #SBATCH --switches=1
 
 # Singularity container path
