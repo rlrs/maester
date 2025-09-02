@@ -3,7 +3,10 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.nn.attention.flex_attention import flex_attention as _flex_attention, create_block_mask
+from torch.nn.attention.flex_attention import flex_attention as _flex_attention, create_block_mask as _create_block_mask
+from torch.distributed.tensor.experimental._attention import (
+            create_cp_block_mask,
+        )
 
 from dataclasses import dataclass
 
@@ -21,7 +24,7 @@ class ModelArgs:
     num_key_value_heads: int = 32
     head_dim: int = 128
     intermediate_size: int = 11008
-    max_position_embeddings: int = 8192
+    max_seq_len: int = 8192
     type_vocab_size: int = 1
     layer_norm_eps: float = 1e-5
     initializer_range: float = 0.02
@@ -175,13 +178,15 @@ def make_sliding_window_mask_fn(window_size):
 
 
 flex_attention = torch.compile(_flex_attention, dynamic=False)
+create_block_mask = torch.compile(_create_block_mask, dynamic=False)
 
 class GemmaAttention(nn.Module):
 
     def __init__(
         self,
         config: ModelArgs,
-        attn_type: str
+        attn_type: str,
+        device_mesh = None
     ):
         super().__init__()
 
@@ -221,8 +226,8 @@ class GemmaAttention(nn.Module):
 
         self.attn_type = attn_type
         self.sliding_window_size = config.sliding_window_size
-        self.attention_backend = "flex"  # Set attention backend
-        
+        self.attention_backend = "sdpa"  # Set attention backend TODO: set back to flex
+
         # Pre-compute block mask for FlexAttention
         if self.attention_backend == "flex":
             # Determine mask function based on attention type
@@ -232,7 +237,7 @@ class GemmaAttention(nn.Module):
                 mask_fn = causal_mask
             
             # Create block mask once during initialization
-            max_seq_len = config.max_position_embeddings
+            max_seq_len = config.max_seq_len
             self.block_mask = create_block_mask(mask_fn, None, None, max_seq_len, max_seq_len)
         
     def forward(
@@ -331,10 +336,10 @@ class GemmaAttention(nn.Module):
             # Let PyTorch choose the best backend automatically
             output = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=attn_mask,
+                # attn_mask=attn_mask, # TODO: disabled for cp
                 dropout_p=0.0,
                 scale=self.scaling,
-                is_causal=False
+                is_causal=True # TODO: true for cp
             )
         
         # [batch_size, seq_len, hidden_dim]
@@ -483,7 +488,7 @@ class GemmaTextModel(nn.Module):
         
         # Precompute RoPE frequencies following multimodal pattern
         head_dim = config.head_dim
-        max_seq_len = config.max_position_embeddings
+        max_seq_len = config.max_seq_len
         
         # Use rope_wave_length if provided, otherwise use defaults
         if hasattr(config, 'rope_wave_length') and config.rope_wave_length:
@@ -529,11 +534,11 @@ class GemmaTextModel(nn.Module):
         with torch.device(self.local_freqs_cis.device):
             # IMPORTANT: rope_scaling_factor is only applied to global attention, not local_sliding
             self._register_freqs_cis('local_freqs_cis', self.config.head_dim, 
-                                   self.config.max_position_embeddings,
+                                   self.config.max_seq_len,
                                    theta=self.config.rope_wave_length.get('local_sliding', 10_000) if self.config.rope_wave_length else 10_000,
                                    rope_scaling_factor=1.0)  # No scaling for local attention
             self._register_freqs_cis('global_freqs_cis', self.config.head_dim,
-                                   self.config.max_position_embeddings, 
+                                   self.config.max_seq_len, 
                                    theta=self.config.rope_wave_length.get('global', 10_000) if self.config.rope_wave_length else 10_000,
                                    rope_scaling_factor=rope_scaling_factor)  # Scaling only for global attention
         
@@ -617,7 +622,7 @@ class Gemma3MultiModalModel(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
-        max_seq_len = config.max_position_embeddings
+        max_seq_len = config.max_seq_len
         head_dim = config.head_dim
         vocab_size = config.vocab_size
         self.text_token_embedder = Embedding(
