@@ -66,10 +66,9 @@ def parallelize_gemma(
 
         apply_fsdp(
             model,
-            dp_mesh,
+            world_mesh[tuple(dp_mesh_dim_names)],
             param_dtype=TORCH_DTYPE_MAP[config.mixed_precision_param],
             reduce_dtype=TORCH_DTYPE_MAP[config.mixed_precision_reduce],
-            tp_enabled=parallel_dims.tp_enabled,
             #pp_enabled=parallel_dims.pp_enabled,
         )
 
@@ -270,7 +269,6 @@ def apply_fsdp(
     dp_mesh: DeviceMesh,
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
-    tp_enabled: bool,
     pp_enabled: bool = False,
 ):
     """Apply FSDP to Gemma model."""

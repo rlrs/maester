@@ -221,7 +221,8 @@ class GemmaAttention(nn.Module):
     def __init__(
         self,
         config: ModelArgs,
-        attn_type: str
+        attn_type: str,
+        device_mesh = None
     ):
         super().__init__()
 
