@@ -52,7 +52,7 @@ def parallelize_gemma(
 
     # Compile each layer individually
     if config.compile:
-        apply_compile(model)
+        apply_compile(model, fullgraph=not parallel_dims.cp_enabled) # TODO: fullgraph for CP?
 
     # Apply FSDP
     if parallel_dims.fsdp_enabled:
@@ -182,10 +182,10 @@ def apply_ac(model: nn.Module):
     logger.info("Applied activation checkpointing to the model")
 
 
-def apply_compile(model: nn.Module):
+def apply_compile(model: nn.Module, fullgraph: bool = False):
     """Compile each transformer layer individually."""
     for layer_id, layer in enumerate(model.model.layers):
-        compiled_layer = torch.compile(layer, fullgraph=True)
+        compiled_layer = torch.compile(layer, fullgraph=fullgraph)
         model.model.layers[layer_id] = compiled_layer
     logger.info("Compiled each transformer layer with torch.compile")
 

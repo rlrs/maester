@@ -7,6 +7,7 @@ from torch.nn.attention.flex_attention import flex_attention as _flex_attention,
 from torch.distributed.tensor.experimental._attention import (
             create_cp_block_mask,
         )
+from torch.distributed.device_mesh import DeviceMesh
 
 from dataclasses import dataclass
 
@@ -43,6 +44,7 @@ class ModelArgs:
     vision_config: dict | None = None  # For multimodal models
     tied_embeddings: bool = True  # For training compatibility
     init_std: float = 0.02  # For weight initialization
+    attention_backend: str = "flex"  # "eager", "flex", or "sdpa", but "flex" is recommended as the others might be incorrect
 
 def precompute_freqs_cis(dim: int,
                          end: int,
@@ -176,9 +178,20 @@ def make_sliding_window_mask_fn(window_size):
         return sliding_window_causal(b, h, q_idx, kv_idx, window_size)
     return mask_fn
 
-
-flex_attention = torch.compile(_flex_attention, dynamic=False)
+flex_attention = torch.compile(_flex_attention, dynamic=False, fullgraph=True)
 create_block_mask = torch.compile(_create_block_mask, dynamic=False)
+
+@torch._dynamo.disable
+def _no_compile_sdpa(q, k, v, scale: float, is_causal: bool = True, attn_mask: torch.Tensor | None = None):
+    # q,k,v: [B, H, S, D]; CP sharding on S (dim=2)
+    with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+        return F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=0.0,
+            attn_mask=attn_mask,
+            scale=scale,
+            is_causal=is_causal,
+        )
 
 class GemmaAttention(nn.Module):
 
@@ -226,7 +239,7 @@ class GemmaAttention(nn.Module):
 
         self.attn_type = attn_type
         self.sliding_window_size = config.sliding_window_size
-        self.attention_backend = "sdpa"  # Set attention backend TODO: set back to flex
+        self.attention_backend = config.attention_backend
 
         # Pre-compute block mask for FlexAttention
         if self.attention_backend == "flex":
@@ -238,8 +251,8 @@ class GemmaAttention(nn.Module):
             
             # Create block mask once during initialization
             max_seq_len = config.max_seq_len
-            self.block_mask = create_block_mask(mask_fn, None, None, max_seq_len, max_seq_len)
-        
+            self.block_mask = create_cp_block_mask(mask_fn, None, None, max_seq_len, max_seq_len, device_mesh=device_mesh)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -297,18 +310,12 @@ class GemmaAttention(nn.Module):
             output = torch.matmul(scores, v)
             
         elif self.attention_backend == "flex":
-            # FlexAttention
-            
             # Transpose to [batch_size, n_heads, seq_len, head_dim]
             q = xq.transpose(1, 2)
             k = xk.transpose(1, 2)
             v = xv.transpose(1, 2)
 
-            # Adjust the pre-computed mask to the current sequence length
-            S = q.shape[2]
-            block_mask = self.block_mask._adjust(S, S) if S != self.block_mask.shape[-1] else self.block_mask
-            
-            output = flex_attention(q, k, v, block_mask=block_mask, scale=self.scaling, enable_gqa=self.num_kv_heads != self.num_heads)
+            output = flex_attention(q, k, v, block_mask=self.block_mask, scale=self.scaling, enable_gqa=self.num_kv_heads != self.num_heads)
                 
         else:  # self.attention_backend == "sdpa"
             if self.num_kv_heads != self.num_heads:
@@ -334,14 +341,17 @@ class GemmaAttention(nn.Module):
             
             # Use PyTorch's scaled_dot_product_attention
             # Let PyTorch choose the best backend automatically
-            output = F.scaled_dot_product_attention(
-                q, k, v,
-                # attn_mask=attn_mask, # TODO: disabled for cp
-                dropout_p=0.0,
-                scale=self.scaling,
-                is_causal=True # TODO: true for cp
-            )
-        
+            # output = F.scaled_dot_product_attention(
+            #     q, k, v,
+            #     # attn_mask=attn_mask, # TODO: disabled for cp
+            #     dropout_p=0.0,
+            #     scale=self.scaling,
+            #     is_causal=True # TODO: true for cp
+            # )
+            output = _no_compile_sdpa(q, k, v, scale=self.scaling, 
+                                      is_causal=True, attn_mask=attn_mask # TODO: these are wrong for gemma
+                                      )
+
         # [batch_size, seq_len, hidden_dim]
         output = output.transpose(1, 2).contiguous().view(
             batch_size, input_len, -1)
@@ -357,13 +367,15 @@ class Gemma2DecoderLayer(nn.Module):
     def __init__(
         self,
         config: ModelArgs,
-        attn_type: str
+        attn_type: str,
+        device_mesh: DeviceMesh | None
     ):
         super().__init__()
         self.attn_type = attn_type
         self.self_attn = GemmaAttention(
             config=config,
-            attn_type=attn_type
+            attn_type=attn_type,
+            device_mesh=device_mesh
         )
         self.mlp = GemmaMLP(
             hidden_size=config.dim,
@@ -428,7 +440,7 @@ class Gemma2DecoderLayer(nn.Module):
         self.mlp.init_weights(init_std)
 
 class GemmaModel(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelArgs, device_mesh: DeviceMesh | None):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -440,7 +452,7 @@ class GemmaModel(nn.Module):
                 if config.attn_types is not None
                 else "global" 
             )
-            self.layers.append(Gemma2DecoderLayer(config, attn_type))
+            self.layers.append(Gemma2DecoderLayer(config, attn_type, device_mesh=device_mesh))
         self.norm = RMSNorm(config.dim, eps=config.rms_norm_eps)
 
     def forward(
@@ -454,7 +466,7 @@ class GemmaModel(nn.Module):
             layer: Gemma2DecoderLayer = self.layers[i] # type: ignore
             hidden_states = layer(
                 hidden_states=hidden_states,
-                freqs_cis=freqs_cis.get(layer.attn_type),
+                freqs_cis=freqs_cis[layer.attn_type],
                 mask=mask,
                 local_mask=local_mask,
             )
@@ -470,13 +482,14 @@ class GemmaModel(nn.Module):
     
 class GemmaTextModel(nn.Module):
     """Text-only Gemma model compatible with training setup."""
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelArgs, device_mesh: DeviceMesh | None = None):
         super().__init__()
         self.config = config
         self.model_args = config  # For compatibility with training code
         self.vocab_size = config.vocab_size
         self.n_layers = config.n_layers
-        
+        self.device_mesh = device_mesh
+
         # Text embeddings
         self.tok_embeddings = Embedding(
             num_embeddings=config.vocab_size,
@@ -484,8 +497,8 @@ class GemmaTextModel(nn.Module):
         )
         
         # Core transformer model
-        self.model = GemmaModel(config)
-        
+        self.model = GemmaModel(config, device_mesh=device_mesh)
+
         # Precompute RoPE frequencies following multimodal pattern
         head_dim = config.head_dim
         max_seq_len = config.max_seq_len
@@ -613,9 +626,9 @@ class GemmaTextModel(nn.Module):
             return output
     
     @classmethod
-    def from_model_args(cls, model_args: ModelArgs) -> "GemmaTextModel":
+    def from_model_args(cls, model_args: ModelArgs, device_mesh: DeviceMesh | None = None) -> "GemmaTextModel":
         """Initialize from model args (compatible with training loop)."""
-        return cls(model_args)
+        return cls(model_args, device_mesh=device_mesh)
 
 
 class Gemma3MultiModalModel(nn.Module):

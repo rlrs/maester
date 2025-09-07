@@ -19,6 +19,8 @@ import torch.nn.functional as F
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor.parallel import loss_parallel
+from torch.distributed.tensor.experimental import context_parallel
+from torch.distributed.tensor.experimental._attention import set_rotate_method
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
@@ -90,6 +92,7 @@ def main():
         dp_shard=cfg.data_parallel_shard_degree,
         dp_replicate=cfg.data_parallel_replicate_degree,
         tp=cfg.tensor_parallel_degree,
+        cp=cfg.context_parallel_degree,
         world_size=world_size,
         enable_loss_parallel=cfg.enable_loss_parallel,
     )
@@ -110,7 +113,17 @@ def main():
         else:
             dp_degree, dp_rank = 1, 0
         logger.info(f"world mesh: {world_mesh}")
-        logger.info(f"dp mesh: {dp_mesh}")
+        # logger.info(f"dp mesh: {dp_mesh}")
+
+        if parallel_dims.cp_enabled: # the following is necessary for CP w/ flex attention
+            from torch.distributed.tensor.experimental._attention import _set_cp_global_var, _DispatchMode, _cp_options
+
+            # set_rotate_method("alltoall")  # alltoall or allgather (only allgather for flex)
+            _set_cp_global_var("cp_shard_dim", 2)
+            # _cp_options.enable_load_balance = True  # no load balancing for flex
+            torch.distributed.tensor.experimental._attention._dispatch_mode = (
+                _DispatchMode.TORCH_FUNCTION
+            )
 
         # Get tokenizer to determine vocab size
         if os.path.isfile(cfg.tokenizer_name):
@@ -145,7 +158,7 @@ def main():
             logger.info(
                 f"Building {cfg.model_name} {cfg.flavor} with {model_config}"
             )
-            model = model_cls.from_model_args(model_config)
+            model = model_cls.from_model_args(model_config, world_mesh["cp"])
 
         # log model size
         model_param_count = get_num_params(model)
@@ -319,8 +332,23 @@ def main():
                 # data_monitor.log_batch_samples(input_ids, labels, data_loader.dataset)
                 # data_monitor.log_dataset_stats(data_loader.dataset)
 
+                buffers = [input_ids, labels]
+                buffer_seq_dims = [1, 1] # shard on seq dim
+                if hasattr(model, 'freqs_cis'):
+                    buffers.extend([model.freqs_cis])
+                    buffer_seq_dims.extend([0])
+                elif hasattr(model, 'local_freqs_cis') and hasattr(model, 'global_freqs_cis'):
+                    buffers.extend([model.local_freqs_cis, model.global_freqs_cis])
+                    buffer_seq_dims.extend([0, 0])
+                context_parallel_ctx = context_parallel(
+                    world_mesh["cp"],
+                    buffers=buffers,
+                    buffer_seq_dims=buffer_seq_dims,
+                    no_restore_buffers={input_ids, labels},  # don't restore
+                ) if parallel_dims.cp_enabled else contextlib.nullcontext()
+
                 # non-pp loss parallel, pp is not implemented
-                with loss_parallel_ctx():
+                with loss_parallel_ctx(), context_parallel_ctx:
                     if cfg.enable_cut_cross_entropy:
                         loss = model(input_ids, labels) # using cut cross-entropy fused kernel
                     else:
@@ -376,7 +404,7 @@ def main():
                     time_delta = timer() - time_last_log
 
                     total_tokens += ntokens_since_last_log
-                    tps = ntokens_since_last_log / (time_delta * parallel_dims.model_parallel_size)
+                    tps = ntokens_since_last_log / (time_delta * parallel_dims.non_data_parallel_size)
                     mfu = 100 * num_flop_per_token * tps / gpu_peak_flops
 
                     time_end_to_end = time_delta / cfg.log_freq
