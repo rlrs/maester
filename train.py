@@ -168,7 +168,7 @@ def main():
             logger.info(
                 f"Building {cfg.model_name} {cfg.flavor} with {model_config}"
             )
-            model = model_cls.from_model_args(model_config, world_mesh["cp"])
+            model = model_cls.from_model_args(model_config, cp_device_mesh=world_mesh["cp"] if parallel_dims.cp_enabled else None)
 
         # log model size
         model_param_count = get_num_params(model)
