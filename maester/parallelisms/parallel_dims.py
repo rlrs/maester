@@ -118,3 +118,7 @@ class ParallelDims:
     @cached_property
     def model_parallel_size(self):
         return self.tp
+
+    @cached_property
+    def non_data_parallel_size(self):
+        return self.cp * self.tp
