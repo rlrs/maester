@@ -79,91 +79,45 @@ def apply_tp(
     
     # Parallelize token embeddings
     parallelize_module(
-        model.tok_embeddings,
+        model,
         tp_mesh,
         {
-            "weight": RowwiseParallel(
+            "tok_embeddings": RowwiseParallel(
                 input_layouts=Replicate(),
                 output_layouts=Shard(1),
             ),
+            "norm": SequenceParallel(),
         },
     )
 
     # Parallelize each transformer layer
     for layer_id, layer in enumerate(model.model.layers):
-        # Parallelize attention module
-        # Gemma uses qkv_proj instead of separate wq, wk, wv
+        layer_plan = {
+            "self_attn.query_norm": SequenceParallel(),
+            "self_attn.key_norm": SequenceParallel(),
+            "self_attn": PrepareModuleInput(
+                input_layouts=(Shard(1), None),
+                desired_input_layouts=(Replicate(), None),
+            ),
+            "self_attn.qkv_proj": ColwiseParallel(),
+            "self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+            "input_layernorm": SequenceParallel(),
+            "post_attention_layernorm": SequenceParallel(),
+            "pre_feedforward_layernorm": SequenceParallel(),
+            "post_feedforward_layernorm": SequenceParallel(),
+            "mlp": PrepareModuleInput(
+                input_layouts=(Shard(1),),
+                desired_input_layouts=(Replicate(),),
+            ),
+            "mlp.up_proj": ColwiseParallel(),
+            "mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+            "mlp.gate_proj": ColwiseParallel(),
+        }
         parallelize_module(
-            layer.self_attn.qkv_proj,
-            tp_mesh,
-            {
-                "weight": ColwiseParallel(
-                    input_layouts=Shard(1),
-                    output_layouts=Shard(0),
-                    use_local_output=not async_tp,
-                ),
-            },
+            module=layer,
+            device_mesh=tp_mesh,
+            parallelize_plan=layer_plan,
         )
-        
-        parallelize_module(
-            layer.self_attn.o_proj,
-            tp_mesh,
-            {
-                "weight": RowwiseParallel(
-                    input_layouts=Shard(0),
-                    output_layouts=Shard(1),
-                    use_local_output=not async_tp,
-                ),
-            },
-        )
-
-        # Parallelize MLP (feed forward) module
-        # Gemma uses gate_proj, up_proj, down_proj
-        for proj_name in ["gate_proj", "up_proj"]:
-            parallelize_module(
-                getattr(layer.mlp, proj_name),
-                tp_mesh,
-                {
-                    "weight": ColwiseParallel(
-                        input_layouts=Shard(1),
-                        output_layouts=Shard(0),
-                        use_local_output=not async_tp,
-                    ),
-                },
-            )
-        
-        parallelize_module(
-            layer.mlp.down_proj,
-            tp_mesh,
-            {
-                "weight": RowwiseParallel(
-                    input_layouts=Shard(0),
-                    output_layouts=Shard(1),
-                    use_local_output=not async_tp,
-                ),
-            },
-        )
-
-        # Parallelize normalization layers
-        for norm_name in ["input_layernorm", "post_attention_layernorm", 
-                         "pre_feedforward_layernorm", "post_feedforward_layernorm"]:
-            if hasattr(layer, norm_name) and getattr(layer, norm_name) is not None:
-                parallelize_module(
-                    getattr(layer, norm_name),
-                    tp_mesh,
-                    {
-                        "weight": SequenceParallel(),
-                    },
-                )
-
-    # Parallelize final normalization
-    parallelize_module(
-        model.model.norm,
-        tp_mesh,
-        {
-            "weight": SequenceParallel(),
-        },
-    )
 
     # For text model, output uses embedding weight directly
     # No need to parallelize a separate output layer
