@@ -92,7 +92,7 @@ class Config(BaseSettings):
 
     # datasets
     dataset: DatasetConfig = DatasetConfig()
-    sft: SFTConfig | None = SFTConfig()
+    sft: SFTConfig | None = None 
     tokenizer_name: str = 'google/gemma-3-1b-pt'
 
     # logging/metrics
