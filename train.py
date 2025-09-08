@@ -256,7 +256,27 @@ def main():
                 {'params': nodecay_params, 'weight_decay': 0.0, 'lr': cfg.opt_cfg['lr']},
             ], **cfg.opt_cfg)
         else:
-            optimizer: torch.optim.Optimizer = cfg.opt_class(model.parameters(), **cfg.opt_cfg)
+            decay_params = []
+            nodecay_params = []
+            for name, param in model.named_parameters():
+                if "tok_embeddings" in name:
+                    logger.info(f"Nodecay weight: {name}")
+                    nodecay_params.append(param)  
+                elif param.dim() >= 2:
+                    logger.info(f"Decay weight: {name}")
+                    decay_params.append(param)
+                else:
+                    logger.info(f"Nodecay weight: {name}")
+                    nodecay_params.append(param) 
+            weight_decay = cfg.opt_cfg.get('weight_decay', 0.1)
+            optimizer: torch.optim.Optimizer = cfg.opt_class([{
+                'params': decay_params,
+                'weight_decay': weight_decay
+            },
+            {
+                'params': nodecay_params,
+                'weight_decay': 0.0
+            }], **cfg.opt_cfg)
         scheduler = get_lr_scheduler(optimizer, cfg)
 
         metric_logger = build_metric_logger(cfg)
