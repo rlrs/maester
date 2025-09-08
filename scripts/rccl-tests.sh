@@ -7,24 +7,24 @@
 #SBATCH --gres=gpu:8
 #SBATCH --time=00:20:00
 #SBATCH --partition=standard-g
-#SBATCH --account=project_465000954
+#SBATCH --account=project_465002183
 #SBATCH --switches=1
 
 # Singularity container path
 CONTAINER=/appl/local/containers/sif-images/lumi-rocm-rocm-6.2.2.sif
-
-# Base directories that need to be bound
-MOUNT_PATHS="/var/spool/slurmd,/opt/cray,/usr/lib64/libcxi.so.1,/usr/lib64/libjansson.so.4,/scratch/project_465000954/"
 
 # Environment setup (these will be passed into the container)
 export ROCM_PATH=/opt/rocm
 export WORKDIR=$SLURM_SUBMIT_DIR
 export PATH=${MPI_INSTALL_DIR}/bin:${ROCM_PATH}/bin:$PATH
 
-local_libfabric_version=1.15.2.0
-local_craympich_version=8.1.27
-export SINGULARITYENV_LD_LIBRARY_PATH="/opt/aws-ofi-rccl/:/lib64:/opt/cray/pe/mpich/$local_craympich_version/ofi/gnu/9.1/lib-abi-mpich:/opt/cray/pe/lib64:/opt/cray/pe/lib64/cce:/opt/cray/pe:/opt/cray/libfabric/$local_libfabric_version/lib64:/usr/lib64:/opt/cray/pe/gcc-libs:${SINGULARITYENV_LD_LIBRARY_PATH}"
-export LD_LIBRARY_PATH=${ROCM_PATH}/lib:${SINGULARITYENV_LD_LIBRARY_PATH}:$LD_LIBRARY_PATH
+# local_libfabric_version=1.15.2.0
+# local_craympich_version=8.1.27
+# export SINGULARITYENV_LD_LIBRARY_PATH="/opt/aws-ofi-rccl/:/lib64:/opt/cray/pe/mpich/$local_craympich_version/ofi/gnu/9.1/lib-abi-mpich:/opt/cray/pe/lib64:/opt/cray/pe/lib64/cce:/opt/cray/pe:/opt/cray/libfabric/$local_libfabric_version/lib64:/usr/lib64:/opt/cray/pe/gcc-libs:${SINGULARITYENV_LD_LIBRARY_PATH}"
+export SINGULARITY_BIND=/var/spool/slurmd,/opt/cray,/usr/lib64/libcxi.so.1,/usr/lib64/libjansson.so.4
+#export SINGULARITYENV_LD_LIBRARY_PATH=/opt/cray/pe/mpich/8.1.29/ofi/crayclang/17.0/lib:/opt/cray/xpmem/2.5.2-2.4_3.47__gd0f7936.shasta/lib64:/opt/aws-ofi-rccl:${SINGULARITYENV_LD_LIBRARY_PATH}
+# export SINGULARITYENV_LD_LIBRARY_PATH=/opt/cray/pe/lib64/:/opt/cray/pe/lib64/cce/:/opt/cray/xpmem/2.5.2-2.4_3.47__gd0f7936.shasta/lib64:/opt/aws-ofi-rccl:${SINGULARITYENV_LD_LIBRARY_PATH}
+# export LD_LIBRARY_PATH=${ROCM_PATH}/lib:${SINGULARITYENV_LD_LIBRARY_PATH}:$LD_LIBRARY_PATH
 
 # RCCL Debug flags
 export NCCL_DEBUG=INFO
@@ -115,11 +115,9 @@ for coll in "${COLLECTIVES[@]}"; do
     srun -N $SLURM_NNODES \
          -n $total \
          singularity exec \
-         --bind ${MOUNT_PATHS} \
          ${CONTAINER} \
          bash -c " \
          export PATH=${PATH} && \
-         export LD_LIBRARY_PATH=${LD_LIBRARY_PATH} && \
          export NCCL_NET_GDR_LEVEL=3 && \
          export NCCL_SOCKET_IFNAME=hsn0,hsn1,hsn2,hsn3 && \
          export NCCL_DEBUG=INFO && \
