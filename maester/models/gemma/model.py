@@ -558,7 +558,7 @@ class GemmaTextModel(nn.Module):
         if document_ids is not None:
             global_mask = create_block_mask(
                 make_document_mask_wrapper(causal_mask, document_ids),
-                None,
+                batch_size,
                 None,
                 seq_len,
                 seq_len,
@@ -571,7 +571,7 @@ class GemmaTextModel(nn.Module):
                         make_sliding_window_mask_fn(self.config.sliding_window_size),
                         document_ids,
                     ),
-                    None,
+                    batch_size,
                     None,
                     seq_len,
                     seq_len,
