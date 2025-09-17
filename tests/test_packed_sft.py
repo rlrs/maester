@@ -5,6 +5,7 @@ import pytest
 from pathlib import Path
 import pandas as pd
 import tempfile
+import torch.nn.functional as F
 from maester.sft.packed_dataset import PackedSFTDataset
 from maester.sft.dataset import build_sft_data_loader
 from maester.models.gemma.model import make_document_mask_wrapper, causal_mask
@@ -153,6 +154,7 @@ class TestModelIntegration:
         
         device = torch.device("cuda")
         model = GemmaTextModel(config).to(device)
+        model.init_weights()
         model.eval()
         
         # Create test inputs
@@ -181,8 +183,14 @@ class TestModelIntegration:
         
 
         with torch.no_grad():
-            loss = model(input_ids, labels, position_ids, document_ids)
-            assert loss.ndim == 0, "Loss should be a scalar"
+            logits = model(input_ids, position_ids=position_ids, document_ids=document_ids)
+            assert logits.shape == (*input_ids.shape, config.vocab_size)
+            assert torch.isfinite(logits).all()
+
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+            )
             assert not torch.isnan(loss), "Loss should not be NaN"
 
 

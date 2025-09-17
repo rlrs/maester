@@ -606,7 +606,14 @@ class GemmaTextModel(nn.Module):
             
             # Global attention mask with document boundaries
             global_mask_fn = make_document_mask_wrapper(causal_mask, document_ids)
-            global_block_mask = create_block_mask(global_mask_fn, None, None, seq_len, seq_len)
+            global_block_mask = create_block_mask(
+                global_mask_fn,
+                None,
+                None,
+                seq_len,
+                seq_len,
+                device=tokens.device,
+            )
             
             # Local sliding window mask with document boundaries
             if self.config.sliding_window_size:
@@ -614,23 +621,37 @@ class GemmaTextModel(nn.Module):
                     make_sliding_window_mask_fn(self.config.sliding_window_size),
                     document_ids
                 )
-                local_block_mask = create_block_mask(local_mask_fn, None, None, seq_len, seq_len)
+                local_block_mask = create_block_mask(
+                    local_mask_fn,
+                    None,
+                    None,
+                    seq_len,
+                    seq_len,
+                    device=tokens.device,
+                )
             else:
                 local_block_mask = None
         else:
-            # For unpacked data, use regular masks (backward compatibility)
-            mask = torch.triu(
-                torch.full((seq_len, seq_len), float('-inf'), device=tokens.device),
-                diagonal=1
-            ).unsqueeze(0).unsqueeze(0)
-            global_block_mask = mask
-            
+            # For unpacked data, build standard causal block masks for FlexAttention
+            global_block_mask = create_block_mask(
+                causal_mask,
+                None,
+                None,
+                seq_len,
+                seq_len,
+                device=tokens.device,
+            )
+
             if self.config.sliding_window_size:
-                local_mask = mask + torch.tril(
-                    torch.full((seq_len, seq_len), float('-inf'), device=tokens.device),
-                    diagonal=-self.config.sliding_window_size,
-                ).unsqueeze(0).unsqueeze(0)
-                local_block_mask = local_mask
+                local_mask_fn = make_sliding_window_mask_fn(self.config.sliding_window_size)
+                local_block_mask = create_block_mask(
+                    local_mask_fn,
+                    None,
+                    None,
+                    seq_len,
+                    seq_len,
+                    device=tokens.device,
+                )
             else:
                 local_block_mask = None
         
@@ -757,5 +778,3 @@ class Gemma3MultiModalModel(nn.Module):
         else:
             output = torch.matmul(hidden_states, embedder_weight.t())
             return output
-
-
