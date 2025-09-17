@@ -103,7 +103,9 @@ def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     init_distributed(cfg)
 
-    run_nccl_preflight()
+    if os.environ.get("RUN_NCCL_PREFLIGHT", "0").lower() in {"1", "true", "yes"}:
+        logger.info("Running NCCL preflight checks (unset RUN_NCCL_PREFLIGHT or set to 0 to skip)")
+        run_nccl_preflight()
 
     train_state = TrainState()
     with maybe_enable_memory_snapshot(
@@ -545,5 +547,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
