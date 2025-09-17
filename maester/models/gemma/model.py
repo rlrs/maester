@@ -199,7 +199,7 @@ def make_document_mask_wrapper(base_mask_fn, document_ids):
     return wrapped_mask_fn
 
 
-flex_attention = torch.compile(_flex_attention, dynamic=False)
+flex_attention = torch.compile(_flex_attention, dynamic=False, fullgraph=True)
 
 class GemmaAttention(nn.Module):
 
@@ -288,6 +288,16 @@ class GemmaAttention(nn.Module):
         xq = apply_rotary_emb(xq, freqs_cis=freqs_cis)
         xk = apply_rotary_emb(xk, freqs_cis=freqs_cis)
 
+        # Select appropriate mask
+        if (
+            self.attn_type == "local_sliding"
+            and self.sliding_window_size is not None
+            and local_mask is not None
+        ):
+            attn_mask = local_mask
+        else:
+            attn_mask = mask
+
         # Select attention implementation based on backend
         if self.attention_backend == "eager":
             if self.num_kv_heads != self.num_heads:
@@ -299,16 +309,6 @@ class GemmaAttention(nn.Module):
             q = xq.transpose(1, 2)
             k = xk.transpose(1, 2)
             v = xv.transpose(1, 2)
-            
-            # Select appropriate mask
-            if (
-                self.attn_type == "local_sliding"
-                and self.sliding_window_size is not None
-                and local_mask is not None
-            ):
-                attn_mask = local_mask
-            else:
-                attn_mask = mask
             
             q = q * self.scaling
             scores = torch.matmul(q, k.transpose(2, 3))
@@ -324,11 +324,7 @@ class GemmaAttention(nn.Module):
             k = xk.transpose(1, 2)
             v = xv.transpose(1, 2)
 
-            # Adjust the pre-computed mask to the current sequence length
-            S = q.shape[2]
-            block_mask = self.block_mask._adjust(S, S) if S != self.block_mask.shape[-1] else self.block_mask
-            
-            output = flex_attention(q, k, v, block_mask=block_mask, scale=self.scaling, enable_gqa=self.num_kv_heads != self.num_heads)
+            output = flex_attention(q, k, v, block_mask=attn_mask, scale=self.scaling, enable_gqa=self.num_kv_heads != self.num_heads)
                 
         else:  # self.attention_backend == "sdpa"
             if self.num_kv_heads != self.num_heads:
