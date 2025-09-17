@@ -61,11 +61,12 @@ class Config(BaseSettings):
     data_parallel_shard_degree: int = 8
     data_parallel_replicate_degree: int = 1
     tensor_parallel_degree: int = 1
+    context_parallel_degree: int = 1
     train_batch_size: int = 2 # per device; 2 * 8 gpus * 32 nodes * 8192 seqlen = ~4M tokens per batch
     train_num_steps: int = 1000
     compile: bool = True
     enable_loss_parallel: bool = True
-    enable_cut_cross_entropy: bool = True
+    enable_cut_cross_entropy: bool = False
     init_timeout_seconds: int = 300
     train_timeout_seconds: int = 100
 
@@ -118,6 +119,7 @@ class Config(BaseSettings):
     # lr schedule
     scheduler: str = "linear_warmup_cosine"
     warmup_steps: int = 50
+    cooldown_steps: int = 50
 
     # fsdp
     mixed_precision_param: str = 'bfloat16'
