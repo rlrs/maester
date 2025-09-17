@@ -3,7 +3,14 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.nn.attention.flex_attention import flex_attention as _flex_attention, create_block_mask
+from torch.nn.attention.flex_attention import (
+    BlockMask,
+    flex_attention as _flex_attention,
+    create_block_mask,
+    _convert_mask_to_block_mask,
+    _create_sparse_block_from_block_mask,
+    _DEFAULT_SPARSE_BLOCK_SIZE,
+)
 
 from dataclasses import dataclass
 
@@ -185,17 +192,33 @@ def make_document_mask_wrapper(base_mask_fn, document_ids):
     """
     if document_ids is None:
         return base_mask_fn
-    
-    # For packed sequences, we need to ensure attention doesn't cross document boundaries
+
+    doc_ids = document_ids.detach().to(torch.long)
+    seq_len = document_ids.shape[-1]
+    device = doc_ids.device
+
     def wrapped_mask_fn(b, h, q_idx, kv_idx):
-        # Check if query and key are in the same document
-        batch_doc_ids = document_ids[b]
-        same_doc = batch_doc_ids[q_idx] == batch_doc_ids[kv_idx]
-        # Apply base mask (causal or sliding window) within documents
-        base_mask = base_mask_fn(b, h, q_idx, kv_idx)
-        # Combine: both must be true (same document AND base mask allows)
+        def _ensure_long(val):
+            if isinstance(val, torch.Tensor):
+                return val.to(dtype=torch.long, device=device)
+            return torch.tensor(val, dtype=torch.long, device=device)
+
+        b_long = _ensure_long(b)
+        h_long = _ensure_long(h)
+        q_long = _ensure_long(q_idx)
+        kv_long = _ensure_long(kv_idx)
+
+        b_flat = b_long.reshape(-1)
+        rows = torch.index_select(doc_ids, 0, b_flat)
+        rows = rows.view(*b_long.shape, seq_len)
+
+        q_docs = torch.gather(rows, -1, q_long.reshape(*q_long.shape, 1)).squeeze(-1)
+        k_docs = torch.gather(rows, -1, kv_long.reshape(*kv_long.shape, 1)).squeeze(-1)
+        same_doc = q_docs == k_docs
+
+        base_mask = base_mask_fn(b_long, h_long, q_long, kv_long)
         return same_doc & base_mask
-    
+
     return wrapped_mask_fn
 
 
@@ -554,7 +577,6 @@ class GemmaTextModel(nn.Module):
             input_positions = torch.arange(0, seq_len, dtype=torch.long, device=tokens.device)
             input_positions = input_positions.unsqueeze(0).expand(batch_size, -1)
 
-        # Create masks based on whether we have document_ids (packed data)
         if document_ids is not None:
             global_mask = create_block_mask(
                 make_document_mask_wrapper(causal_mask, document_ids),
@@ -563,7 +585,7 @@ class GemmaTextModel(nn.Module):
                 seq_len,
                 seq_len,
                 device=tokens.device,
-            )
+            ).to(tokens.device)
 
             if self.config.sliding_window_size:
                 local_mask = create_block_mask(
@@ -576,7 +598,7 @@ class GemmaTextModel(nn.Module):
                     seq_len,
                     seq_len,
                     device=tokens.device,
-                )
+                ).to(tokens.device)
             else:
                 local_mask = None
         else:
@@ -587,7 +609,7 @@ class GemmaTextModel(nn.Module):
                 seq_len,
                 seq_len,
                 device=tokens.device,
-            )
+            ).to(tokens.device)
 
             if self.config.sliding_window_size:
                 local_mask = create_block_mask(
@@ -597,7 +619,7 @@ class GemmaTextModel(nn.Module):
                     seq_len,
                     seq_len,
                     device=tokens.device,
-                )
+                ).to(tokens.device)
             else:
                 local_mask = None
 
