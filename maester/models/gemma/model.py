@@ -246,19 +246,16 @@ class GemmaAttention(nn.Module):
 
         self.attn_type = attn_type
         self.sliding_window_size = config.sliding_window_size
-        self.attention_backend = "flex"  # Set attention backend
-        
+        self.attention_backend = "flex"  # FlexAttention is required for Gemma masks
+
         # Pre-compute block mask for FlexAttention
-        if self.attention_backend == "flex":
-            # Determine mask function based on attention type
-            if self.attn_type == "local_sliding" and self.sliding_window_size is not None:
-                mask_fn = make_sliding_window_mask_fn(self.sliding_window_size)
-            else:
-                mask_fn = causal_mask
-            
-            # Create block mask once during initialization
-            max_seq_len = config.max_seq_len
-            self.block_mask = create_block_mask(mask_fn, None, None, max_seq_len, max_seq_len)
+        if self.attn_type == "local_sliding" and self.sliding_window_size is not None:
+            mask_fn = make_sliding_window_mask_fn(self.sliding_window_size)
+        else:
+            mask_fn = causal_mask
+
+        max_seq_len = config.max_seq_len
+        self.block_mask = create_block_mask(mask_fn, None, None, max_seq_len, max_seq_len)
         
     def forward(
         self,
@@ -298,65 +295,23 @@ class GemmaAttention(nn.Module):
         else:
             attn_mask = mask
 
-        # Select attention implementation based on backend
-        if self.attention_backend == "eager":
-            if self.num_kv_heads != self.num_heads:
-                # [batch_size, seq_len, n_heads, head_dim]
-                xk = torch.repeat_interleave(xk, self.num_queries_per_kv, dim=2)
-                xv = torch.repeat_interleave(xv, self.num_queries_per_kv, dim=2)
-            
-            # [batch_size, n_heads, seq_len, head_dim]
-            q = xq.transpose(1, 2)
-            k = xk.transpose(1, 2)
-            v = xv.transpose(1, 2)
-            
-            q = q * self.scaling
-            scores = torch.matmul(q, k.transpose(2, 3))
-            scores = scores + attn_mask
-            scores = F.softmax(scores.float(), dim=-1).type_as(q)
-            output = torch.matmul(scores, v)
-            
-        elif self.attention_backend == "flex":
-            # FlexAttention
-            
-            # Transpose to [batch_size, n_heads, seq_len, head_dim]
-            q = xq.transpose(1, 2)
-            k = xk.transpose(1, 2)
-            v = xv.transpose(1, 2)
+        if self.attention_backend != "flex":
+            raise ValueError("GemmaAttention now requires FlexAttention backend")
 
-            output = flex_attention(q, k, v, block_mask=attn_mask, scale=self.scaling, enable_gqa=self.num_kv_heads != self.num_heads)
-                
-        else:  # self.attention_backend == "sdpa"
-            if self.num_kv_heads != self.num_heads:
-                # Expand KV heads for GQA
-                # [batch_size, seq_len, n_heads, head_dim]
-                xk = torch.repeat_interleave(xk, self.num_queries_per_kv, dim=2)
-                xv = torch.repeat_interleave(xv, self.num_queries_per_kv, dim=2)
-            
-            # Transpose to [batch_size, n_heads, seq_len, head_dim]
-            q = xq.transpose(1, 2)
-            k = xk.transpose(1, 2)
-            v = xv.transpose(1, 2)
-            
-            # Select appropriate mask
-            if (
-                self.attn_type == "local_sliding"
-                and self.sliding_window_size is not None
-                and local_mask is not None
-            ):
-                attn_mask = local_mask
-            else:
-                attn_mask = mask
-            
-            # Use PyTorch's scaled_dot_product_attention
-            # Let PyTorch choose the best backend automatically
-            output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=0.0,
-                scale=self.scaling,
-                is_causal=False
-            )
+        # FlexAttention
+        # Transpose to [batch_size, n_heads, seq_len, head_dim]
+        q = xq.transpose(1, 2)
+        k = xk.transpose(1, 2)
+        v = xv.transpose(1, 2)
+
+        output = flex_attention(
+            q,
+            k,
+            v,
+            block_mask=attn_mask,
+            scale=self.scaling,
+            enable_gqa=self.num_kv_heads != self.num_heads,
+        )
         
         # [batch_size, seq_len, hidden_dim]
         output = output.transpose(1, 2).contiguous().view(
@@ -589,7 +544,7 @@ class GemmaTextModel(nn.Module):
             device=hidden_states.device
         )
         hidden_states = hidden_states * normalizer
-        
+
         # Use provided position_ids or create default sequential positions
         if position_ids is not None:
             # position_ids shape: [batch_size, seq_len]
@@ -598,31 +553,24 @@ class GemmaTextModel(nn.Module):
             # Create default sequential position indices [batch_size, seq_len]
             input_positions = torch.arange(0, seq_len, dtype=torch.long, device=tokens.device)
             input_positions = input_positions.unsqueeze(0).expand(batch_size, -1)
-        
+
         # Create masks based on whether we have document_ids (packed data)
         if document_ids is not None:
-            # For packed data, create block masks with document boundaries
-            # These will be passed through all layers for efficiency
-            
-            # Global attention mask with document boundaries
-            global_mask_fn = make_document_mask_wrapper(causal_mask, document_ids)
-            global_block_mask = create_block_mask(
-                global_mask_fn,
+            global_mask = create_block_mask(
+                make_document_mask_wrapper(causal_mask, document_ids),
                 None,
                 None,
                 seq_len,
                 seq_len,
                 device=tokens.device,
             )
-            
-            # Local sliding window mask with document boundaries
+
             if self.config.sliding_window_size:
-                local_mask_fn = make_document_mask_wrapper(
-                    make_sliding_window_mask_fn(self.config.sliding_window_size),
-                    document_ids
-                )
-                local_block_mask = create_block_mask(
-                    local_mask_fn,
+                local_mask = create_block_mask(
+                    make_document_mask_wrapper(
+                        make_sliding_window_mask_fn(self.config.sliding_window_size),
+                        document_ids,
+                    ),
                     None,
                     None,
                     seq_len,
@@ -630,10 +578,9 @@ class GemmaTextModel(nn.Module):
                     device=tokens.device,
                 )
             else:
-                local_block_mask = None
+                local_mask = None
         else:
-            # For unpacked data, build standard causal block masks for FlexAttention
-            global_block_mask = create_block_mask(
+            global_mask = create_block_mask(
                 causal_mask,
                 None,
                 None,
@@ -643,9 +590,8 @@ class GemmaTextModel(nn.Module):
             )
 
             if self.config.sliding_window_size:
-                local_mask_fn = make_sliding_window_mask_fn(self.config.sliding_window_size)
-                local_block_mask = create_block_mask(
-                    local_mask_fn,
+                local_mask = create_block_mask(
+                    make_sliding_window_mask_fn(self.config.sliding_window_size),
                     None,
                     None,
                     seq_len,
@@ -653,8 +599,8 @@ class GemmaTextModel(nn.Module):
                     device=tokens.device,
                 )
             else:
-                local_block_mask = None
-        
+                local_mask = None
+
         # Select frequencies based on positions
         assert input_positions.shape == (batch_size, seq_len), "input_positions must match tokens shape"
 
@@ -662,13 +608,13 @@ class GemmaTextModel(nn.Module):
             "local_sliding": self.local_freqs_cis[input_positions].unsqueeze(1), # unsqueeze for head dim
             "global": self.global_freqs_cis[input_positions].unsqueeze(1),
         }
-        
+
         # Forward through transformer
         hidden_states = self.model(
             hidden_states=hidden_states,
             freqs_cis=freqs_cis_dict,
-            mask=global_block_mask,
-            local_mask=local_block_mask,
+            mask=global_mask,
+            local_mask=local_mask,
         )
         
         # Compute loss or logits
