@@ -262,13 +262,16 @@ def main():
             nodecay_params = []
             for name, param in model.named_parameters():
                 if "tok_embeddings" in name:
-                    logger.info(f"Nodecay weight: {name}")
+                    if dp_rank == 0:
+                        logger.info(f"Nodecay weight: {name}")
                     nodecay_params.append(param)  
                 elif param.dim() >= 2:
-                    logger.info(f"Decay weight: {name}")
+                    if dp_rank == 0:
+                        logger.info(f"Decay weight: {name}")
                     decay_params.append(param)
                 else:
-                    logger.info(f"Nodecay weight: {name}")
+                    if dp_rank == 0:
+                        logger.info(f"Nodecay weight: {name}")
                     nodecay_params.append(param) 
             weight_decay = cfg.opt_cfg.get('weight_decay', 0.1)
             optimizer: torch.optim.Optimizer = cfg.opt_class([{
