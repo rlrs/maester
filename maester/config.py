@@ -25,6 +25,27 @@ class DatasetConfig(BaseSettings):
     bos_token: int = 128000
     eos_token: int = 128001
     drop_tokens: str = ""
+    # dataset_path: str =  "data/"
+    # datasets: str = "c4_mini,fake_dataset"
+    num_data_workers: int = 1
+    # col_name: str = "tokens"
+    # file_type: str = "arrow"
+
+
+class SFTConfig(BaseSettings):
+    """Configuration for supervised fine-tuning."""
+    template: str = "chatml"
+    mask_strategy: str = "assistant_only"
+    conversation_column: str = "conversations"
+    im_start_token: str = "<start_of_turn>"  # Token to use for <|im_start|>
+    im_end_token: str = "<end_of_turn>"  # Token to use for <|im_end|>
+    
+    # Packing configuration
+    use_packed: bool = True  # Whether to use pre-packed data
+    packed_path: str = "data/packed_sft.parquet"  # Path to packed data file
+    seed: int = 42  # Random seed for shuffling epochs in packed data
+    
+    # Future: distillation settings?
 
     @classmethod
     def settings_customise_sources(
@@ -71,7 +92,8 @@ class Config(BaseSettings):
 
     # datasets
     dataset: DatasetConfig = DatasetConfig()
-    tokenizer_name: str = 'meta-llama/Llama-3.2-3B'
+    sft: SFTConfig | None = None 
+    tokenizer_name: str = 'google/gemma-3-1b-pt'
 
     # logging/metrics
     log_freq: int = 10
@@ -91,8 +113,8 @@ class Config(BaseSettings):
     forced_load_path: str | None = None
 
     # model
-    model_name: str = "llama3"
-    flavor: str = "3B"
+    model_name: str = "gemma3"
+    flavor: str = "1B"
     seq_len: int = 8192
     norm_type: str = "compiled_rmsnorm"
 
@@ -107,10 +129,10 @@ class Config(BaseSettings):
     # optimizer
     opt_class: ImportString[Callable] = 'torch.optim.AdamW'
     opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
-        lr = 3e-4, # max lr, schedule reduces it at points
+        lr = 1e-5, # max lr, schedule reduces it at points
         betas = (0.9, 0.95),
         weight_decay=0.1,
-        eps=1e-8,
+        eps=1e-9,
         # foreach=True, # foreach might work where fused doesn't
         fused=True
     )
@@ -118,6 +140,7 @@ class Config(BaseSettings):
     # lr schedule
     scheduler: str = "linear_warmup_cosine"
     warmup_steps: int = 50
+    cooldown_steps: int = 100  # used for some schedules
 
     # fsdp
     mixed_precision_param: str = 'bfloat16'

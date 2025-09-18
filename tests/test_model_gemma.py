@@ -12,8 +12,8 @@ import pytest
 def test_gemma_dcp_checkpoints_exist():
     """Test that DCP checkpoints exist for Gemma models."""
     checkpoints = {
-        "1B": Path("google-gemma-1b-pt-dcp"),
-        "4B": Path("google-gemma-4b-pt-dcp"),
+        "1B": Path("google-gemma-3-1b-pt-dcp"),
+        "4B": Path("google-gemma-3-4b-pt-dcp"),
     }
     
     available = {}

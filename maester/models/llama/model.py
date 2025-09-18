@@ -118,7 +118,8 @@ def apply_rotary_emb(
     # first half is real, second half is imaginary (matches HF rope)
     # xq_ = torch.complex(xq[..., :xq.shape[-1] // 2].float(), xq[..., xq.shape[-1] // 2:].float())
     # xk_ = torch.complex(xk[..., :xk.shape[-1] // 2].float(), xk[..., xk.shape[-1] // 2:].float())
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    if freqs_cis.ndim != xq_.ndim:
+        freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
 
@@ -425,6 +426,8 @@ class Transformer(nn.Module):
             self, 
             tokens: torch.Tensor, 
             labels: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.Tensor] = None,
+            document_ids: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
         """
         Perform a forward pass through the Transformer model.
@@ -432,17 +435,47 @@ class Transformer(nn.Module):
         Args:
             tokens (torch.Tensor): Input token indices.
             labels (Optional[torch.Tensor]): Target token indices. If provided, the loss will be computed instead of the logits.
+            position_ids (Optional[torch.Tensor]): Custom position IDs for RoPE. If not provided, uses sequential positions.
+            document_ids (Optional[torch.Tensor]): Document IDs for attention masking (currently unused in Llama).
 
         Returns:
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
+        # Warn if document_ids are provided (not supported in Llama yet)
+        if document_ids is not None:
+            from maester.utils import logger
+            logger.warning(
+                "document_ids provided to Llama model but document masking is not yet implemented. "
+                "Ignoring document_ids - attention may cross document boundaries in packed sequences."
+            )
+        
         h = self.tok_embeddings(tokens)
         # if self.model_args.enable_mup: # TODO: re-enable (disabled because it breaks TP)
             # h *= self.model_args.mup_input_alpha
 
+        batch_size, seq_len = tokens.shape
+
+        # Get freqs_cis based on position_ids if provided
+        if position_ids is not None:
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)
+            assert position_ids.shape[0] == batch_size and position_ids.shape[1] == seq_len, (
+                "position_ids must match the shape of tokens"
+            )
+            # Ensure indices live on the same device as cached freqs
+            position_ids = position_ids.long().to(device=self.freqs_cis.device)
+            # Index into precomputed freqs_cis using custom position_ids
+            # Gathered frequencies have shape [batch_size, seq_len, head_dim // 2]
+            freqs_cis = self.freqs_cis[position_ids]
+            # Unsqueeze an explicit head axis so attention can broadcast over heads
+            freqs_cis = freqs_cis.unsqueeze(2)
+        else:
+            # Use default sequential positions (current behavior)
+            freqs_cis = self.freqs_cis
+        
         for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
+            h = layer(h, freqs_cis)
         h = self.norm(h)
         if self.model_args.enable_mup:
             # Scaling `h` instead of `output` allows coord check to log the actual output 
