@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from maester.sft.packed_dataset import PackedSFTDataset
 from maester.sft.dataset import build_sft_data_loader
 from maester.models.gemma.model import make_document_mask_wrapper, causal_mask
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+import math
 
 
 class TestPackedDataset:
@@ -63,7 +65,7 @@ class TestPackedDataset:
 
 class TestDocumentMasking:
     """Test attention masking with document boundaries."""
-    
+
     def test_document_mask_prevents_cross_attention(self):
         """Verify attention cannot cross document boundaries."""
         # Document structure: [0, 0, 0, 1, 1, 2, 2, 2]
@@ -95,6 +97,99 @@ class TestDocumentMasking:
         assert regular_mask(0, 0, 5, 3) == True, "Causal attention allowed"
         assert regular_mask(0, 0, 3, 5) == False, "Anti-causal blocked"
         assert regular_mask(0, 0, 4, 4) == True, "Same position allowed"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Flex attention requires CUDA")
+    def test_block_mask_matches_dense(self):
+        batch_size = 1
+        seq_len = 128
+        n_heads = 2
+        head_dim = 8
+
+        device = torch.device("cuda")
+        doc_ids = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
+        doc_ids[:, 32:64] = 1
+        doc_ids[:, 64:96] = 2
+        doc_ids[:, 96:] = 3
+
+        same_doc = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)
+        positions = torch.arange(seq_len, device=device)
+        causal = positions.view(1, seq_len, 1) >= positions.view(1, 1, seq_len)
+        allowed = causal & same_doc
+
+        mask_fn = make_document_mask_wrapper(causal_mask, doc_ids)
+        block_mask = create_block_mask(
+            mask_fn,
+            batch_size,
+            None,
+            seq_len,
+            seq_len,
+            device=device,
+        )
+
+        # Ensure flex attention runs without error
+        q = torch.randn(batch_size, n_heads, seq_len, head_dim, device=device)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+
+        out = flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            scale=head_dim ** -0.5,
+            enable_gqa=False,
+        )
+        assert torch.isfinite(out).all()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Flex attention requires CUDA")
+    def test_document_mask_blocks_respect_boundaries(self):
+        """Ensure document masking still holds when a boundary falls inside a block."""
+
+        device = torch.device("cuda")
+        batch_size = 1
+        seq_len = 256  # spans two default 128-token blocks
+        n_heads = 1
+        head_dim = 4
+        boundary = 176  # inside second block (indices 128-255)
+
+        doc_ids = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
+        doc_ids[:, boundary:] = 1
+
+        mask_fn = make_document_mask_wrapper(causal_mask, doc_ids)
+        block_mask = create_block_mask(
+            mask_fn,
+            B=batch_size,
+            H=n_heads,
+            Q_LEN=seq_len,
+            KV_LEN=seq_len,
+            device=device,
+        )
+
+        q = torch.ones(batch_size, n_heads, seq_len, head_dim, device=device)
+        k = torch.ones_like(q)
+        v = torch.ones_like(q)
+        v[:, :, :boundary, :] = -1  # document 0 has value -1, document 1 has value +1
+
+        out = flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            scale=head_dim ** -0.5,
+            enable_gqa=False,
+        )
+
+        out = out.squeeze(0).squeeze(0)  # [seq_len, head_dim]
+
+        # Tokens before the boundary should see only document 0 values.
+        assert torch.allclose(out[:boundary], torch.full_like(out[:boundary], -1)), (
+            "Tokens before boundary should attend only to document 0"
+        )
+
+        # Tokens after the boundary should never see document 0 tokens.
+        assert torch.allclose(out[boundary:], torch.ones_like(out[boundary:])), (
+            "Tokens after boundary should attend only to document 1"
+        )
 
 
 class TestModelIntegration:
