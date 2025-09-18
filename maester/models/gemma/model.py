@@ -1,15 +1,9 @@
-from functools import partial
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import (
-    BlockMask,
     flex_attention as _flex_attention,
     create_block_mask,
-    _convert_mask_to_block_mask,
-    _create_sparse_block_from_block_mask,
-    _DEFAULT_SPARSE_BLOCK_SIZE,
 )
 
 from dataclasses import dataclass
