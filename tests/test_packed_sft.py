@@ -9,8 +9,11 @@ import torch.nn.functional as F
 from maester.sft.packed_dataset import PackedSFTDataset
 from maester.sft.dataset import build_sft_data_loader
 from maester.models.gemma.model import make_document_mask_wrapper, causal_mask
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-import math
+from torch.nn.attention.flex_attention import (
+    flex_attention,
+    create_block_mask,
+    create_mask,
+)
 
 
 class TestPackedDataset:
@@ -114,9 +117,19 @@ class TestDocumentMasking:
         same_doc = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)
         positions = torch.arange(seq_len, device=device)
         causal = positions.view(1, seq_len, 1) >= positions.view(1, 1, seq_len)
-        allowed = causal & same_doc
+        allowed = (causal & same_doc).unsqueeze(1).expand(batch_size, n_heads, seq_len, seq_len)
 
         mask_fn = make_document_mask_wrapper(causal_mask, doc_ids)
+        dense_mask = create_mask(
+            mask_fn,
+            batch_size,
+            n_heads,
+            seq_len,
+            seq_len,
+            device=device,
+        )
+        assert torch.equal(dense_mask, allowed), "Dense mask does not match expected"
+
         block_mask = create_block_mask(
             mask_fn,
             batch_size,
@@ -131,15 +144,22 @@ class TestDocumentMasking:
         k = torch.randn_like(q)
         v = torch.randn_like(q)
 
+        scale = head_dim ** -0.5
         out = flex_attention(
             q,
             k,
             v,
             block_mask=block_mask,
-            scale=head_dim ** -0.5,
+            scale=scale,
             enable_gqa=False,
         )
-        assert torch.isfinite(out).all()
+
+        dense_scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+        dense_scores = dense_scores.masked_fill(~dense_mask, float("-inf"))
+        dense_probs = torch.softmax(dense_scores, dim=-1)
+        dense_out = torch.matmul(dense_probs, v)
+
+        assert torch.allclose(out, dense_out, atol=1e-5, rtol=1e-4)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Flex attention requires CUDA")
     def test_document_mask_blocks_respect_boundaries(self):
