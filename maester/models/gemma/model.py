@@ -216,8 +216,6 @@ def make_document_mask_wrapper(base_mask_fn, document_ids):
     return wrapped_mask_fn
 
 
-flex_attention = torch.compile(_flex_attention, dynamic=False, fullgraph=True)
-
 class GemmaAttention(nn.Module):
 
     def __init__(
@@ -273,6 +271,12 @@ class GemmaAttention(nn.Module):
 
         max_seq_len = config.max_seq_len
         self.block_mask = create_block_mask(mask_fn, None, None, max_seq_len, max_seq_len)
+
+        self.flex_attention = torch.compile(
+            _flex_attention,
+            dynamic=False,
+            fullgraph=True,
+        )
         
     def forward(
         self,
@@ -321,7 +325,7 @@ class GemmaAttention(nn.Module):
         k = xk.transpose(1, 2)
         v = xv.transpose(1, 2)
 
-        output = flex_attention(
+        output = self.flex_attention(
             q,
             k,
             v,
