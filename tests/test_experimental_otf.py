@@ -1220,5 +1220,50 @@ class TestEndToEndIntegration(unittest.TestCase):
         print(f"SUCCESS: Multi-worker integration stress test passed for {world_size} workers with complex checkpoint patterns")
 
 
+class TestParquetDatasetInMemoryCaching(unittest.TestCase):
+    """Tests for in-memory caching of Parquet files."""
+
+    def setUp(self):
+        """Set up test data and tokenizer."""
+        mock_distributed_calls(0, 1)
+        self.test_dir = Path(tempfile.mkdtemp())
+        self.data_dir = create_test_parquet_dataset(self.test_dir / 'cache_test_data', num_files=1, docs_per_file=3)
+        self.tokenizer = AutoTokenizer.from_pretrained('gpt2')
+
+    def tearDown(self):
+        """Clean up temporary data."""
+        if self.test_dir.exists():
+            shutil.rmtree(self.test_dir)
+
+    def test_cache_reads_rows_from_memory(self):
+        """Ensure that cached tables provide document access without row-group reads."""
+        dataset = ParquetDataset(
+            data_dir=str(self.data_dir),
+            rank=0,
+            worldsize=1,
+            tokenizer=self.tokenizer,
+            delimiter_token=-1,
+            bos_token=None,
+            max_chunksize=16,
+            verbose=False,
+            shuffle=False,
+            cache_in_memory=True,
+        )
+
+        file_path, _, min_row = dataset._get_docid(0)
+        _, reader = dataset._get_reader('', file_path, None)
+
+        self.assertIsNotNone(dataset._cached_table)
+        self.assertEqual(dataset._cached_table.num_rows, dataset.docs_per_file[file_path])
+
+        first_row = dataset._read_specific_row(reader, min_row)
+        self.assertTrue(first_row.equals(dataset._cached_table.slice(min_row, 1)))
+
+        second_row = dataset._read_specific_row(reader, min_row + 1)
+        self.assertTrue(second_row.equals(dataset._cached_table.slice(min_row + 1, 1)))
+
+
+
+
 if __name__ == '__main__':
     unittest.main()
