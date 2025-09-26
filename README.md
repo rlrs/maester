@@ -40,7 +40,7 @@ wandb login
 1. **Create a job directory** – `submit.py` renders a config snapshot and SLURM
    script under `jobs/<job-name>/`:
    ```bash
-   python submit.py configs/gemma3/4b-sft.toml
+   python submit.py --config-file configs/gemma3/4b-sft.toml
    ```
 2. **Local / non-SLURM run** – use the job directory with `torchrun`:
    ```bash
