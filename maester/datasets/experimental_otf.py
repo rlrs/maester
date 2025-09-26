@@ -889,6 +889,7 @@ class ParquetDataset(_Stateful_Dataset):
         data_column: str = "text",
         process_fn: Optional[Callable] = None,
         raw_data_mode: bool = False,
+        cache_in_memory: bool = False,
     ):
         super(ParquetDataset, self).__init__(rank, worldsize)
         self.seed = seed
@@ -903,6 +904,8 @@ class ParquetDataset(_Stateful_Dataset):
         self.verbose = verbose
         self.data_column = data_column
         self.raw_data_mode = raw_data_mode
+        self.cache_in_memory = cache_in_memory
+        self._cached_table = None
         self.process_fn = process_fn or self._default_process
         self.docset: List[Any] = []  # map of doc indices to (file_path, min docid, max docid)
         self.docs_per_file = {}
@@ -1045,11 +1048,23 @@ class ParquetDataset(_Stateful_Dataset):
 
     def _get_reader(self, path, newpath, reader):
         if newpath != path:
-            del reader
+            if reader is not None:
+                del reader
             if self.verbose:
                 logger.info(f"Worker {self.rank} opening new file {newpath}")
             reader = pq.ParquetFile(newpath)
             path = newpath
+            self._cached_table = None
+            if self.cache_in_memory:
+                columns = None
+                if self.data_column in reader.schema.names:
+                    columns = [self.data_column]
+                try:
+                    self._cached_table = reader.read(columns=columns)
+                except KeyError:
+                    self._cached_table = reader.read()
+        elif not self.cache_in_memory:
+            self._cached_table = None
         return path, reader
 
     def _construct_chunk(self, j, doc, n_chunks):
@@ -1087,6 +1102,18 @@ class ParquetDataset(_Stateful_Dataset):
                 return state
             
     def _read_specific_row(self, reader, row_index):
+        if row_index < 0:
+            raise IndexError(f"Row index {row_index} must be non-negative")
+        if self.cache_in_memory and self._cached_table is not None:
+            if row_index >= self._cached_table.num_rows:
+                raise IndexError(
+                    f"Row index {row_index} exceeds cached table with {self._cached_table.num_rows} rows"
+                )
+            return self._cached_table.slice(row_index, 1)
+
+        if reader is None:
+            raise ValueError("Parquet reader is not initialized")
+
         row_group_index = 0
         rows_seen = 0
         for i in range(reader.num_row_groups):
