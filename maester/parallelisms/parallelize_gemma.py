@@ -4,10 +4,10 @@ from collections import defaultdict
 import torch
 import torch.nn as nn
 from torch.distributed import DeviceMesh
-from torch.distributed._composable.fsdp import (
-    MixedPrecisionPolicy,
-    fully_shard
-)
+# from torch.distributed._composable.fsdp import (
+#     MixedPrecisionPolicy,
+#     fully_shard
+# )
 from torch.distributed._composable.replicate import replicate
 from torch.distributed._tensor import Replicate, Shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -22,7 +22,8 @@ from torch.distributed.tensor.parallel import (
 )
 
 from maester.log_utils import logger
-from maester.parallelisms.parallel_dims import ParallelDims
+from maester.parallelisms.simple_fsdp import simple_fsdp, MixedPrecisionPolicy
+from maester.parallelisms import ParallelDims
 from maester.config import Config, TORCH_DTYPE_MAP
 
 
@@ -51,23 +52,29 @@ def parallelize_gemma(
     if config.ac_mode != "none":
         apply_ac(model, config)
 
+    # torch._inductor.config.simplefsdp.bucket_mode = "auto"
+    # torch._inductor.config.simplefsdp.enable_reorder = True
+    model = simple_fsdp(model, world_mesh[("dp",)], "fully_shard", config.ac_mode, mp_policy=MixedPrecisionPolicy(param_dtype=torch.float16, reduce_dtype=torch.float32))
+
     # Compile each layer individually
-    if config.compile:
-        apply_compile(model)
+    # if config.compile:
+    #     apply_compile(model)
+    torch._inductor.config.reorder_for_peak_memory = False
+    # model = torch.compile(model, fullgraph=True)
 
-    # Apply FSDP
-    if parallel_dims.dp_enabled:
-        dp_mesh = world_mesh["dp"] if world_mesh.ndim > 1 else world_mesh
-        assert dp_mesh.mesh_dim_names == ("dp",), dp_mesh.mesh_dim_names
+    # # Apply FSDP
+    # if parallel_dims.dp_enabled:
+    #     dp_mesh = world_mesh["dp"] if world_mesh.ndim > 1 else world_mesh
+    #     assert dp_mesh.mesh_dim_names == ("dp",), dp_mesh.mesh_dim_names
 
-        apply_fsdp(
-            model,
-            dp_mesh,
-            param_dtype=TORCH_DTYPE_MAP[config.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[config.mixed_precision_reduce],
-            tp_enabled=parallel_dims.tp_enabled,
-            #pp_enabled=parallel_dims.pp_enabled,
-        )
+    #     apply_fsdp(
+    #         model,
+    #         dp_mesh,
+    #         param_dtype=TORCH_DTYPE_MAP[config.mixed_precision_param],
+    #         reduce_dtype=TORCH_DTYPE_MAP[config.mixed_precision_reduce],
+    #         tp_enabled=parallel_dims.tp_enabled,
+    #         #pp_enabled=parallel_dims.pp_enabled,
+    #     )
 
 
 def apply_tp(
@@ -179,6 +186,7 @@ _save_list = {
     torch.ops.aten._scaled_dot_product_efficient_attention.default,
     torch.ops.aten._scaled_dot_product_flash_attention.default,
     torch.ops._c10d_functional.reduce_scatter_tensor.default,
+    torch._higher_order_ops.flex_attention,
 }
 
 def _apply_ac_to_transformer_block(module: nn.Module, ac_config: Config):

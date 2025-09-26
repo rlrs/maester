@@ -274,14 +274,15 @@ def main():
                         logger.info(f"Nodecay weight: {name}")
                     nodecay_params.append(param) 
             weight_decay = cfg.opt_cfg.get('weight_decay', 0.1)
-            optimizer: torch.optim.Optimizer = cfg.opt_class([{
-                'params': decay_params,
-                'weight_decay': weight_decay
-            },
-            {
-                'params': nodecay_params,
-                'weight_decay': 0.0
-            }], **cfg.opt_cfg)
+            # optimizer: torch.optim.Optimizer = cfg.opt_class([{
+            #     'params': decay_params,
+            #     'weight_decay': weight_decay
+            # },
+            # {
+            #     'params': nodecay_params,
+            #     'weight_decay': 0.0
+            # }], **cfg.opt_cfg)
+            optimizer = cfg.opt_class(model.parameters(), **cfg.opt_cfg) # TODO: using single group for testing simplefsdp
         scheduler = get_lr_scheduler(optimizer, cfg)
 
         metric_logger = build_metric_logger(cfg)
@@ -390,6 +391,8 @@ def main():
                         del pred
                     loss.backward()
 
+                for name, param in model.named_parameters():
+                    print(f"{name} grad: {param.grad}")
                 grad_norms = clip_grad_norm( # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
                     model.parameters(), cfg.max_grad_norm, foreach=True
                 )
@@ -441,7 +444,7 @@ def main():
                     
                     # Aggregate data loading times across ALL ranks (TP ranks load redundantly)
                     # Flatten world mesh to get all ranks
-                    global_mesh = world_mesh._flatten() if hasattr(world_mesh, '_flatten') else world_mesh
+                    global_mesh = world_mesh._flatten() if hasattr(world_mesh, '_flatten') and world_mesh.ndim > 1 else world_mesh
                     global_avg_data_loading = dist_mean(time_data_loading, global_mesh).item()
                     global_max_data_loading = dist_max(time_data_loading, global_mesh).item()
                     global_avg_data_loading_pct = dist_mean(time_data_loading_pct, global_mesh).item()
