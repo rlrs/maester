@@ -131,7 +131,8 @@ cuda = [
     "torch>=2.7",
     "torchvision",
     "torchdata",
-    "pytorch-triton",
+    "pytorch-triton==3.3.0",
+    "triton==3.3.1"
 ]
 
 # CUDA 12.8 (nightly)
