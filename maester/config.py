@@ -6,7 +6,7 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 from pydantic.fields import FieldInfo
-from typing import Callable, Type, Any
+from typing import Callable, Type, Any, Optional
 from pathlib import Path
 import torch
 
@@ -19,8 +19,9 @@ TORCH_DTYPE_MAP = {
 
 class DatasetConfig(BaseSettings):
     data_dirs: list[str] = [
-                            "data/toy"
-                            ]
+        "data/toy",
+    ]
+    dataset_types: Optional[list[str]] = None
     dataset_weights: str = "1.0"
     bos_token: int = 128000
     eos_token: int = 128001
