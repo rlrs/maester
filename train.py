@@ -20,6 +20,9 @@ from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor.parallel import loss_parallel
 
+if torch.backends.mps.is_available():
+    import maester.mps
+
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from maester.checkpoint import CheckpointManager
@@ -70,6 +73,13 @@ torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce co
 @record
 def main():
     init_logger()
+    if torch.cuda.is_available():
+        device_type = "cuda"
+    elif torch.backends.mps.is_available():
+        device_type = "mps"
+        from maester.mps import build_gpu_memory_monitor
+    else:
+        raise ValueError("Either CUDA or MPS must be available.")
     logger.info(f"Starting training.")
 
     if len(sys.argv) > 1: 
@@ -113,7 +123,7 @@ def main():
     ) as memory_profiler:
 
         # build meshes
-        world_mesh = parallel_dims.build_mesh(device_type="cuda")
+        world_mesh = parallel_dims.build_mesh(device_type="cuda" if device_type=="cuda" else "cpu")
         if parallel_dims.dp_enabled:
             dp_mesh = world_mesh["dp"]
             dp_degree = dp_mesh.size()
@@ -181,7 +191,7 @@ def main():
         logger.info(f"Model after parallelization {model=}\n")
 
         # allocate sharded model on GPU and initialize weights via DTensor
-        model.to_empty(device="cuda")
+        model.to_empty(device=device_type)
         model.init_weights()
         
         # register hooks after compile?
@@ -363,12 +373,12 @@ def main():
                 ntokens_since_last_log += labels.numel()
                 data_loading_times.append(timer() - data_load_start)
 
-                input_ids = input_ids.cuda()
-                labels = labels.cuda()
+                input_ids = input_ids.to(device_type)
+                labels = labels.to(device_type)
                 if position_ids is not None:
-                    position_ids = position_ids.cuda()
+                    position_ids = position_ids.to(device_type)
                 if document_ids is not None:
-                    document_ids = document_ids.cuda()
+                    document_ids = document_ids.to(device_type)
 
                 optimizer.zero_grad()
 
@@ -391,7 +401,7 @@ def main():
                     loss.backward()
 
                 grad_norms = clip_grad_norm( # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
-                    model.parameters(), cfg.max_grad_norm, foreach=True
+                    model.parameters(), cfg.max_grad_norm, foreach=device_type=="cuda"
                 )
                 optimizer.step()
                 scheduler.step()

@@ -30,6 +30,9 @@ class DatasetConfig(BaseSettings):
     num_data_workers: int = 1
     # col_name: str = "tokens"
     # file_type: str = "arrow"
+    num_workers: int = 1
+    prefetch_factor: int = 8
+    pin_memory: bool = True
 
 
 class SFTConfig(BaseSettings):
@@ -89,6 +92,7 @@ class Config(BaseSettings):
     enable_cut_cross_entropy: bool = True
     init_timeout_seconds: int = 300
     train_timeout_seconds: int = 100
+    dist_backend: str = 'nccl'
 
     # datasets
     dataset: DatasetConfig = DatasetConfig()

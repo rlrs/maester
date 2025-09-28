@@ -1557,7 +1557,12 @@ def build_experimental_data_loader(cfg, rank, world_size):
         )
     # warning: things *will* break with num_workers > 1
     return torch.utils.data.DataLoader(
-        data, num_workers=1, prefetch_factor=8, batch_size=cfg.train_batch_size, pin_memory=True, persistent_workers=True
+        data,
+        num_workers=cfg.dataset.num_workers,
+        prefetch_factor=cfg.dataset.prefetch_factor if cfg.dataset.num_workers else None,
+        batch_size=cfg.train_batch_size,
+        pin_memory=cfg.dataset.pin_memory,
+        persistent_workers=cfg.dataset.num_workers > 0,
     )
 
 

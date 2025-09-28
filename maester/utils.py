@@ -26,12 +26,12 @@ from maester.log_utils import logger
 from maester.models.gemma.model import Embedding as GemmaEmbedding
 
 def dist_max(x: int | float, mesh: DeviceMesh) -> torch.Tensor:
-    tensor = torch.tensor(x).cuda()
+    tensor = torch.tensor(x).to(mesh.device_type)
     return funcol.all_reduce(tensor, reduceOp=c10d.ReduceOp.MAX.name, group=mesh)
 
 
 def dist_mean(x: int | float, mesh: DeviceMesh) -> torch.Tensor:
-    tensor = torch.tensor(x).cuda()
+    tensor = torch.tensor(x).to(mesh.device_type)
     return funcol.all_reduce(tensor, reduceOp=c10d.ReduceOp.AVG.name, group=mesh)
 
 def _warn_overwrite_env(env, val):
@@ -143,7 +143,7 @@ def init_distributed(cfg):
     #     _warn_overwrite_env(TRACE_FILE, f"{dump_dir}/rank_")
 
     torch.distributed.init_process_group(
-        "nccl", timeout=timedelta(seconds=cfg.init_timeout_seconds)
+        cfg.dist_backend, timeout=timedelta(seconds=cfg.init_timeout_seconds),
     )
 
     # to mitigate the memory issue that collectives using
