@@ -1,0 +1,48 @@
+model_name = "gemma3"
+flavor = "1B"
+tokenizer_name = "google/gemma-3-1b-pt"
+
+# job 
+job_name = "gemma-3-1b-test"
+wandb_project = "gemma-3-1b-test"
+enable_wandb = false
+
+# parallelism
+num_nodes = 1
+data_parallel_shard_degree = 1
+data_parallel_replicate_degree = 1
+dist_backend = "gloo"
+
+# training settings
+train_batch_size = 1
+seq_len = 1024
+train_num_steps = 1000
+scheduler = "linear_warmup_constant_sqrt_decay"
+warmup_steps = 5
+cooldown_steps = 5
+enable_checkpoint = false
+checkpoint_interval = 15
+compile = false
+enable_cut_cross_entropy = false
+ac_mode = "none"
+selective_ac_option = "op"
+
+log_freq = 1
+mixed_precision_param = "float16"
+
+[dataset]
+bos_token = 2
+eos_token = 1
+data_dirs = [
+    "data",
+]
+dataset_weights = "1.0"
+num_workers = 0
+pin_memory = false
+
+[opt_cfg] # must specify *all* fields here, will not merge with defaults
+lr = 1e-4
+betas = [0.9, 0.95]
+weight_decay = 0.1
+eps = 1e-9
+fused = true
