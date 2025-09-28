@@ -272,11 +272,6 @@ class GemmaAttention(nn.Module):
         max_seq_len = config.max_seq_len
         self.block_mask = create_block_mask(mask_fn, None, None, max_seq_len, max_seq_len)
 
-        self.flex_attention = torch.compile(
-            _flex_attention,
-            dynamic=False,
-            fullgraph=True,
-        )
         
     def forward(
         self,
@@ -325,7 +320,7 @@ class GemmaAttention(nn.Module):
         k = xk.transpose(1, 2)
         v = xv.transpose(1, 2)
 
-        output = self.flex_attention(
+        output = torch.compile(_flex_attention, fullgraph=True)(
             q,
             k,
             v,
