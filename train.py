@@ -341,54 +341,57 @@ def main():
                 torch.manual_seed(train_state.step + dp_rank) # seeding with dp_rank to ensure identical inputs for TP groups
                 if train_state.step > 1 and train_state.step % cfg.gc_freq == 0:
                     gc.collect(1)
-
-                data_load_start = timer()
-                batch = next(data_iterator)
-                
-                input_ids = batch["input_ids"]
-                labels = batch["labels"]
-                
-                # Get position_ids if available (currently only from packed SFT data)
-                # TODO: Consider generating position_ids for all data loaders for consistency
-                position_ids = batch.get("position_ids", None)
-                
-                # Get document_ids if available (for flex attention document masking in packed data)
-                document_ids = batch.get("document_ids", None)
-                
-                # Collect padding stats if available (SFT mode)
-                if "stats" in batch and "actual_lengths" in batch["stats"]:
-                    padding_lengths_since_last_log.append(batch["stats"]["actual_lengths"])
-                
-                # logger.info(f"step {train_state.step} training on input_ids (element 0) {input_ids[0, :]}")
-                ntokens_since_last_log += labels.numel()
-                data_loading_times.append(timer() - data_load_start)
-
-                input_ids = input_ids.cuda()
-                labels = labels.cuda()
-                if position_ids is not None:
-                    position_ids = position_ids.cuda()
-                if document_ids is not None:
-                    document_ids = document_ids.cuda()
-
                 optimizer.zero_grad()
 
-                # data_monitor.log_batch_samples(input_ids, labels, data_loader.dataset)
-                # data_monitor.log_dataset_stats(data_loader.dataset)
+                for _ in range(cfg.train_gradient_accumulation):
+                    data_load_start = timer()
+                    batch = next(data_iterator)
+                
+                    input_ids = batch["input_ids"]
+                    labels = batch["labels"]
+                
+                    # Get position_ids if available (currently only from packed SFT data)
+                    # TODO: Consider generating position_ids for all data loaders for consistency
+                    position_ids = batch.get("position_ids", None)
+                
+                    # Get document_ids if available (for flex attention document masking in packed data)
+                    document_ids = batch.get("document_ids", None)
+                
+                    # Collect padding stats if available (SFT mode)
+                    if "stats" in batch and "actual_lengths" in batch["stats"]:
+                        padding_lengths_since_last_log.append(batch["stats"]["actual_lengths"])
+                
+                    # logger.info(f"step {train_state.step} training on input_ids (element 0) {input_ids[0, :]}")
+                    ntokens_since_last_log += labels.numel()
+                    data_loading_times.append(timer() - data_load_start)
 
-                # non-pp loss parallel, pp is not implemented
-                with loss_parallel_ctx():
-                    if cfg.enable_cut_cross_entropy:
-                        loss = model(input_ids, labels, position_ids=position_ids, document_ids=document_ids) # using cut cross-entropy fused kernel
-                    else:
-                        pred = model(input_ids, position_ids=position_ids, document_ids=document_ids)
+                    input_ids = input_ids.cuda()
+                    labels = labels.cuda()
+                    if position_ids is not None:
+                        position_ids = position_ids.cuda()
+                    if document_ids is not None:
+                        document_ids = document_ids.cuda()
 
-                        # data_monitor.log_predictions(pred, labels, data_loader.dataset)
 
-                        loss = loss_fn(pred, labels)
-                        # pred.shape=(bs, seq_len, vocab_size)
-                        # need to free to before bwd to avoid peaking memory
-                        del pred
-                    loss.backward()
+                    # data_monitor.log_batch_samples(input_ids, labels, data_loader.dataset)
+                    # data_monitor.log_dataset_stats(data_loader.dataset)
+
+                    # non-pp loss parallel, pp is not implemented
+                    with loss_parallel_ctx():
+                        if cfg.enable_cut_cross_entropy:
+                            loss = model(input_ids, labels, position_ids=position_ids, document_ids=document_ids) # using cut cross-entropy fused kernel
+                        else:
+                            pred = model(input_ids, position_ids=position_ids, document_ids=document_ids)
+
+                            # data_monitor.log_predictions(pred, labels, data_loader.dataset)
+
+                            loss = loss_fn(pred, labels)
+                            # pred.shape=(bs, seq_len, vocab_size)
+                            # need to free to before bwd to avoid peaking memory
+                            del pred
+                        losses_since_last_log.append(loss.detach())
+                        loss = loss / cfg.train_gradient_accumulation
+                        loss.backward()
 
                 grad_norms = clip_grad_norm( # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
                     model.parameters(), cfg.max_grad_norm, foreach=True
@@ -398,7 +401,6 @@ def main():
 
                 weight_scale_stats = weight_scale_monitor.step_monitor()
 
-                losses_since_last_log.append(loss)
 
                 # log metrics
                 if train_state.step == 1 or train_state.step % cfg.log_freq == 0:

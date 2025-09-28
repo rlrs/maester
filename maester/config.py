@@ -85,6 +85,7 @@ class Config(BaseSettings):
     tensor_parallel_degree: int = 1
     train_batch_size: int = 2 # per device; 2 * 8 gpus * 32 nodes * 8192 seqlen = ~4M tokens per batch
     train_num_steps: int = 1000
+    train_gradient_accumulation: int = 1
     compile: bool = True
     enable_loss_parallel: bool = True
     enable_cut_cross_entropy: bool = True
