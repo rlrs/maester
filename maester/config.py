@@ -25,6 +25,7 @@ class DatasetConfig(BaseSettings):
     bos_token: int = 128000
     eos_token: int = 128001
     drop_tokens: str = ""
+    cache_row_groups: bool = True
     # dataset_path: str =  "data/"
     # datasets: str = "c4_mini,fake_dataset"
     num_data_workers: int = 1

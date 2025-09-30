@@ -1,5 +1,6 @@
 # IBM experimental dataloader contributed to torchtitan but not merged.
 # Modified here to include on-the-fly tokenization, reading raw texts from Parquet.
+import bisect
 import csv
 import hashlib
 import json
@@ -7,7 +8,8 @@ import math
 import os
 import random
 import time
-from typing import Any, Callable, List, Optional, Set
+from collections import OrderedDict
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -889,6 +891,7 @@ class ParquetDataset(_Stateful_Dataset):
         data_column: str = "text",
         process_fn: Optional[Callable] = None,
         raw_data_mode: bool = False,
+        cache_row_groups: bool = True,
     ):
         super(ParquetDataset, self).__init__(rank, worldsize)
         self.seed = seed
@@ -904,8 +907,12 @@ class ParquetDataset(_Stateful_Dataset):
         self.data_column = data_column
         self.raw_data_mode = raw_data_mode
         self.process_fn = process_fn or self._default_process
+        self.cache_row_groups = cache_row_groups  # toggle to keep parquet row groups in memory
         self.docset: List[Any] = []  # map of doc indices to (file_path, min docid, max docid)
         self.docs_per_file = {}
+        # Row-group metadata and cache keyed by file path, used to avoid repeated scans and reads
+        self._row_group_prefix: Dict[str, List[int]] = {}
+        self._row_group_cache: Dict[str, OrderedDict[int, pa.Table]] = {}
 
         # Guaranteed inconsistent shuffling across workers
         random.seed(self.seed + rank)
@@ -1043,13 +1050,34 @@ class ParquetDataset(_Stateful_Dataset):
                 return shardid, docrange, min_d
         raise RuntimeError("This should be unreachable")
 
+    def _prepare_row_group_metadata(self, path: str, reader: pq.ParquetFile):
+        num_groups = reader.num_row_groups
+        assert num_groups > 0, f"Parquet file {path} has no row groups"
+
+        if path not in self._row_group_prefix:
+            prefix = []
+            running_total = 0
+            for i in range(num_groups):
+                running_total += reader.metadata.row_group(i).num_rows
+                prefix.append(running_total)
+            self._row_group_prefix[path] = prefix
+
+        if self.cache_row_groups and path not in self._row_group_cache:
+            self._row_group_cache[path] = OrderedDict()
+
     def _get_reader(self, path, newpath, reader):
         if newpath != path:
-            del reader
+            if self.cache_row_groups and path in self._row_group_cache:
+                self._row_group_cache.pop(path, None)
+            if reader is not None:
+                del reader
             if self.verbose:
                 logger.info(f"Worker {self.rank} opening new file {newpath}")
             reader = pq.ParquetFile(newpath)
             path = newpath
+            self._prepare_row_group_metadata(path, reader)
+        elif path and path not in self._row_group_prefix:
+            self._prepare_row_group_metadata(path, reader)
         return path, reader
 
     def _construct_chunk(self, j, doc, n_chunks):
@@ -1086,20 +1114,29 @@ class ParquetDataset(_Stateful_Dataset):
             if state < size:
                 return state
             
-    def _read_specific_row(self, reader, row_index):
-        row_group_index = 0
-        rows_seen = 0
-        for i in range(reader.num_row_groups):
-            num_rows = reader.metadata.row_group(i).num_rows
-            if rows_seen + num_rows > row_index:
-                row_group_index = i
-                break
-            rows_seen += num_rows
+    def _read_specific_row(self, path, reader, row_index):
+        prefix = self._row_group_prefix[path]
+        row_group_index = bisect.bisect_right(prefix, row_index)
+        assert (
+            row_group_index < len(prefix)
+        ), f"Row index {row_index} exceeds total rows for {path}"
+        rows_before_group = prefix[row_group_index - 1] if row_group_index > 0 else 0
+        row_offset = row_index - rows_before_group
 
-        row_offset = row_index - rows_seen
-        table = reader.read_row_group(row_group_index)
-        row = table.slice(row_offset, 1)
-        return row
+        if not self.cache_row_groups:
+            table = reader.read_row_group(row_group_index, columns=[self.data_column])
+            return table.slice(row_offset, 1)
+
+        cache = self._row_group_cache[path]
+        if row_group_index in cache:
+            table = cache[row_group_index]
+            cache.move_to_end(row_group_index)
+        else:
+            table = reader.read_row_group(row_group_index, columns=[self.data_column])
+            cache[row_group_index] = table
+            cache.move_to_end(row_group_index)
+
+        return table.slice(row_offset, 1)
 
     def __iter__(self):
         docset_offset = self.docset_index
@@ -1146,7 +1183,7 @@ class ParquetDataset(_Stateful_Dataset):
                 newpath = file_path
                 path, reader = self._get_reader(path, newpath, reader)
                 
-                table = self._read_specific_row(reader, local_row)
+                table = self._read_specific_row(path, reader, local_row)
                 data = table[self.data_column][0].as_py()
                 
                 if self.raw_data_mode:
@@ -1196,7 +1233,7 @@ class ParquetDataset(_Stateful_Dataset):
                 local_row = doclcg + mindoc
                 newpath = file_path
                 path, reader = self._get_reader(path, newpath, reader)
-                table = self._read_specific_row(reader, local_row)
+                table = self._read_specific_row(path, reader, local_row)
                 data = table[self.data_column][0].as_py()
                 doc = self.process_fn(data)
 
@@ -1534,6 +1571,7 @@ def build_experimental_data_loader(cfg, rank, world_size):
         weights=weights,
         seed=42,
         verbose=(rank == 0),
+        cache_row_groups=cfg.dataset.cache_row_groups,
         # n_logical_shards=cfg.dataset.data_logical_shards,
     )
 
