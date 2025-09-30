@@ -891,7 +891,7 @@ class ParquetDataset(_Stateful_Dataset):
         data_column: str = "text",
         process_fn: Optional[Callable] = None,
         raw_data_mode: bool = False,
-        max_row_group_cache_bytes: Optional[int] = None,  # memory budget for cached row groups (bytes)
+        cache_row_groups: bool = True,
     ):
         super(ParquetDataset, self).__init__(rank, worldsize)
         self.seed = seed
@@ -907,20 +907,12 @@ class ParquetDataset(_Stateful_Dataset):
         self.data_column = data_column
         self.raw_data_mode = raw_data_mode
         self.process_fn = process_fn or self._default_process
-        if max_row_group_cache_bytes is not None:
-            assert (
-                max_row_group_cache_bytes > 0
-            ), "max_row_group_cache_bytes must be positive"
-        self.max_row_group_cache_bytes = max_row_group_cache_bytes
+        self.cache_row_groups = cache_row_groups  # toggle to keep parquet row groups in memory
         self.docset: List[Any] = []  # map of doc indices to (file_path, min docid, max docid)
         self.docs_per_file = {}
         # Row-group metadata and cache keyed by file path, used to avoid repeated scans and reads
         self._row_group_prefix: Dict[str, List[int]] = {}
         self._row_group_cache: Dict[str, OrderedDict[int, pa.Table]] = {}
-        self._row_group_cache_bytes: Dict[str, int] = {}
-        self._row_group_cache_limits: Dict[str, Optional[int]] = {}
-        self._row_group_cache_entry_bytes: Dict[str, Dict[int, int]] = {}
-        self._row_group_column_index: Dict[str, int] = {}
 
         # Guaranteed inconsistent shuffling across workers
         random.seed(self.seed + rank)
@@ -1070,41 +1062,13 @@ class ParquetDataset(_Stateful_Dataset):
                 prefix.append(running_total)
             self._row_group_prefix[path] = prefix
 
-        if path not in self._row_group_cache:
+        if self.cache_row_groups and path not in self._row_group_cache:
             self._row_group_cache[path] = OrderedDict()
-            self._row_group_cache_bytes[path] = 0
-            self._row_group_cache_entry_bytes[path] = {}
-
-            schema = getattr(reader, "schema_arrow", reader.schema)
-            if hasattr(schema, "get_field_index"):
-                col_index = schema.get_field_index(self.data_column)
-            else:
-                col_index = schema.names.index(self.data_column)
-            assert (
-                col_index != -1
-            ), f"Column {self.data_column} not found in parquet file {path}"
-
-            self._row_group_column_index[path] = col_index
-
-            if self.max_row_group_cache_bytes is not None:
-                limit = self.max_row_group_cache_bytes
-            else:
-                total_uncompressed = 0
-                for i in range(num_groups):
-                    column_meta = reader.metadata.row_group(i).column(col_index)
-                    size = column_meta.total_uncompressed_size or column_meta.total_compressed_size
-                    total_uncompressed += size
-                limit = total_uncompressed if total_uncompressed > 0 else None
-            self._row_group_cache_limits[path] = limit
 
     def _get_reader(self, path, newpath, reader):
         if newpath != path:
-            if path in self._row_group_cache:
+            if self.cache_row_groups and path in self._row_group_cache:
                 self._row_group_cache.pop(path, None)
-                self._row_group_cache_bytes.pop(path, None)
-                self._row_group_cache_limits.pop(path, None)
-                self._row_group_cache_entry_bytes.pop(path, None)
-                self._row_group_column_index.pop(path, None)
             if reader is not None:
                 del reader
             if self.verbose:
@@ -1159,47 +1123,18 @@ class ParquetDataset(_Stateful_Dataset):
         rows_before_group = prefix[row_group_index - 1] if row_group_index > 0 else 0
         row_offset = row_index - rows_before_group
 
-        cache = self._row_group_cache[path]
-        entry_sizes = self._row_group_cache_entry_bytes[path]
-        cache_bytes = self._row_group_cache_bytes[path]
-        cache_limit = self._row_group_cache_limits[path]
-        col_index = self._row_group_column_index.get(path)
+        if not self.cache_row_groups:
+            table = reader.read_row_group(row_group_index, columns=[self.data_column])
+            return table.slice(row_offset, 1)
 
+        cache = self._row_group_cache[path]
         if row_group_index in cache:
             table = cache[row_group_index]
             cache.move_to_end(row_group_index)
         else:
             table = reader.read_row_group(row_group_index, columns=[self.data_column])
-            if cache_limit is not None:
-                size_bytes = table.nbytes
-                if size_bytes == 0:
-                    schema = getattr(reader, "schema_arrow", reader.schema)
-                    if col_index is None:
-                        if hasattr(schema, "get_field_index"):
-                            col_index = schema.get_field_index(self.data_column)
-                        else:
-                            col_index = schema.names.index(self.data_column)
-                        self._row_group_column_index[path] = col_index
-                    column_meta = reader.metadata.row_group(row_group_index).column(col_index)
-                    size_bytes = column_meta.total_uncompressed_size or column_meta.total_compressed_size
-                if size_bytes and cache_limit > 0:
-                    while cache and cache_bytes + size_bytes > cache_limit:
-                        old_idx, _ = cache.popitem(last=False)
-                        cache_bytes -= entry_sizes.pop(old_idx, 0)
-                    self._row_group_cache_bytes[path] = max(cache_bytes, 0)
-                    if size_bytes <= cache_limit:
-                        cache[row_group_index] = table
-                        entry_sizes[row_group_index] = size_bytes
-                        cache.move_to_end(row_group_index)
-                        cache_bytes += size_bytes
-                        self._row_group_cache_bytes[path] = cache_bytes
-            else:
-                entry_size = table.nbytes
-                cache[row_group_index] = table
-                cache.move_to_end(row_group_index)
-                entry_sizes[row_group_index] = entry_size
-                cache_bytes += entry_size
-                self._row_group_cache_bytes[path] = cache_bytes
+            cache[row_group_index] = table
+            cache.move_to_end(row_group_index)
 
         return table.slice(row_offset, 1)
 
@@ -1636,7 +1571,7 @@ def build_experimental_data_loader(cfg, rank, world_size):
         weights=weights,
         seed=42,
         verbose=(rank == 0),
-        max_row_group_cache_bytes=cfg.dataset.max_row_group_cache_bytes,
+        cache_row_groups=cfg.dataset.cache_row_groups,
         # n_logical_shards=cfg.dataset.data_logical_shards,
     )
 
