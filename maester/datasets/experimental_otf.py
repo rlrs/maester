@@ -1587,11 +1587,15 @@ def build_experimental_data_loader(cfg, rank, world_size):
     data = Preprocess_Dataset(data, causal_lm)
     # Enable auto-saving
     if cfg.enable_checkpoint: # and not cfg.model_weights_only: # model_weights_only is only for final weight export...
+        grad_accum_steps = getattr(cfg, "gradient_accumulation_steps", 1)
+        grad_accum_steps = max(1, grad_accum_steps)
+        # Track optimizer-scale steps so dataloader checkpoints line up with model checkpoints
+        steps_per_checkpoint_step = cfg.train_batch_size * grad_accum_steps
         data = Checkpoint_Dataset(
             data,
             os.path.join(cfg.dump_dir, cfg.job_name, cfg.checkpoint_folder, "dataloader"),
             cfg.checkpoint_interval,
-            cfg.train_batch_size,
+            steps_per_checkpoint_step,
         )
     # warning: things *will* break with num_workers > 1
     return torch.utils.data.DataLoader(
