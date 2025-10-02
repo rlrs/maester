@@ -1,5 +1,6 @@
 # IBM experimental dataloader contributed to torchtitan but not merged.
 # Modified here to include on-the-fly tokenization, reading raw texts from Parquet.
+import bisect
 import csv
 import hashlib
 import json
@@ -7,7 +8,8 @@ import math
 import os
 import random
 import time
-from typing import Any, Callable, List, Optional, Set, Type, Union
+from collections import OrderedDict
+from typing import Any, Callable, Dict, List, Optional, Set, Type, Union
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -1188,6 +1190,7 @@ def build_experimental_data_loader(cfg, rank, world_size):
         weights=weights,
         seed=42,
         verbose=(rank == 0),
+        cache_row_groups=cfg.dataset.cache_row_groups,
         # n_logical_shards=cfg.dataset.data_logical_shards,
     )
 
