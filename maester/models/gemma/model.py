@@ -271,7 +271,6 @@ class GemmaAttention(nn.Module):
 
         max_seq_len = config.max_seq_len
         self.block_mask = create_block_mask(mask_fn, None, None, max_seq_len, max_seq_len)
-
         
     def forward(
         self,
