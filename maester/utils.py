@@ -79,6 +79,7 @@ def get_num_params(model: torch.nn.Module, exclude_embedding: bool = False) -> i
 
 
 def get_num_flop_per_token(num_params: int, model_config, seq_len) -> int:
+    # TODO: Add MoE support, e.g. compute number of active tokens
     l, h, q, t = (
         model_config.n_layers,
         model_config.n_heads,
