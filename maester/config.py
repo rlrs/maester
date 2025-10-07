@@ -6,7 +6,7 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 from pydantic.fields import FieldInfo
-from typing import Callable, Type, Any, Optional
+from typing import Callable, Type, Any
 from pathlib import Path
 import torch
 
@@ -19,9 +19,8 @@ TORCH_DTYPE_MAP = {
 
 class DatasetConfig(BaseSettings):
     data_dirs: list[str] = [
-        "data/toy",
-    ]
-    dataset_types: Optional[list[str]] = None
+                            "data/toy"
+                            ]
     dataset_weights: str = "1.0"
     bos_token: int = 128000
     eos_token: int = 128001
@@ -85,6 +84,8 @@ class Config(BaseSettings):
     data_parallel_replicate_degree: int = 1
     tensor_parallel_degree: int = 1
     train_batch_size: int = 2 # per device; 2 * 8 gpus * 32 nodes * 8192 seqlen = ~4M tokens per batch
+    gradient_accumulation_steps: int = 1
+    gradient_accumulation_sync_each_step: bool = False
     train_num_steps: int = 1000
     compile: bool = True
     enable_loss_parallel: bool = True
