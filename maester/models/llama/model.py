@@ -45,6 +45,19 @@ class ModelArgs:
     mup_output_alpha: float = 1.0
     mup_width_mul: float = 1.0 # = width / base_width
 
+    # MLA configuration (optional)
+    use_mla: bool = False
+    mla_rank: Optional[int] = None
+    mla_rope_dim: Optional[int] = None
+    mla_value_dim: Optional[int] = None
+    mla_nope_dim: Optional[int] = Nonmaester/models/llama/__init__.pye
+    kv_lora_rank: Optional[int] = None
+    q_lora_rank: int = 0
+    qk_rope_head_dim: Optional[int] = None
+    qk_nope_head_dim: Optional[int] = None
+    v_head_dim: Optional[int] = None
+    mla_mscale: float = 1.0
+
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     """
@@ -172,19 +185,136 @@ class Attention(nn.Module):
         self.n_rep = self.n_heads // self.n_kv_heads
         self.head_dim = model_args.dim // model_args.n_heads
 
-        self.wq = nn.Linear(
-            model_args.dim, model_args.n_heads * self.head_dim, bias=False
-        )
-        self.wk = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.use_mla = model_args.use_mla
+        self.q_lora_rank = model_args.q_lora_rank or 0
+
+        if self.use_mla:
+            self.kv_lora_rank = model_args.kv_lora_rank or model_args.mla_rank
+            if self.kv_lora_rank is None or self.kv_lora_rank <= 0:
+                raise ValueError("MLA requested but kv_lora_rank/mla_rank not provided")
+
+            default_head_dim = self.head_dim
+            rope_dim = (
+                model_args.qk_rope_head_dim
+                or model_args.mla_rope_dim
+                or default_head_dim
+            )
+            if rope_dim % 2 != 0:
+                raise ValueError("qk_rope_head_dim must be even for rotary embeddings")
+            self.qk_rope_head_dim = rope_dim
+            nope_dim = model_args.qk_nope_head_dim
+            if nope_dim is None:
+                nope_dim = (
+                    model_args.mla_nope_dim
+                    if model_args.mla_nope_dim is not None
+                    else default_head_dim - rope_dim
+                )
+            if nope_dim < 0:
+                raise ValueError("qk_rope_head_dim exceeds attention head dim")
+            self.qk_nope_head_dim = nope_dim
+            self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+
+            value_dim = (
+                model_args.v_head_dim
+                or model_args.mla_value_dim
+                or default_head_dim
+            )
+            if value_dim <= 0:
+                raise ValueError("v_head_dim must be positive")
+            self.v_head_dim = value_dim
+
+            if self.q_lora_rank > 0:
+                self.wq = None
+                self.wq_a = nn.Linear(model_args.dim, self.q_lora_rank, bias=False)
+                self.q_norm = create_norm(
+                    model_args.norm_type,
+                    dim=self.q_lora_rank,
+                    eps=model_args.norm_eps,
+                )
+                self.wq_b = nn.Linear(
+                    self.q_lora_rank,
+                    self.n_heads * self.qk_head_dim,
+                    bias=False,
+                )
+            else:
+                self.wq = nn.Linear(
+                    model_args.dim, self.n_heads * self.qk_head_dim, bias=False
+                )
+                self.wq_a = None
+                self.q_norm = None
+                self.wq_b = None
+
+            self.wkv_a = nn.Linear(
+                model_args.dim,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                bias=False,
+            )
+            self.kv_norm = create_norm(
+                model_args.norm_type,
+                dim=self.kv_lora_rank,
+                eps=model_args.norm_eps,
+            )
+            self.wkv_b = nn.Linear(
+                self.kv_lora_rank,
+                self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                bias=False,
+            )
+            self.wk = None
+            self.wv = None
+        else:
+            self.kv_lora_rank = None
+            self.qk_rope_head_dim = self.head_dim
+            self.qk_nope_head_dim = 0
+            self.qk_head_dim = self.head_dim
+            self.v_head_dim = self.head_dim
+
+            self.wq = nn.Linear(
+                model_args.dim, model_args.n_heads * self.head_dim, bias=False
+            )
+            self.wk = nn.Linear(
+                model_args.dim, self.n_kv_heads * self.head_dim, bias=False
+            )
+            self.wv = nn.Linear(
+                model_args.dim, self.n_kv_heads * self.head_dim, bias=False
+            )
+            self.wq_a = None
+            self.q_norm = None
+            self.wq_b = None
+            self.wkv_a = None
+            self.kv_norm = None
+            self.wkv_b = None
+
+        self.value_dim = self.v_head_dim
         self.wo = nn.Linear(
-            model_args.n_heads * self.head_dim, model_args.dim, bias=False
+            self.n_heads * self.value_dim, model_args.dim, bias=False
         )
-        self.attn_scale = 1.0 / self.head_dim if model_args.enable_mup else 1.0 / math.sqrt(self.head_dim)
+        if self.use_mla:
+            self.attn_scale = (1.0 / math.sqrt(self.qk_head_dim)) * model_args.mla_mscale
+        else:
+            self.attn_scale = (
+                1.0 / self.head_dim
+                if model_args.enable_mup
+                else 1.0 / math.sqrt(self.head_dim)
+            )
 
     def init_weights(self, init_std: float):
-        for linear in (self.wq, self.wk, self.wv):
-            nn.init.normal_(linear.weight, mean=0.0, std=init_std)
+        if self.wq is not None:
+            nn.init.normal_(self.wq.weight, mean=0.0, std=init_std)
+        if self.wq_a is not None:
+            nn.init.normal_(self.wq_a.weight, mean=0.0, std=init_std)
+        if self.wq_b is not None:
+            nn.init.normal_(self.wq_b.weight, mean=0.0, std=init_std)
+        if self.q_norm is not None and hasattr(self.q_norm, "reset_parameters"):
+            self.q_norm.reset_parameters()
+
+        if self.use_mla:
+            nn.init.normal_(self.wkv_a.weight, mean=0.0, std=init_std)
+            nn.init.normal_(self.wkv_b.weight, mean=0.0, std=init_std)
+            if self.kv_norm is not None and hasattr(self.kv_norm, "reset_parameters"):
+                self.kv_norm.reset_parameters()
+        else:
+            nn.init.normal_(self.wk.weight, mean=0.0, std=init_std)
+            nn.init.normal_(self.wv.weight, mean=0.0, std=init_std)
         nn.init.normal_(self.wo.weight, mean=0.0, std=init_std)
 
     def forward(
@@ -204,30 +334,92 @@ class Attention(nn.Module):
 
         """
         bs, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        # -1 to infer n_heads since TP shards them
-        xq = xq.view(bs, seqlen, -1, self.head_dim)
-        xk = xk.view(bs, seqlen, -1, self.head_dim)
-        xv = xv.view(bs, seqlen, -1, self.head_dim)
+        if self.use_mla:
+            if self.wq is not None:
+                q = self.wq(x)
+            else:
+                q_latent = self.wq_a(x)
+                if self.q_norm is not None:
+                    q_latent = self.q_norm(q_latent)
+                q = self.wq_b(q_latent)
+            q = q.view(bs, seqlen, self.n_heads, self.qk_head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+            if self.qk_rope_head_dim > 0:
+                q_nope, q_pe = torch.split(
+                    q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+                )
+            else:
+                q_nope = q
+                q_pe = None
 
-        # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_heads, head_dim)
-        values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_heads, head_dim)
+            kv = self.wkv_a(x)
+            if self.qk_rope_head_dim > 0:
+                kv_latent, k_pe = torch.split(
+                    kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+                )
+            else:
+                kv_latent = kv
+                k_pe = None
 
-        xq = xq.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
-        xk = keys.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
-        xv = values.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
+            if self.kv_norm is not None:
+                kv_latent = self.kv_norm(kv_latent)
 
-        # we use causal mask for training
-        output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True, enable_gqa=True, scale=self.attn_scale)
-        output = output.transpose(
-            1, 2
-        ).contiguous()  # (bs, seqlen, n_heads, head_dim)
+            kv_proj = self.wkv_b(kv_latent)
+            kv_proj = kv_proj.view(
+                bs, seqlen, self.n_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
 
-        # assert output.shape == (bs, seqlen, self.n_heads, self.head_dim), f"attn: {output.shape} != {(bs, seqlen, self.n_heads, self.head_dim)}"
+            if self.qk_nope_head_dim > 0:
+                k_nope = kv_proj[..., : self.qk_nope_head_dim]
+                v = kv_proj[..., self.qk_nope_head_dim :]
+            else:
+                k_nope = None
+                v = kv_proj
+
+            if self.qk_rope_head_dim > 0:
+                k_pe = k_pe.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
+                q_pe, k_pe = apply_rotary_emb(q_pe, k_pe, freqs_cis=freqs_cis)
+                q = (
+                    torch.cat([q_nope, q_pe], dim=-1)
+                    if self.qk_nope_head_dim > 0
+                    else q_pe
+                )
+                k = (
+                    torch.cat([k_nope, k_pe], dim=-1)
+                    if self.qk_nope_head_dim > 0
+                    else k_pe
+                )
+            else:
+                q = q_nope
+                k = k_nope
+
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+
+            output = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, scale=self.attn_scale
+            )
+            output = output.transpose(1, 2).contiguous()
+        else:
+            q = self.wq(x).view(bs, seqlen, -1, self.head_dim)
+            k = self.wk(x).view(bs, seqlen, -1, self.head_dim)
+            v = self.wv(x).view(bs, seqlen, -1, self.head_dim)
+            q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)
+
+            keys = repeat_kv(k, self.n_rep)
+            values = repeat_kv(v, self.n_rep)
+
+            q = q.transpose(1, 2)
+            keys = keys.transpose(1, 2)
+            values = values.transpose(1, 2)
+
+            output = F.scaled_dot_product_attention(
+                q, keys, values, is_causal=True, enable_gqa=True, scale=self.attn_scale
+            )
+            output = output.transpose(1, 2).contiguous()
+
         output = output.view(bs, seqlen, -1)
         return self.wo(output)
 
@@ -414,8 +606,15 @@ class Transformer(nn.Module):
             nn.init.normal_(self.output.weight, std=self.model_args.init_std)
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
+        rope_dim = self.model_args.dim // self.model_args.n_heads
+        if self.model_args.use_mla:
+            rope_dim = (
+                self.model_args.qk_rope_head_dim
+                or self.model_args.mla_rope_dim
+                or rope_dim
+            )
         return precompute_freqs_cis(
-            self.model_args.dim // self.model_args.n_heads,
+            rope_dim,
             # Need to compute until at least the max token limit for generation
             # (use 2x max sequence length to be safe)
             self.model_args.max_seq_len * 2,
