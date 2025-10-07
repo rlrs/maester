@@ -26,6 +26,7 @@ class DatasetConfig(BaseSettings):
     bos_token: int = 128000
     eos_token: int = 128001
     drop_tokens: str = ""
+    cache_row_groups: bool = True
     # dataset_path: str =  "data/"
     # datasets: str = "c4_mini,fake_dataset"
     num_data_workers: int = 1
@@ -84,6 +85,8 @@ class Config(BaseSettings):
     data_parallel_replicate_degree: int = 1
     tensor_parallel_degree: int = 1
     train_batch_size: int = 2 # per device; 2 * 8 gpus * 32 nodes * 8192 seqlen = ~4M tokens per batch
+    gradient_accumulation_steps: int = 1
+    gradient_accumulation_sync_each_step: bool = False
     train_num_steps: int = 1000
     train_gradient_accumulation: int = 1
     compile: bool = True
