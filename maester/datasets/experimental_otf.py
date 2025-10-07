@@ -9,7 +9,7 @@ import os
 import random
 import time
 from collections import OrderedDict
-from typing import Any, Callable, Dict, List, Optional, Set, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -19,11 +19,6 @@ import torch.utils.data
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from maester.log_utils import logger
-
-from .formats import (
-    JinxDataset,
-    ParquetDataset,
-)
 
 """
 The following distributed dataloaders are designed around 3 main principles:
@@ -84,6 +79,16 @@ def _shard_partition(itemlist: List[Any], rank: int, worldsize: int) -> List[Any
     return itemlist[
         (rank * len(itemlist)) // worldsize : ((rank + 1) * len(itemlist)) // worldsize
     ]
+
+
+def _shard_inclusive(itemlist: List[Any], rank: int, worldsize: int) -> List[Any]:
+    """
+    In cases where len(itemlist) % worldsize != 0, allow for fractional ownership of items,
+    and return the span including all owned items, fractional or otherwise.
+    """
+    start = math.floor(len(itemlist) * rank / worldsize)
+    end = math.ceil(len(itemlist) * (rank + 1) / worldsize)
+    return itemlist[start:end]
 
 
 class _Stateful_Dataset(torch.utils.data.IterableDataset):
@@ -1279,10 +1284,6 @@ class Sampling_Dataset(_Stateful_Dataset):
     def __init__(
         self,
         data_dirs: list[str],
-        dataset_types: list[Union[
-            Type["ParquetDataset"],
-            Type["JINXDataset"],
-        ]],
         rank: int,
         worldsize: int,
         tokenizer,
@@ -1308,9 +1309,9 @@ class Sampling_Dataset(_Stateful_Dataset):
 
         # Build subdataset iterators
         self.data = []
-        for i, (d, dataset_type) in enumerate(zip(data_dirs, dataset_types)):
+        for i, d in enumerate(data_dirs):
             self.data.append(
-                dataset_type(
+                ParquetDataset(
                     data_dir=d,
                     rank=rank,
                     worldsize=worldsize,
@@ -1530,8 +1531,8 @@ def build_experimental_data_loader(cfg, rank, world_size):
         Number of distributed workers. Used for handling dataset sharding logic.
     """
 
-    data_dirs, dataset_types, weights = parse_data_args(
-        cfg.dataset.data_dirs, cfg.dataset.dataset_types, cfg.dataset.dataset_weights
+    data_dirs, weights = parse_data_args(
+        cfg.dataset.data_dirs, cfg.dataset.dataset_weights
     )
 
     def causal_lm(data_seq, prompt_len=0):
@@ -1560,7 +1561,6 @@ def build_experimental_data_loader(cfg, rank, world_size):
     droplist = droplist + [cfg.dataset.bos_token, cfg.dataset.eos_token]
     data = Sampling_Dataset(
         data_dirs,
-        dataset_types,
         rank,
         world_size,
         tokenizer,
@@ -1603,7 +1603,7 @@ def build_experimental_data_loader(cfg, rank, world_size):
     )
 
 
-def parse_data_args(datas, dataset_types, weights):
+def parse_data_args(datas, weights):
     # Convert csv inputs into corresponding lists of values
     def splitstrip(x):
         if isinstance(x, str):
@@ -1616,8 +1616,5 @@ def parse_data_args(datas, dataset_types, weights):
             raise ValueError(f"arg input {x} cannot be parsed.")
 
     datas = splitstrip(datas)
-    if dataset_types is None:
-        dataset_types = ["ParquetDataset"] * len(datas)
-    dataset_types = [globals()[x] for x in splitstrip(dataset_types)]
     weights = [float(x) for x in splitstrip(weights)]
-    return datas, dataset_types, weights
+    return datas, weights
