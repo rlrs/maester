@@ -216,8 +216,6 @@ def make_document_mask_wrapper(base_mask_fn, document_ids):
     return wrapped_mask_fn
 
 
-flex_attention = torch.compile(_flex_attention, dynamic=False, fullgraph=True)
-
 class GemmaAttention(nn.Module):
 
     def __init__(
@@ -321,13 +319,17 @@ class GemmaAttention(nn.Module):
         k = xk.transpose(1, 2)
         v = xv.transpose(1, 2)
 
-        output = flex_attention(
+        output = torch.compile(_flex_attention, fullgraph=True)(
             q,
             k,
             v,
             block_mask=attn_mask,
             scale=self.scaling,
             enable_gqa=self.num_kv_heads != self.num_heads,
+            # kernel_options={ # on smaller GPUs like 4090, set these if you get triton shared memory errors
+            #     "BLOCK_M": 16, "BLOCK_N": 16,  # forward
+            #     "BLOCK_M1": 16, "BLOCK_N1": 16, "BLOCK_M2": 16, "BLOCK_N2": 16  # backwards
+            # }
         )
         
         # [batch_size, seq_len, hidden_dim]
