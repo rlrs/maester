@@ -16,13 +16,6 @@ llama2_configs = {
     "271M": ModelArgs(dim=1024, n_layers=16, n_heads=8),
     "1B": ModelArgs(dim=2048, n_layers=18, n_heads=16),
     "7B": ModelArgs(dim=4096, n_layers=32, n_heads=32),
-    "Comma7B": ModelArgs(
-        dim=4096,
-        n_layers=32,
-        n_heads=32,
-        rope_theta=100000.0,
-        max_seq_len=4096,
-    ),
     "13B": ModelArgs(dim=5120, n_layers=40, n_heads=40),
     "26B": ModelArgs(dim=5120, n_layers=80, n_heads=40),
     "70B": ModelArgs(
@@ -92,6 +85,14 @@ llama3_configs = {
         ffn_dim_multiplier=1.0,
         multiple_of=1024,
         rope_theta=500000,
+    ),
+    "Comma7B": ModelArgs(
+        dim=4096,
+        n_layers=32,
+        n_heads=32,
+        rope_theta=100000.0,
+        max_seq_len=4096,
+        vocab_size=64256,
     ),
     "8B": ModelArgs(
         dim=4096,
