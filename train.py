@@ -320,7 +320,7 @@ def main():
 
         data_iterator = iter(data_loader)
 
-        logger.info(f"Training starts at step {train_state.step} until {cfg.train_num_steps}")
+        logger.info(f"Training starts at step {train_state.step}")
         with maybe_enable_profiling(
             cfg, global_step=train_state.step
         ) as torch_profiler:
