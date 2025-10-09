@@ -43,6 +43,7 @@ from maester.profiling import (maybe_enable_memory_snapshot,
 from maester.sft import build_sft_data_loader
 from maester.utils import (clean_param_name, clip_grad_norm, dist_max, dist_mean, get_num_flop_per_token,
                            get_num_params, get_peak_flops, init_distributed,
+                           privatize_grads,
                            set_pg_timeouts)
 from nccl_preflight import run_nccl_preflight
 
@@ -183,6 +184,10 @@ def main():
         # allocate sharded model on GPU and initialize weights via DTensor
         model.to_empty(device="cuda")
         model.init_weights()
+        if cfg.dp_enabled:
+            # Opacus hooks to materialize .grad_sample during backward
+            from opacus import GradSampleModule
+            model = GradSampleModule(model)  # wraps in-place; parameters preserved
         
         # register hooks after compile?
         # get_logits_metrics, cleanup_monitoring, reinit_storage = register_logits_monitoring(
@@ -376,11 +381,14 @@ def main():
                     if document_ids is not None:
                         document_ids = document_ids.cuda()
 
-                    sync_grads_now = True
-                    if skip_sync_during_accum:
-                        sync_grads_now = micro_idx == grad_accum_steps - 1
+                    if cfg.dp_enabled:
+                        model.set_requires_gradient_sync(False)
+                    else:
+                        sync_grads_now = True
+                        if skip_sync_during_accum:
+                            sync_grads_now = micro_idx == grad_accum_steps - 1
 
-                    if fsdp_can_toggle_sync and grad_accum_steps > 1:
+                    if fsdp_can_toggle_sync and grad_accum_steps > 1 and not cfg.dp_enabled:
                         model.set_requires_gradient_sync(sync_grads_now)
 
                     with loss_parallel_ctx():
@@ -408,13 +416,34 @@ def main():
                         fsdp_can_toggle_sync
                         and grad_accum_steps > 1
                         and skip_sync_during_accum
+                        and not cfg.dp_enabled
                         and not sync_grads_now
                     ):
                         model.set_requires_gradient_sync(True)
 
-                grad_norms = clip_grad_norm(  # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
-                    model.parameters(), cfg.max_grad_norm, foreach=True
-                )
+                if cfg.dp_enabled:
+                    # Build privatized grads into .grad from .grad_sample
+                    privatize_grads(
+                        model.parameters(),
+                        max_grad_norm=cfg.dp_max_grad_norm,
+                        noise_multiplier=cfg.dp_noise_multiplier,
+                        expected_batch_size=cfg.train_batch_size * dp_degree * grad_accum_steps,
+                        world_size=parallel_dims.dp_shard * parallel_dims.dp_replicate,  # number of DP replicas
+                        dp_group=(world_mesh["dp"] if parallel_dims.dp_enabled else None),
+                        secure_rng=True,
+                    )
+                    # After privatization, .grad holds the *averaged* privatized grads across local batch.
+                    # Now average across data-parallel replicas.
+                    if parallel_dims.dp_enabled:
+                        for p in model.parameters():
+                            if p.grad is None:
+                                continue
+                            dist.all_reduce(p.grad, group=world_mesh["dp"])
+                            p.grad.div_(world_mesh["dp"].size())
+                else:
+                    grad_norms = clip_grad_norm(  # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
+                        model.parameters(), cfg.max_grad_norm, foreach=True
+                    )
                 optimizer.step()
                 scheduler.step()
                 train_state.step += 1
