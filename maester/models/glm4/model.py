@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
-from transformers.integrations import use_kernel_forward_from_hub
+# from transformers.integrations import use_kernel_forward_from_hub
 import math
 import torch
 import torch.nn.functional as F
@@ -39,7 +39,7 @@ class ModelArgs:
     pad_token_id: int = 151329
     eos_token_id: int | list[int] = field(default_factory=lambda: [151329, 151336, 151338])
     bos_token_id: Optional[int] = None
-    attention_bias: bool = False  # Updated to match MoE config default
+    attention_bias: bool = False
     tied_embeddings: bool = False
 
     # MoE-specific parameters
@@ -342,9 +342,10 @@ class Glm4MoeDecoderLayer(nn.Module):
         self.hidden_size = config.dim
 
         self.self_attn = Glm4MoeAttention(config=config, layer_idx=layer_idx)
+        self.moe_enabled = layer_idx >= config.first_k_dense_replace
 
-        if layer_idx >= config.first_k_dense_replace:
-            self.mlp = Glm4MoeMoE(config)
+        if self.moe_enabled:
+            self.moe = Glm4MoeMoE(config)
         else:
             self.mlp = Glm4MoeMLP(config)
 
@@ -370,7 +371,10 @@ class Glm4MoeDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if self.moe_enabled:
+            hidden_states = self.moe(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -444,16 +448,16 @@ class Glm4MoeTextModel(nn.Module):
                 nn.init.normal_(layer.mlp.down_proj.weight, mean=0.0, std=self.config.initializer_range)
             else:  # MoE
                 # Initialize router
-                nn.init.normal_(layer.mlp.gate.weight, mean=0.0, std=self.config.initializer_range)
+                nn.init.normal_(layer.moe.gate.weight, mean=0.0, std=self.config.initializer_range)
                 # Initialize experts
-                for expert in layer.mlp.experts:
+                for expert in layer.moe.experts:
                     nn.init.normal_(expert.gate_proj.weight, mean=0.0, std=self.config.initializer_range)
                     nn.init.normal_(expert.up_proj.weight, mean=0.0, std=self.config.initializer_range)
                     nn.init.normal_(expert.down_proj.weight, mean=0.0, std=self.config.initializer_range)
                 # Initialize shared experts
-                nn.init.normal_(layer.mlp.shared_experts.gate_proj.weight, mean=0.0, std=self.config.initializer_range)
-                nn.init.normal_(layer.mlp.shared_experts.up_proj.weight, mean=0.0, std=self.config.initializer_range)
-                nn.init.normal_(layer.mlp.shared_experts.down_proj.weight, mean=0.0, std=self.config.initializer_range)
+                nn.init.normal_(layer.moe.shared_experts.gate_proj.weight, mean=0.0, std=self.config.initializer_range)
+                nn.init.normal_(layer.moe.shared_experts.up_proj.weight, mean=0.0, std=self.config.initializer_range)
+                nn.init.normal_(layer.moe.shared_experts.down_proj.weight, mean=0.0, std=self.config.initializer_range)
 
             # Initialize normalization layers
             layer.input_layernorm.reset_parameters()
@@ -512,7 +516,7 @@ class Glm4MoeTextModel(nn.Module):
         return cls(model_args)
 
 
-@use_kernel_forward_from_hub("RMSNorm")
+# @use_kernel_forward_from_hub("RMSNorm")
 class Glm4MoeRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
