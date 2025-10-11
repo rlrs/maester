@@ -32,6 +32,7 @@ from maester.lr_scheduling import get_lr_scheduler
 from maester.memory import cleanup_before_training
 from maester.metrics import build_gpu_memory_monitor, build_metric_logger, register_logits_monitoring, WeightScaleMonitor
 from maester.data_monitor import DataMonitor
+from maester.dp_privacy import DPConfig, DPSanitizer, SimplePLDAccountant, no_grad_sync_for_fsdp
 from maester.models import (
     model_name_to_cls,
     models_config,
@@ -297,6 +298,63 @@ def main():
         if cfg.compile:
             loss_fn = torch.compile(loss_fn)
 
+        if cfg.dp_enabled:
+            # GOOD: pick groups explicitly from your 3-D mesh
+            # === DP groups (replace your current block that sets dp_pg/mp_pg) ===
+            dp_repl_pg = None
+            if cfg.dp_enabled and parallel_dims.dp_replicate_enabled:
+                try:
+                    dp_repl_pg = world_mesh["dp_replicate"].get_group()
+                except KeyError:
+                    # Case: only one DP dim named "dp" because dp_shard==1
+                    try:
+                        dp_repl_pg = world_mesh["dp"].get_group()
+                    except KeyError:
+                        dp_repl_pg = None  # single-replica fallback
+
+            def _maybe_get_pg(*dims):
+                try:
+                    return world_mesh[dims].get_group()
+                except KeyError:
+                    return None
+
+            mp_pg = None
+            if cfg.dp_enabled:
+                # Prefer joint TP×DP_shard if both present
+                if parallel_dims.tp_enabled and parallel_dims.dp_shard_enabled:
+                    mp_pg = _maybe_get_pg("tp", "dp_shard")
+                # Fall back to TP only
+                if mp_pg is None and parallel_dims.tp_enabled:
+                    mp_pg = _maybe_get_pg("tp")
+                # Or DP_shard only
+                if mp_pg is None and parallel_dims.dp_shard_enabled:
+                    mp_pg = _maybe_get_pg("dp_shard")
+                # Else mp_pg stays None (no param sharding)
+
+            dp_cfg = DPConfig(C=cfg.dp_clip_norm, sigma=cfg.dp_noise_multiplier)
+            sanitizer = DPSanitizer(model, dp_pg=dp_repl_pg, mp_pg=mp_pg, cfg=dp_cfg)
+
+            # --- loss_fn that produces per-sample losses ---
+            def per_sample_losses(logits, labels, ignore_index=-100):
+                # logits: [B, T, V], labels: [B, T]
+                # CE per token
+                loss_tok = F.cross_entropy(
+                    logits.flatten(0,1).float(), labels.flatten(0,1),
+                    reduction="none", ignore_index=ignore_index
+                ).view(labels.shape)  # [B, T]
+                # mask padding
+                valid = (labels != ignore_index).float()
+                # sum over tokens -> per-sample scalar
+                loss_per_sample = (loss_tok * valid).sum(dim=1)  # [B]
+                return loss_per_sample
+
+            if cfg.compile:
+                per_sample_losses = torch.compile(per_sample_losses, dynamic=True)
+
+            delta = cfg.dp_delta  # e.g., 1.0 / N_priv
+            pld_acc = SimplePLDAccountant(delta=delta)  # FFT-based PLD for Poisson subsampled Gaussian
+            pld_ready = True
+
         # training loop
         cleanup_before_training()
         model.train()
@@ -354,15 +412,9 @@ def main():
 
                     input_ids = batch["input_ids"]
                     labels = batch["labels"]
-
-                    # Get position_ids if available (currently only from packed SFT data)
-                    # TODO: Consider generating position_ids for all data loaders for consistency
                     position_ids = batch.get("position_ids", None)
-
-                    # Get document_ids if available (for flex attention document masking in packed data)
                     document_ids = batch.get("document_ids", None)
 
-                    # Collect padding stats if available (SFT mode)
                     if "stats" in batch and "actual_lengths" in batch["stats"]:
                         padding_lengths_since_last_log.append(batch["stats"]["actual_lengths"])
 
@@ -376,45 +428,129 @@ def main():
                     if document_ids is not None:
                         document_ids = document_ids.cuda()
 
+                    # Preserve your sync policy for accumulation
                     sync_grads_now = True
                     if skip_sync_during_accum:
-                        sync_grads_now = micro_idx == grad_accum_steps - 1
-
+                        sync_grads_now = (micro_idx == grad_accum_steps - 1)
                     if fsdp_can_toggle_sync and grad_accum_steps > 1:
                         model.set_requires_gradient_sync(sync_grads_now)
 
-                    with loss_parallel_ctx():
-                        if cfg.enable_cut_cross_entropy:
-                            loss = model(
-                                input_ids,
-                                labels,
-                                position_ids=position_ids,
-                                document_ids=document_ids,
+                    # === Branch on DP ===
+                    if not cfg.dp_enabled:
+                        # ---------- ORIGINAL NON-DP PATH (unchanged) ----------
+                        with loss_parallel_ctx():
+                            if cfg.enable_cut_cross_entropy:
+                                loss = model(
+                                    input_ids,
+                                    labels,
+                                    position_ids=position_ids,
+                                    document_ids=document_ids,
+                                )
+                            else:
+                                pred = model(
+                                    input_ids,
+                                    position_ids=position_ids,
+                                    document_ids=document_ids,
+                                )
+                                loss = loss_fn(pred, labels)
+                                del pred
+
+                            losses_since_last_log.append(loss.detach())
+                            (loss / grad_accum_steps).backward()
+
+                        if (fsdp_can_toggle_sync and grad_accum_steps > 1 and
+                            skip_sync_during_accum and not sync_grads_now):
+                            model.set_requires_gradient_sync(True)
+
+                    else:
+                        # ---------- DP PATH ----------
+                        # Micro-batch size on this rank
+                        E_local = input_ids.shape[0]
+
+                        # 1) PASS 1: collect per-sample squared norms via hooks
+                        sanitizer.begin_microstep(E_local)
+                        with loss_parallel_ctx():
+                            # forward
+                            logits = model(
+                                input_ids, position_ids=position_ids, document_ids=document_ids
                             )
-                        else:
-                            pred = model(
-                                input_ids,
-                                position_ids=position_ids,
-                                document_ids=document_ids,
+                            loss_i = per_sample_losses(logits, labels)  # [E_local]
+                            del logits
+
+                            # backward on sum to populate ghost norms; avoid grad sync & param grad all-reduce
+                            with no_grad_sync_for_fsdp(model):
+                                loss_i.sum().backward()
+
+                        scales = sanitizer.end_collect_and_compute_scales()  # [E_local]
+
+                        # IMPORTANT: wipe param grads from pass 1; we only want pass-2 grads
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                p.grad = None
+
+                        # 2) PASS 2: recompute, backprop clipped mean
+                        with loss_parallel_ctx():
+                            logits = model(
+                                input_ids, position_ids=position_ids, document_ids=document_ids
                             )
-                            loss = loss_fn(pred, labels)
-                            del pred
+                            loss_i = per_sample_losses(logits, labels)  # [E_local]
+                            assert loss_i.requires_grad, "loss_i lost its graph before DP backprop."
 
-                        losses_since_last_log.append(loss.detach())
-                        scaled_loss = loss / grad_accum_steps
-                        scaled_loss.backward()
+                            # For logging parity, record token-mean "loss" like your original
+                            # (sum over tokens per sample divided by number of valid tokens)
+                            # We approximate via batch mean of per-sample sums divided by seq len of valid tokens on this rank.
+                            # For stability (and same units as before), log the average per-sample sum / tokens_per_sample_mean.
+                            with torch.no_grad():
+                                valid = (labels != -100).float()
+                                denom = valid.sum().clamp_min(1.0)
+                                avg_loss_like = loss_i.sum() / denom
+                            losses_since_last_log.append(avg_loss_like.detach())
 
-                    if (
-                        fsdp_can_toggle_sync
-                        and grad_accum_steps > 1
-                        and skip_sync_during_accum
-                        and not sync_grads_now
-                    ):
-                        model.set_requires_gradient_sync(True)
+                            # Sum across dp_replicate (replicas see different examples)
+                            if parallel_dims.dp_replicate_enabled and dp_repl_pg is not None:
+                                E_repl = torch.tensor([E_local], device=input_ids.device, dtype=torch.int64)
+                                dist.all_reduce(E_repl, op=dist.ReduceOp.SUM, group=dp_repl_pg)
+                                E_repl = int(E_repl.item())
+                            else:
+                                E_repl = E_local
 
-                grad_norms = clip_grad_norm(  # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
-                    model.parameters(), cfg.max_grad_norm, foreach=True
-                )
+                            # Multiply by dp_shard size only if that dim exists AND shards see distinct samples
+                            dp_shard_factor = 1
+                            if parallel_dims.dp_shard_enabled:
+                                try:
+                                    dp_shard_factor = world_mesh["dp_shard"].size()
+                                except KeyError:
+                                    dp_shard_factor = 1  # no such dim in this layout
+
+                            E_global_micro = E_repl * dp_shard_factor
+
+                            # Accumulate per-step total batch (to scale noise ONCE after all microsteps)
+                            if micro_idx == 0:
+                                E_global_accum = E_global_micro
+                            else:
+                                E_global_accum += E_global_micro
+
+                            # Backprop clipped mean for this microstep; grads accumulate across microsteps
+                            sanitizer.backprop_clipped_mean(loss_i, scales, E_global=E_global_micro)
+
+                        if (fsdp_can_toggle_sync and grad_accum_steps > 1 and
+                            skip_sync_during_accum and not sync_grads_now):
+                            model.set_requires_gradient_sync(True)
+
+                # === End of microstep accumulation ===
+                if not cfg.dp_enabled:
+                    # Original clip + step
+                    grad_norms = clip_grad_norm(model.parameters(), cfg.max_grad_norm, foreach=True)
+                else:
+                    # DP: no extra clipping here. Optionally compute diagnostic norms WITHOUT clipping:
+                    grad_list = [p.grad for p in model.parameters() if (p.grad is not None)]
+                    grad_norms = []
+                    if len(grad_list) > 0:
+                        # foreach_norm is cheap; purely for metrics (matches your logging keys)
+                        grad_norms = torch._foreach_norm(grad_list, 2)
+                    # Add identical noise across DP replicas ONCE per step; scale by total E_global over microsteps
+                    sanitizer.add_dp_noise_(optimizer, E_global=E_global_accum, step=train_state.step)
+
                 optimizer.step()
                 scheduler.step()
                 train_state.step += 1
@@ -511,9 +647,16 @@ def main():
                         })
                     for i in range(len(optimizer.param_groups)):
                         metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
-                    for gn, (name, _) in zip(grad_norms, model.named_parameters()):
-                        cn = clean_param_name(name)
-                        metrics[f"{cn}/grad_norm"] = gn
+                    if not cfg.dp_enabled:
+                        # unchanged
+                        for gn, (name, _) in zip(grad_norms, model.named_parameters()):
+                            cn = clean_param_name(name); metrics[f"{cn}/grad_norm"] = gn
+                    else:
+                        # align names with the grads we actually normed
+                        named_with_grad = [(name, p) for name, p in model.named_parameters() if p.grad is not None]
+                        for (name, _), gn in zip(named_with_grad, grad_norms):
+                            cn = clean_param_name(name)
+                            metrics[f"{cn}/grad_norm"] = gn
                     for exp_avg_norm, exp_avg_sq_norm, name in zip(exp_avg_norms, exp_avg_sq_norms, param_names):
                         cn = clean_param_name(name)
                         metrics[f"{cn}/exp_avg_norm"] = exp_avg_norm
@@ -526,6 +669,24 @@ def main():
                     # metrics.update(get_logits_metrics())
                     if weight_scale_stats:
                         metrics.update(weight_scale_stats)
+                    if cfg.dp_enabled:
+                        # local
+                        clip_frac_local = float((scales < 1).float().mean().item())
+                        metrics["dp/clip_frac_local"] = clip_frac_local
+                        # global mean over replicas
+                        if parallel_dims.dp_replicate_enabled and dp_pg is not None:
+                            t = torch.tensor([clip_frac_local], device=input_ids.device, dtype=torch.float32)
+                            dist.all_reduce(t, op=dist.ReduceOp.SUM, group=dp_repl_pg)
+                            t /= dist.get_world_size(dp_pg)
+                            metrics["dp/clip_frac"] = float(t.item())
+                        metrics["dp/C"] = cfg.dp_clip_norm
+                        metrics["dp/sigma"] = cfg.dp_noise_multiplier
+                        metrics["dp/E_global_step"] = float(E_global_accum)
+                        N_priv = cfg.dp_num_privacy_units  # total #examples in *private* set
+                        q_t = float(E_global_accum) / float(N_priv)
+                        pld_acc.add_step(q=q_t, sigma=cfg.dp_noise_multiplier)
+                        metrics["dp/q"] = q_t
+                        metrics["dp/eps@delta"] = pld_acc.epsilon() if pld_ready else float("nan")
                     if metric_logger is not None:
                         metric_logger.log(metrics, step=train_state.step)
 

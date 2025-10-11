@@ -157,6 +157,13 @@ class Config(BaseSettings):
     enable_async_tensor_parallel: bool = False
     enable_compiled_autograd: bool = True
 
+    # differential privacy
+    dp_enabled: bool = False
+    dp_clip_norm: float = 1.0
+    dp_noise_multiplier: float = 1.0
+    dp_num_privacy_units: int = 1
+    dp_delta: float = 1e-6
+
     # profiling
     enable_profiling: bool = True
     enable_memory_snapshot: bool = False
