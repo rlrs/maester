@@ -9,10 +9,9 @@ weights that Maester expects (`wq`, `wkv_a`, `wkv_b`, `kv_norm`).
 
 Example usage::
 
-    python scripts/convert_to_mla.py \
-        --checkpoint ckpts/mha.pt \
-        --output-dir artifacts/mha_to_mla \
-        --num-heads 32 --rope-dim 64 --latent-rank 128
+    python scripts/convert_to_mla.py --checkpoint models/comma-v0.1-2t-dcp/ --output-dir models/comma-v0.1-2t-mla-dcp/ \
+    --num-heads 32 --rope-dim 32 --latent-rank 64 --model-name llama3 --model-flavor Comma-7B \
+    --tokenizer common-pile/comma-v0.1-2t --rank-docs /work/data/datasets/train/common-pile/v1.0.0/*.parquet
 
 Both consolidated PyTorch checkpoints and Torch Distributed Checkpoint (DCP)
 directories are supported.
@@ -33,6 +32,8 @@ from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.metadata import Metadata, STATE_DICT_TYPE, TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict_loader import _load_state_dict as dcp_load_state_dict
 
+from compute_mla_rank import compute_rank_tensor
+from maester.models import models_config
 from maester.upgrades.gqa import detect_hidden_size, detect_num_layers
 
 
@@ -55,11 +56,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Override inferred transformer layer count",
     )
-    parser.add_argument(
-        "--dtype",
-        default=None,
-        help="Optional dtype override when saving (e.g. float16)",
-    )
+    parser.add_argument("--dtype", default=None, help="Optional dtype override when saving (e.g. float16)")
     parser.add_argument(
         "--model-name",
         default=None,
@@ -95,6 +92,65 @@ def _parse_args() -> argparse.Namespace:
         help="Directory name for the converted DCP (defaults to output dir)",
     )
     parser.add_argument("--overwrite", action="store_true", help="Allow reusing an existing output directory")
+    parser.add_argument(
+        "--qk-rank",
+        type=Path,
+        default=None,
+        help="Path to a pre-computed rank tensor. If omitted, a calibration pass will be run.",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default=None,
+        help="Tokenizer to use when computing ranks (required if --qk-rank is not provided)",
+    )
+    parser.add_argument(
+        "--rank-docs",
+        nargs="+",
+        default=None,
+        help="Calibration documents (files, dirs, or globs) when computing ranks",
+    )
+    parser.add_argument(
+        "--rank-sample-size",
+        type=int,
+        default=1024,
+        help="Number of sequences to use when computing ranks (default: 1024)",
+    )
+    parser.add_argument(
+        "--rank-batch-size",
+        type=int,
+        default=8,
+        help="Batch size during rank computation (default: 8)",
+    )
+    parser.add_argument(
+        "--rank-seq-len",
+        type=int,
+        default=None,
+        help="Sequence length used for rank computation (defaults to model max sequence length)",
+    )
+    parser.add_argument(
+        "--rank-parquet-text-column",
+        type=str,
+        default="text",
+        help="Column name when reading parquet calibration data (default: text)",
+    )
+    parser.add_argument(
+        "--rank-cache",
+        type=Path,
+        default=None,
+        help="Optional path to save the computed rank tensor",
+    )
+    parser.add_argument(
+        "--rank-seed",
+        type=int,
+        default=42,
+        help="RNG seed for rank computation (default: 42)",
+    )
+    parser.add_argument(
+        "--share-rope",
+        action="store_true",
+        help="Average rotary weights across heads to mimic shared RoPE (default: keep per-head weights)",
+    )
     return parser.parse_args()
 
 
@@ -188,22 +244,6 @@ def _svd_factorise(matrix: torch.Tensor, rank: int) -> Tuple[torch.Tensor, torch
     return proj.to(orig_dtype), latent.to(orig_dtype)
 
 
-def _select_2norm_indices(weight: torch.Tensor, top_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return (nope_idx, rope_idx) using per-row 2-norm ranking."""
-
-    # weight shape: (head_dim, hidden_dim)
-    head_dim = weight.size(0)
-    if top_k <= 0 or top_k > head_dim:
-        raise SystemExit("Invalid rope rank relative to head dimension")
-    norms = torch.norm(weight, dim=1)
-    rope_unsorted = torch.argsort(norms, descending=True)[:top_k]
-    rope_idx = torch.sort(rope_unsorted).values
-    mask = torch.ones(head_dim, dtype=torch.bool)
-    mask[rope_idx] = False
-    nope_idx = torch.arange(head_dim, dtype=torch.long)[mask]
-    return nope_idx, rope_idx
-
-
 def _convert_layer(
     wq: torch.Tensor,
     wk: torch.Tensor,
@@ -213,65 +253,104 @@ def _convert_layer(
     rope_dim: int,
     value_dim: int,
     latent_rank: int,
+    layer_rank: torch.Tensor,
+    share_rope: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return (new_wq, wkv_a, wkv_b, kv_norm)."""
+    """Return (new_wq, wkv_a, wkv_b, kv_norm) using joint SVD."""
 
     hidden = wq.size(1)
     head_dim = wq.size(0) // num_heads
     nope_dim = head_dim - rope_dim
-    if value_dim > wv.size(0) // num_heads:
-        raise SystemExit("value_dim exceeds available per-head value rows")
 
-    wq_heads = wq.view(num_heads, head_dim, hidden)
-    wk_heads = wk.view(num_heads, head_dim, hidden)
-    wv_heads = wv.view(num_heads, head_dim, hidden)
+    if layer_rank.shape != (num_heads, head_dim):
+        raise SystemExit("Rank tensor shape mismatch for layer")
+
+    new_wq = torch.empty_like(wq)
+    k_nope_indices = []
+    k_rope_indices = []
+
+    for head in range(num_heads):
+        offset = head * head_dim
+        ranks = layer_rank[head]
+        order = torch.argsort(ranks, descending=False)
+        rope_idx = order[:rope_dim]
+        rope_idx = torch.sort(rope_idx).values
+        mask = torch.ones(head_dim, dtype=torch.bool)
+        mask[rope_idx] = False
+        nope_idx = torch.arange(head_dim, dtype=torch.long)[mask]
+
+        reorder = torch.cat([nope_idx, rope_idx]) + offset
+        new_wq[offset : offset + head_dim] = wq[reorder]
+
+        k_nope_indices.append(nope_idx + offset)
+        k_rope_indices.append(rope_idx + offset)
 
     latent_total = latent_rank * num_heads
     rows = nope_dim + value_dim
 
-    new_wq_heads = []
-    latent_rows = torch.empty(latent_total, hidden, dtype=wq.dtype, device=wq.device)
-    proj_blocks = torch.zeros(num_heads * rows, latent_total, dtype=wq.dtype, device=wq.device)
+    latent_rows = torch.empty(
+        latent_total,
+        hidden,
+        dtype=wk.dtype,
+        device=wk.device,
+    )
+    proj_blocks = torch.zeros(
+        num_heads * rows,
+        latent_total,
+        dtype=wk.dtype,
+        device=wk.device,
+    )
     rope_slices = []
 
-    # Pre-compute value indices using the same 2-norm rule.
-    value_indices_per_head = []
-    for h in range(num_heads):
-        _, v_rope_idx = _select_2norm_indices(wv_heads[h], value_dim)
-        # We only need the selected rows; indices are already sorted ascending.
-        value_indices_per_head.append(v_rope_idx)
+    for head in range(num_heads):
+        head_offset = head * head_dim
+        latent_start = head * latent_rank
+        latent_end = latent_start + latent_rank
 
-    current_latent = 0
-    for h in range(num_heads):
-        k_nope_idx, k_rope_idx = _select_2norm_indices(wk_heads[h], rope_dim)
+        if nope_dim > 0:
+            k_nope_weight = wk[k_nope_indices[head]]
+        else:
+            k_nope_weight = wk.new_empty((0, hidden))
+        k_rope_weight = wk[k_rope_indices[head]]
+        v_weight_head = wv[head_offset : head_offset + head_dim]
 
-        reorder_idx = torch.cat([k_nope_idx, k_rope_idx])
-        # Reorder query rows to [nope, rope] to match runtime split.
-        new_wq_heads.append(wq_heads[h][reorder_idx])
+        joint = torch.cat([k_nope_weight, v_weight_head], dim=0)
+        proj, latent = _svd_factorise(joint, latent_rank)
 
-        k_nope_weight = wk_heads[h][k_nope_idx][:nope_dim]
-        k_rope_weight = wk_heads[h][k_rope_idx][:rope_dim]
-        v_weight = wv_heads[h][value_indices_per_head[h]][:value_dim]
+        proj_k = proj[:nope_dim]
+        proj_v_all = proj[nope_dim:]
 
-        stacked = torch.cat([k_nope_weight, v_weight], dim=0)
-        proj, latent = _svd_factorise(stacked, latent_rank)
+        if value_dim < head_dim:
+            v_norm = torch.norm(v_weight_head, dim=1)
+            top_v = torch.argsort(v_norm, descending=True)[:value_dim]
+            top_v = torch.sort(top_v).values
+            proj_v = proj_v_all[top_v]
+        elif value_dim == head_dim:
+            proj_v = proj_v_all
+        else:
+            raise SystemExit("value_dim cannot exceed head_dim")
 
-        start = current_latent
-        end = start + latent_rank
-        latent_rows[start:end] = latent
+        block_start = head * rows
+        block_mid = block_start + nope_dim
+        block_end = block_mid + value_dim
 
-        block_start = h * rows
-        block_end = block_start + rows
-        proj_blocks[block_start:block_end, start:end] = proj
+        if nope_dim > 0:
+            proj_blocks[block_start:block_mid, latent_start:latent_end] = proj_k
+        proj_blocks[block_mid:block_end, latent_start:latent_end] = proj_v
 
+        latent_rows[latent_start:latent_end] = latent
         rope_slices.append(k_rope_weight)
-        current_latent = end
 
-    rope_tensor = torch.stack(rope_slices, dim=0).mean(dim=0)
-    wkv_a = torch.cat([latent_rows, rope_tensor], dim=0)
+    rope_stack = torch.stack(rope_slices, dim=0)
+    if share_rope:
+        rope_tensor = rope_stack.mean(dim=0)
+    else:
+        rope_tensor = rope_stack.reshape(num_heads * rope_dim, hidden)
+
+    wkv_a = torch.cat([latent_rows, rope_tensor], dim=0).to(wq.dtype)
+    proj_blocks = proj_blocks.to(wq.dtype)
     kv_norm = torch.ones(latent_total, dtype=wq.dtype, device=wq.device)
 
-    new_wq = torch.cat(new_wq_heads, dim=0)
     return new_wq, wkv_a, proj_blocks, kv_norm
 
 
@@ -290,6 +369,7 @@ def _write_config_overlay(
     nope_dim: int,
     value_dim: int,
     latent_rank: int,
+    share_rope: bool,
 ) -> None:
     overlay = {
         "model_name": model_name,
@@ -305,6 +385,7 @@ def _write_config_overlay(
             "mla_rope_dim": rope_dim,
             "mla_nope_dim": nope_dim,
             "mla_value_dim": value_dim,
+            "mla_share_rope": share_rope,
         },
     }
     with path.open("w") as fh:
@@ -315,12 +396,51 @@ def main() -> None:
     args = _parse_args()
     _ensure_output_dir(args.output_dir, overwrite=args.overwrite)
 
+    rank_tensor_path: Path | None = None
+    if args.qk_rank is not None:
+        rank_tensor_path = args.qk_rank
+        rank_tensor = torch.load(rank_tensor_path, map_location="cpu").to(torch.int16)
+    else:
+        if not args.model_name or not args.model_flavor:
+            raise SystemExit("--model-name and --model-flavor are required when computing ranks")
+        if args.tokenizer is None:
+            raise SystemExit("--tokenizer is required when computing ranks")
+        if not args.rank_docs:
+            raise SystemExit("--rank-docs must be provided when computing ranks")
+
+        base_model_args = models_config[args.model_name][args.model_flavor]
+        default_seq_len = getattr(base_model_args, "max_seq_len", 2048)
+        rank_seq_len = args.rank_seq_len or default_seq_len
+
+        rank_tensor = compute_rank_tensor(
+            checkpoint=args.checkpoint,
+            model_name=args.model_name,
+            model_flavor=args.model_flavor,
+            tokenizer_name=args.tokenizer,
+            docs=args.rank_docs,
+            sample_size=args.rank_sample_size,
+            batch_size=args.rank_batch_size,
+            seq_len=rank_seq_len,
+            parquet_text_column=args.rank_parquet_text_column,
+            device=None,
+            dtype=args.dtype,
+            checkpoint_key=None,
+            seed=args.rank_seed,
+        ).to(torch.int16)
+
+        rank_tensor_path = args.rank_cache or (args.output_dir / "qk_rank.pth")
+        rank_tensor_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(rank_tensor, rank_tensor_path)
+        print(f"Saved rank tensor to {rank_tensor_path}")
+
     state = _load_state_dict(args.checkpoint)
 
     num_layers = args.num_layers or detect_num_layers(state)
     hidden_size = detect_hidden_size(state)
 
-    sample_wq = state[_layer_key(0, "wq.weight")]
+    sample_wq = state.get(_layer_key(0, "wq.weight"))
+    if sample_wq is None:
+        raise SystemExit("Unable to locate layers.0.attention.wq.weight in checkpoint")
     num_heads = args.num_heads
     head_dim = sample_wq.size(0) // num_heads
 
@@ -334,8 +454,17 @@ def main() -> None:
     if latent_rank <= 0:
         raise SystemExit("--latent-rank must be positive")
 
+    if rank_tensor.dim() != 3:
+        raise SystemExit("Rank tensor must have shape [num_layers, num_heads, head_dim]")
+    if rank_tensor.shape[0] < num_layers or rank_tensor.shape[1] != num_heads or rank_tensor.shape[2] != head_dim:
+        raise SystemExit("Rank tensor shape does not match model dimensions")
+
     rope_dim = int(rope_dim)
     nope_dim = head_dim - rope_dim
+    if latent_rank > (nope_dim + value_dim):
+        raise SystemExit(
+            f"--latent-rank ({latent_rank}) exceeds available rows per head ({nope_dim + value_dim})"
+        )
     latent_total = latent_rank * num_heads
 
     for layer in range(num_layers):
@@ -353,6 +482,8 @@ def main() -> None:
             rope_dim=rope_dim,
             value_dim=value_dim,
             latent_rank=latent_rank,
+            layer_rank=rank_tensor[layer],
+            share_rope=args.share_rope,
         )
 
         state[_layer_key(layer, "wq.weight")] = new_wq
@@ -403,6 +534,8 @@ def main() -> None:
         "mla_value_dim": value_dim,
         "mla_rope_dim": rope_dim,
         "mla_nope_dim": nope_dim,
+        "mla_share_rope": args.share_rope,
+        "qk_rank_path": str(rank_tensor_path) if rank_tensor_path is not None else None,
     }
 
     manifest_path = args.manifest_out or args.output_dir / "manifest.json"
@@ -419,6 +552,7 @@ def main() -> None:
             nope_dim=nope_dim,
             value_dim=value_dim,
             latent_rank=latent_rank,
+            share_rope=args.share_rope,
         )
 
     print(f"Converted checkpoint saved to {checkpoint_out}")

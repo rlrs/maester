@@ -57,6 +57,7 @@ class ModelArgs:
     qk_nope_head_dim: Optional[int] = None
     v_head_dim: Optional[int] = None
     mla_mscale: float = 1.0
+    mla_share_rope: bool = False # this is non-standard, but part of MHA2MLA
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
@@ -291,8 +292,12 @@ class MultiLatentAttention(nn.Module):
             self.q_norm = None
             self.wq_b = None
 
+        self.mla_share_rope = getattr(model_args, "mla_share_rope", True)
+        rope_multiplier = 1 if self.mla_share_rope else self.n_heads
+        self.k_pe_features = self.qk_rope_head_dim * rope_multiplier
+
         self.wkv_a = nn.Linear(
-            self.dim, self.kv_lora_rank + self.qk_rope_head_dim, bias=False
+            self.dim, self.kv_lora_rank + self.k_pe_features, bias=False
         )
         self.kv_norm = create_norm(
             model_args.norm_type,
@@ -346,9 +351,8 @@ class MultiLatentAttention(nn.Module):
         )
 
         kv = self.wkv_a(x)
-        kv_latent, k_pe = torch.split(
-            kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
+        kv_latent = kv[..., : self.kv_lora_rank]
+        k_pe = kv[..., self.kv_lora_rank :]
 
         kv_latent = self.kv_norm(kv_latent)
         kv_proj = self.wkv_b(kv_latent)
@@ -360,7 +364,10 @@ class MultiLatentAttention(nn.Module):
             kv_proj, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
 
-        k_pe = k_pe.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
+        if self.mla_share_rope:
+            k_pe = k_pe.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
+        else:
+            k_pe = k_pe.view(bs, seqlen, self.n_heads, self.qk_rope_head_dim)
         q_pe, k_pe = apply_rotary_emb(q_pe, k_pe, freqs_cis=freqs_cis)
         q = torch.cat([q_nope, q_pe], dim=-1)
         k = torch.cat([k_nope, k_pe], dim=-1)

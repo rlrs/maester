@@ -80,19 +80,18 @@ llama3_configs = {
         dim=4096,
         n_layers=32,
         n_heads=32,
-        n_kv_heads=8,
         rope_theta=100000,
+        vocab_size=64256,
 
         use_mla=True,
-        # Shared latent cache
-        kv_lora_rank=512, # d_c
-        qk_rope_head_dim=64, # d_h^R
-        # qk_nope_head_dim=96,
-        mla_rope_dim=32,
-        mla_nope_dim=96,
-        mla_value_dim=96,
-        v_head_dim=96,
-        mla_mscale=1.0,
+        kv_lora_rank=2048, # d_c
+        qk_rope_head_dim=32, # d_h^R
+        qk_nope_head_dim=96,
+        # mla_rope_dim=64,
+        # mla_nope_dim=64,
+        # mla_value_dim=128,
+        v_head_dim=128,
+        # mla_mscale=1.0,
         q_lora_rank=0,
     ),
     "1B-v2": ModelArgs(
