@@ -301,35 +301,28 @@ def main():
         if cfg.dp_enabled:
             # GOOD: pick groups explicitly from your 3-D mesh
             # === DP groups (replace your current block that sets dp_pg/mp_pg) ===
+            # --- Process groups ---
             dp_repl_pg = None
-            if cfg.dp_enabled and parallel_dims.dp_replicate_enabled:
+            try:
+                dp_repl_pg = world_mesh["dp_replicate"].get_group()
+            except Exception:
                 try:
-                    dp_repl_pg = world_mesh["dp_replicate"].get_group()
-                except KeyError:
-                    # Case: only one DP dim named "dp" because dp_shard==1
-                    try:
-                        dp_repl_pg = world_mesh["dp"].get_group()
-                    except KeyError:
-                        dp_repl_pg = None  # single-replica fallback
-
-            def _maybe_get_pg(*dims):
-                try:
-                    return world_mesh[dims].get_group()
-                except KeyError:
-                    return None
+                    dp_repl_pg = world_mesh["dp"].get_group()
+                except Exception:
+                    dp_repl_pg = None  # single replica
 
             mp_pg = None
-            if cfg.dp_enabled:
-                # Prefer joint TP×DP_shard if both present
-                if parallel_dims.tp_enabled and parallel_dims.dp_shard_enabled:
-                    mp_pg = _maybe_get_pg("tp", "dp_shard")
-                # Fall back to TP only
-                if mp_pg is None and parallel_dims.tp_enabled:
-                    mp_pg = _maybe_get_pg("tp")
-                # Or DP_shard only
-                if mp_pg is None and parallel_dims.dp_shard_enabled:
-                    mp_pg = _maybe_get_pg("dp_shard")
-                # Else mp_pg stays None (no param sharding)
+            try:
+                # Prefer shard×TP if you have both; else TP; else shard; else None
+                mp_pg = world_mesh["tp","dp_shard"].get_group()
+            except Exception:
+                try:
+                    mp_pg = world_mesh["tp"].get_group()
+                except Exception:
+                    try:
+                        mp_pg = world_mesh["dp_shard"].get_group()
+                    except Exception:
+                        mp_pg = None
 
             dp_cfg = DPConfig(C=cfg.dp_clip_norm, sigma=cfg.dp_noise_multiplier)
             sanitizer = DPSanitizer(model, dp_pg=dp_repl_pg, mp_pg=mp_pg, cfg=dp_cfg)
@@ -455,7 +448,7 @@ def main():
                                 loss = loss_fn(pred, labels)
                                 del pred
 
-                            losses_since_last_log.append(loss.detach())
+                            losses_since_last_log.append(float(loss.detach()))
                             (loss / grad_accum_steps).backward()
 
                         if (fsdp_can_toggle_sync and grad_accum_steps > 1 and
@@ -504,7 +497,7 @@ def main():
                                 valid = (labels != -100).float()
                                 denom = valid.sum().clamp_min(1.0)
                                 avg_loss_like = loss_i.sum() / denom
-                            losses_since_last_log.append(avg_loss_like.detach())
+                            losses_since_last_log.append(float(avg_loss_like.detach()))
 
                             # Sum across dp_replicate (replicas see different examples)
                             if parallel_dims.dp_replicate_enabled and dp_repl_pg is not None:
@@ -548,9 +541,46 @@ def main():
                     if len(grad_list) > 0:
                         # foreach_norm is cheap; purely for metrics (matches your logging keys)
                         grad_norms = torch._foreach_norm(grad_list, 2)
-                    # Add identical noise across DP replicas ONCE per step; scale by total E_global over microsteps
+                        grad_norms = [float(t.item()) for t in grad_norms]  # after foreach_norm
+                    # (A) Sum/avg grads across DP replicas – handle DTensor grads safely
+                    if dp_repl_pg is not None and dist.get_world_size(dp_repl_pg) > 1:
+                        world = dist.get_world_size(dp_repl_pg)
+                        with torch.no_grad():
+                            for p in model.parameters():
+                                g = getattr(p, "grad", None)
+                                if g is None:
+                                    continue
+                                # IMPORTANT: don't call dist.all_reduce on a DTensor – operate on its local shard.
+                                if hasattr(torch.distributed.tensor, "DTensor") and isinstance(g, torch.distributed.tensor.DTensor):
+                                    local = g.to_local()  # regular Tensor on this rank
+                                    dist.all_reduce(local, op=dist.ReduceOp.SUM, group=dp_repl_pg)
+                                    local.div_(world)
+                                else:
+                                    dist.all_reduce(g, op=dist.ReduceOp.SUM, group=dp_repl_pg)
+                                    g.div_(world)
+                    if cfg.dp_assert:
+                        def _pick_big_param_with_grad(model):
+                            best = None
+                            best_n = -1
+                            for p in model.parameters():
+                                if p.grad is None:
+                                    continue
+                                n = p.numel()
+                                if n > best_n:
+                                    best, best_n = p, n
+                            return best, best_n
+                        # (B) Add identical Gaussian noise (scale by total E_global across microsteps)
+                        # BEFORE sanitizer.add_dp_noise_
+                        p_probe, _ = _pick_big_param_with_grad(model)
+                        g_before_probe = (p_probe.grad.to_local() if hasattr(p_probe.grad, "to_local") else p_probe.grad).detach().clone()
                     sanitizer.add_dp_noise_(optimizer, E_global=E_global_accum, step=train_state.step)
-
+                    if cfg.dp_assert:
+                        # AFTER sanitizer.add_dp_noise_
+                        g_after_probe = (p_probe.grad.to_local() if hasattr(p_probe.grad, "to_local") else p_probe.grad)
+                        delta = (g_after_probe - g_before_probe).float()
+                        est_std = float(delta.view(-1)[:262144].std().item())
+                        expected = (cfg.dp_noise_multiplier * cfg.dp_clip_norm) / float(E_global_accum)
+                        assert est_std > 0 and abs(est_std/expected - 1) <= 0.3, "Same-step DP noise std off."
                 optimizer.step()
                 scheduler.step()
                 train_state.step += 1
@@ -562,7 +592,7 @@ def main():
 
                 # log metrics
                 if train_state.step == 1 or train_state.step % cfg.log_freq == 0:
-                    losses = [l.detach().item() for l in losses_since_last_log]
+                    losses = losses_since_last_log[:]
                     avg_loss, max_loss = (
                         np.mean(losses),
                         np.max(losses),
@@ -579,15 +609,19 @@ def main():
                     exp_avgs, exp_avg_sqs, param_names = [], [], []
                     for group in optimizer.param_groups:
                         for p in group['params']:
-                            if p.grad is None:
-                                continue
                             state = optimizer.state[p]
-                            if 'exp_avg' in state:  # Check if states initialized
-                                exp_avgs.append(state['exp_avg'])
-                                exp_avg_sqs.append(state['exp_avg_sq'])
-                                param_names.append(param_to_name[p])
-                    exp_avg_norms = torch._foreach_norm(exp_avgs, 2)
-                    exp_avg_sq_norms = torch._foreach_norm(exp_avg_sqs, 2)
+                            if not state:
+                                continue
+                            ea = state.get('exp_avg', None)
+                            es = state.get('exp_avg_sq', None)
+                            if ea is not None and es is not None:
+                                exp_avgs.append(ea); exp_avg_sqs.append(es)
+                                param_names.append(param_to_name.get(p, "<unnamed>"))
+                    if exp_avgs:
+                        exp_avg_norms = [float(t.item()) for t in torch._foreach_norm(exp_avgs, 2)]
+                        exp_avg_sq_norms = [float(t.item()) for t in torch._foreach_norm(exp_avg_sqs, 2)]
+                    else:
+                        exp_avg_norms, exp_avg_sq_norms = [], []
 
                     time_delta = timer() - time_last_log
 
@@ -670,23 +704,26 @@ def main():
                     if weight_scale_stats:
                         metrics.update(weight_scale_stats)
                     if cfg.dp_enabled:
-                        # local
-                        clip_frac_local = float((scales < 1).float().mean().item())
-                        metrics["dp/clip_frac_local"] = clip_frac_local
-                        # global mean over replicas
-                        if parallel_dims.dp_replicate_enabled and dp_pg is not None:
-                            t = torch.tensor([clip_frac_local], device=input_ids.device, dtype=torch.float32)
-                            dist.all_reduce(t, op=dist.ReduceOp.SUM, group=dp_repl_pg)
-                            t /= dist.get_world_size(dp_pg)
-                            metrics["dp/clip_frac"] = float(t.item())
                         metrics["dp/C"] = cfg.dp_clip_norm
                         metrics["dp/sigma"] = cfg.dp_noise_multiplier
                         metrics["dp/E_global_step"] = float(E_global_accum)
-                        N_priv = cfg.dp_num_privacy_units  # total #examples in *private* set
+
+                        # local clip fraction
+                        metrics["dp/clip_frac_local"] = float((scales < 1).float().mean().item())
+
+                        # global clip fraction (average over DP replicas)
+                        if dp_repl_pg is not None and dist.get_world_size(dp_repl_pg) > 1:
+                            t = torch.tensor([metrics["dp/clip_frac_local"]], device=input_ids.device, dtype=torch.float32)
+                            dist.all_reduce(t, op=dist.ReduceOp.SUM, group=dp_repl_pg)
+                            t /= dist.get_world_size(dp_repl_pg)
+                            metrics["dp/clip_frac"] = float(t.item())
+
+                        # privacy accounting
+                        N_priv = cfg.dp_num_privacy_units
                         q_t = float(E_global_accum) / float(N_priv)
                         pld_acc.add_step(q=q_t, sigma=cfg.dp_noise_multiplier)
                         metrics["dp/q"] = q_t
-                        metrics["dp/eps@delta"] = pld_acc.epsilon() if pld_ready else float("nan")
+                        metrics["dp/eps@delta"] = pld_acc.epsilon()
                     if metric_logger is not None:
                         metric_logger.log(metrics, step=train_state.step)
 

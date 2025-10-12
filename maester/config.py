@@ -163,6 +163,7 @@ class Config(BaseSettings):
     dp_noise_multiplier: float = 1.0
     dp_num_privacy_units: int = 1
     dp_delta: float = 1e-6
+    dp_assert: bool = False
 
     # profiling
     enable_profiling: bool = True
