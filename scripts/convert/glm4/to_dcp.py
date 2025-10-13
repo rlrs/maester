@@ -69,13 +69,16 @@ def convert_hf_tensors(safetensors_files: List[Path]) -> Dict[str, torch.Tensor]
     """Load HF shards and map keys to our internal GLM4 names, leaving temps for grouping."""
     state: Dict[str, torch.Tensor] = {}
 
-    for fp in safetensors_files:
+    n_files = len(safetensors_files)
+    for i, fp in enumerate(safetensors_files):
         with safe_open(fp, framework="pt", device="cpu") as f:
+            print(f"Loading {fp} ({i+1}/{n_files})")
             for key in f.keys():
                 tensor = f.get_tensor(key)
                 new_key = map_hf_key_glm4(key)
                 if new_key:
-                    state[new_key] = tensor.clone()
+                    # Keep single copy in memory; avoid clone
+                    state[new_key] = tensor
                 else:
                     print(f"Warning: Unmapped key {key}")
     return state
