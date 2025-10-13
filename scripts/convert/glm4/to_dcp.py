@@ -51,7 +51,9 @@ def group_expert_weights(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch
         else:
             new_state[k] = v
 
-    for group_key, experts in expert_groups.items():
+    n_groups = len(expert_groups)
+    for i, (group_key, experts) in enumerate(expert_groups.items()):
+        print(f"Grouping {group_key} ({i+1}/{n_groups})")
         max_idx = max(experts.keys())
         ex_list: List[torch.Tensor] = []
         proto = next(iter(experts.values()))
