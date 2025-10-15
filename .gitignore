@@ -20,3 +20,5 @@ separate-logs/
 *.distcp
 
 wandb/
+
+data/
