@@ -42,12 +42,12 @@ def group_expert_weights(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch
             layer_idx = parts[1]
             expert_idx = int(parts[4])
             wtype = parts[5]
-            group_key = f"layers.{layer_idx}.moe.experts.{wtype}"
+            group_key = f"model.layers.{layer_idx}.moe.experts.{wtype}"
             expert_groups.setdefault(group_key, {})[expert_idx] = v
         elif k.startswith("__shared__"):
             actual_key = k[len("__shared__"):]
-            transposed = v.t()
-            new_state[actual_key] = transposed.unsqueeze(0)
+            transposed = v#.t()
+            new_state["model." + actual_key] = transposed#.unsqueeze(0)
         else:
             new_state[k] = v
 
@@ -59,7 +59,7 @@ def group_expert_weights(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch
         proto = next(iter(experts.values()))
         for i in range(max_idx + 1):
             if i in experts:
-                ex_list.append(experts[i].t())  # [in, out]
+                ex_list.append(experts[i])#.t())  # [in, out]
             else:
                 ex_list.append(torch.zeros(proto.shape[1], proto.shape[0], dtype=proto.dtype))
         grouped = torch.stack(ex_list, dim=0)  # [num_experts, in, out]
@@ -105,7 +105,7 @@ def map_hf_key_glm4(key: str) -> str | None:
     if key == "model.embed_tokens.weight":
         return "tok_embeddings.weight"
     if key == "model.norm.weight":
-        return "norm.weight"
+        return "model.norm.weight"
     if key == "lm_head.weight":
         return "output.weight"
 
@@ -117,67 +117,65 @@ def map_hf_key_glm4(key: str) -> str | None:
         # Attention
         if f"model.layers.{layer_idx}.self_attn." in key:
             if key.endswith("q_proj.weight"):
-                return f"layers.{layer_idx}.self_attn.q_proj.weight"
+                return f"model.layers.{layer_idx}.self_attn.q_proj.weight"
             if key.endswith("k_proj.weight"):
-                return f"layers.{layer_idx}.self_attn.k_proj.weight"
+                return f"model.layers.{layer_idx}.self_attn.k_proj.weight"
             if key.endswith("v_proj.weight"):
-                return f"layers.{layer_idx}.self_attn.v_proj.weight"
+                return f"model.layers.{layer_idx}.self_attn.v_proj.weight"
             if key.endswith("o_proj.weight"):
-                return f"layers.{layer_idx}.self_attn.o_proj.weight"
+                return f"model.layers.{layer_idx}.self_attn.o_proj.weight"
 
             # biases (when ModelArgs.attention_bias = True)
             if key.endswith("q_proj.bias"):
-                return f"layers.{layer_idx}.self_attn.q_proj.bias"
+                return f"model.layers.{layer_idx}.self_attn.q_proj.bias"
             if key.endswith("k_proj.bias"):
-                return f"layers.{layer_idx}.self_attn.k_proj.bias"
+                return f"model.layers.{layer_idx}.self_attn.k_proj.bias"
             if key.endswith("v_proj.bias"):
-                return f"layers.{layer_idx}.self_attn.v_proj.bias"
+                return f"model.layers.{layer_idx}.self_attn.v_proj.bias"
             # Note: o_proj has bias=False in the model
 
         # Norms
         if key.endswith("input_layernorm.weight"):
-            return f"layers.{layer_idx}.input_layernorm.weight"
+            return f"model.layers.{layer_idx}.input_layernorm.weight"
         if key.endswith("post_attention_layernorm.weight"):
-            return f"layers.{layer_idx}.post_attention_layernorm.weight"
+            return f"model.layers.{layer_idx}.post_attention_layernorm.weight"
 
         # MLP / MoE
         if f"model.layers.{layer_idx}.mlp." in key:
             # Router (MoE)
             if key.endswith("mlp.gate.weight"):
-                # match Glm4MoeMoE.gate (Glm4MoeTopkRouter).weight
-                return f"layers.{layer_idx}.moe.gate.weight"
+                return f"model.layers.{layer_idx}.moe.router.gate.weight"
             if key.endswith("mlp.gate.e_score_correction_bias"):
-                # match Glm4MoeTopkRouter.e_score_correction_bias (buffer)
-                return f"layers.{layer_idx}.moe.gate.e_score_correction_bias"
+                return f"model.layers.{layer_idx}.moe.expert_bias"
 
             # Shared experts (MoE)
             if ".mlp.shared_experts." in key:
                 if key.endswith("gate_proj.weight"):
-                    return f"__shared__layers.{layer_idx}.moe.shared_expert.w1"
+                    return f"__shared__layers.{layer_idx}.moe.shared_experts.w1.weight" # note "expert" vs "experts"!
                 if key.endswith("up_proj.weight"):
-                    return f"__shared__layers.{layer_idx}.moe.shared_expert.w3"
+                    return f"__shared__layers.{layer_idx}.moe.shared_experts.w3.weight"
                 if key.endswith("down_proj.weight"):
-                    return f"__shared__layers.{layer_idx}.moe.shared_expert.w2"
+                    return f"__shared__layers.{layer_idx}.moe.shared_experts.w2.weight"
 
             # Routed experts (MoE)
             if ".mlp.experts." in key:
                 # model.layers.L.mlp.experts.E.{gate_proj,up_proj,down_proj}.weight
                 expert_idx = parts[5]
                 if key.endswith("gate_proj.weight"):
-                    return f"__group__layers.{layer_idx}.moe.experts.{expert_idx}.w1"
+                    return f"__group__layers.{layer_idx}.moe.experts.{expert_idx}.w1.weight"
                 if key.endswith("up_proj.weight"):
-                    return f"__group__layers.{layer_idx}.moe.experts.{expert_idx}.w3"
+                    return f"__group__layers.{layer_idx}.moe.experts.{expert_idx}.w3.weight"
                 if key.endswith("down_proj.weight"):
-                    return f"__group__layers.{layer_idx}.moe.experts.{expert_idx}.w2"
+                    return f"__group__layers.{layer_idx}.moe.experts.{expert_idx}.w2.weight"
 
             # Dense MLP (Air or early dense layers)
             if ("experts" not in key) and ("shared_experts" not in key) and ("mlp.gate." not in key):
                 if key.endswith("gate_proj.weight"):
-                    return f"layers.{layer_idx}.mlp.gate_proj.weight"
+                    return f"model.layers.{layer_idx}.mlp.gate_proj.weight"
                 if key.endswith("up_proj.weight"):
-                    return f"layers.{layer_idx}.mlp.up_proj.weight"
+                    return f"model.layers.{layer_idx}.mlp.up_proj.weight"
                 if key.endswith("down_proj.weight"):
-                    return f"layers.{layer_idx}.mlp.down_proj.weight"
+                    return f"model.layers.{layer_idx}.mlp.down_proj.weight"
 
     # Some HF shards put a duplicate vocab head under the last layer
     # if key.endswith("shared_head.head.weight"):

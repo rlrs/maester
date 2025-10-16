@@ -46,14 +46,14 @@ def parallelize_deepseek(
         )
 
     if config.ac_mode != "none":
-        apply_ac(model, config)
+        apply_ac(model.model, config)
 
     if config.compile:
         if parallel_dims.ep_enabled:
             logger.warning("Compiling MoE layers is broken")
-            apply_compile(model)
+            apply_compile(model.model)
         else:
-            apply_compile(model, fullgraph=False)
+            apply_compile(model.model, fullgraph=False)
 
     dp_mesh: DeviceMesh | None = None
     if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
@@ -217,6 +217,7 @@ def apply_fsdp(
     reduce_dtype: torch.dtype,
     cpu_offload: bool = False,
     reshard_after_forward_policy: str = "default",
+    ep_degree: int = 1,
     dp_mod_ep_mesh: DeviceMesh | None = None,
 ):
     """
@@ -240,7 +241,7 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    for layer_id, transformer_block in model.layers.items():
+    for layer_id, transformer_block in model.model.layers.items():
         if reshard_after_forward_policy == "always":
             reshard_after_forward = True
         elif reshard_after_forward_policy == "never":
@@ -248,15 +249,16 @@ def apply_fsdp(
         elif reshard_after_forward_policy == "default":
             # As an optimization, do not reshard after forward for the last
             # transformer block since FSDP would prefetch it immediately
-            reshard_after_forward = int(layer_id) < len(model.layers) - 1
+            reshard_after_forward = int(layer_id) < len(model.model.layers) - 1
         else:
             raise ValueError(
                 f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
             )
-
+        
         # NOTE: in an MoE layer, the router and the shared experts
         #       are sharded together with the TransformerBlock
-        if transformer_block.moe_enabled and dp_mod_ep_mesh:
+        if transformer_block.moe_enabled and ep_degree > 1: # TODO: fix this
+            print("Applying FSDP with EP")
             fsdp_mod_ep_config = fsdp_config.copy()
             fsdp_mod_ep_config["mesh"] = dp_mod_ep_mesh
             fully_shard(
@@ -264,11 +266,10 @@ def apply_fsdp(
                 **fsdp_mod_ep_config,
                 reshard_after_forward=reshard_after_forward,
             )
-
         fully_shard(
             transformer_block,
             **fsdp_config,
-            reshard_after_forward=reshard_after_forward,
+            reshard_after_forward=True,
         )
     fully_shard(model, **fsdp_config, reshard_after_forward=True)
 
