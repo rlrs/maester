@@ -4,8 +4,12 @@ python scripts/convert_dcp_to_hf.py /path/to/checkpoints/ /path/to/output/ \
 """
 
 import argparse
+import json
 import os
 import re
+from pathlib import Path
+
+from typing import Optional
 
 import torch
 from torch.distributed.checkpoint import FileSystemReader
@@ -19,6 +23,97 @@ from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.state_dict_loader import _load_state_dict
 from transformers import AutoConfig, AutoTokenizer
 import safetensors.torch
+
+try:
+    from maester.models import models_config
+except ImportError:  # pragma: no cover - fallback for standalone use
+    models_config = {}
+
+
+def _find_job_config(start_path: str):
+    """Search upwards from the checkpoint directory for a job config."""
+    path = Path(start_path).resolve()
+    for current in (path, *path.parents):
+        candidate = current / "config.json"
+        if candidate.is_file():
+            try:
+                with candidate.open("r", encoding="utf-8") as handle:
+                    return json.load(handle), candidate
+            except json.JSONDecodeError:
+                print(f"Warning: failed to parse {candidate}, ignoring.")
+    return None, None
+
+
+def _load_model_args(job_config: Optional[dict]):
+    if not job_config:
+        return None
+    model_name = job_config.get("model_name")
+    flavor = job_config.get("flavor")
+    if not model_name or not flavor:
+        return None
+    config_store = models_config.get(model_name)
+    if not config_store:
+        return None
+    return config_store.get(flavor)
+
+
+def _resolve_export_dtype(job_config: Optional[dict]) -> torch.dtype:
+    dtype = torch.bfloat16
+    if not job_config:
+        return dtype
+    candidate = job_config.get("export_dtype") or job_config.get("mixed_precision_param")
+    if not isinstance(candidate, str):
+        return dtype
+    mapping = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "half": torch.float16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    return mapping.get(candidate.lower(), dtype)
+
+
+def _infer_num_layers(state_dict: STATE_DICT_TYPE):
+    layer_ids = []
+    for key in state_dict:
+        if "layers" not in key:
+            continue
+        match = re.search(r"layers.(\d+)", key)
+        if match:
+            layer_ids.append(int(match.group(1)))
+    if not layer_ids:
+        return None
+    return max(layer_ids) + 1
+
+
+def _infer_head_counts(state_dict: STATE_DICT_TYPE, hf_config, model_args, hidden_size: int):
+    num_heads = None
+    if model_args is not None:
+        num_heads = getattr(model_args, "n_heads", None)
+    if num_heads is None:
+        num_heads = getattr(hf_config, "num_attention_heads", None)
+    if num_heads is None:
+        raise ValueError("Unable to determine number of attention heads; provide --base or ensure config.json is available.")
+
+    kv_heads = None
+    wk_weight = state_dict.get('layers.0.attention.wk.weight')
+    if isinstance(wk_weight, torch.Tensor) and hidden_size % num_heads == 0:
+        head_dim = hidden_size // num_heads
+        if head_dim and wk_weight.shape[0] % head_dim == 0:
+            kv_heads = wk_weight.shape[0] // head_dim
+
+    if not kv_heads:
+        if model_args is not None:
+            kv_heads = getattr(model_args, "n_kv_heads", None)
+    if not kv_heads:
+        kv_heads = getattr(hf_config, "num_key_value_heads", None)
+    if not kv_heads:
+        kv_heads = num_heads
+
+    return num_heads, kv_heads
 
 class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
     """
@@ -86,22 +181,40 @@ if __name__ == "__main__":
         sd = sd['model']
     sd = {k.replace('._orig_mod', ''): v for k, v in sd.items()} # fix '_orig_mod' thing...
     print(f"Model keys: {list(sd.keys())}")
+
+    job_config, job_config_path = _find_job_config(src_dir)
+    if job_config_path:
+        print(f"Detected job config at {job_config_path}")
+    model_args = _load_model_args(job_config)
+    if model_args and job_config:
+        print(
+            "Using model metadata: "
+            f"{job_config.get('model_name')}/{job_config.get('flavor')}"
+        )
+
     if args.type == "hf":
         # Build and save HF Config
         print('#' * 30)
         print('Saving HF Model Config...')
         hf_tokenizer = AutoTokenizer.from_pretrained(args.tokenizer if args.tokenizer else args.base)
-        dtype = torch.bfloat16
+        dtype = _resolve_export_dtype(job_config)
         hf_config = AutoConfig.from_pretrained(args.base)
         hf_config.torch_dtype = dtype
-        hf_config.num_hidden_layers = max([int(re.search(r'layers.(\d+)', k).group(1)) for k in sd.keys() if 'layers' in k]) + 1
-        hf_config.hidden_size = sd['layers.0.attention.wq.weight'].shape[0]
-#        hf_config.num_attention_heads = 32 # TODO: read all these from a config
-#        hf_config.num_key_value_heads = 8
+        inferred_layers = _infer_num_layers(sd)
+        if inferred_layers is not None:
+            hf_config.num_hidden_layers = inferred_layers
+        hidden_size = sd['layers.0.attention.wq.weight'].shape[0]
+        hf_config.hidden_size = hidden_size
+        num_heads, kv_heads = _infer_head_counts(sd, hf_config, model_args, hidden_size)
+        hf_config.num_attention_heads = num_heads
+        hf_config.num_key_value_heads = kv_heads
         hf_config.intermediate_size = sd['layers.0.feed_forward.w1.weight'].shape[0]
         hf_config.vocab_size = sd['tok_embeddings.weight'].shape[0]
-        hf_config.bos_token_id = hf_tokenizer.bos_token_id
-        hf_config.eos_token_id = hf_tokenizer.eos_token_id
+        if hf_tokenizer is not None:
+            if hf_tokenizer.bos_token_id is not None:
+                hf_config.bos_token_id = hf_tokenizer.bos_token_id
+            if hf_tokenizer.eos_token_id is not None:
+                hf_config.eos_token_id = hf_tokenizer.eos_token_id
         hf_config.save_pretrained(dst_dir)
         print(hf_config)
 
@@ -197,4 +310,3 @@ if __name__ == "__main__":
         torch.save(sd, dst_dir)
     else:
         raise ValueError(f"Unknown destination type {args.type}")
-

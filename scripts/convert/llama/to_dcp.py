@@ -1,63 +1,116 @@
-import argparse
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
 import json
+import re
+import sys
 from pathlib import Path
 
 import torch
 import torch.distributed.checkpoint as DCP
+from safetensors import safe_open
+
+# support running without installing as a package
+wd = Path(__file__).parent.parent.resolve()
+sys.path.append(str(wd))
+
+from maester.models import models_config
+
 
 @torch.inference_mode()
-def convert_llama_weights(input_dir, output_dir):
-    with open(args.input_dir / "params.json", "r") as f:
-        params = json.load(f)
-    n_layers = params["n_layers"]
-    n_heads = params["n_heads"]
-    dim = params["dim"]
-    dims_per_head = dim // n_heads
+def convert_hf_checkpoint(
+    *,
+    checkpoint_dir: Path,
+    output_dir: Path,
+) -> None:
+    # Load the json file containing weight mapping
+    model_map_json = checkpoint_dir / "model.safetensors.index.json"
 
-    checkpoint_list = sorted([file for file in input_dir.rglob("*.pth")])
-    print(f"Loading from these files: {checkpoint_list}.")
-    shards = [torch.load(ckpt, map_location="cpu", weights_only=True) for ckpt in checkpoint_list]
+    assert model_map_json.is_file()
 
-    n_heads_per_shard = n_heads // len(shards)
-    num_key_value_heads = params["n_kv_heads"]
-    n_kv_heads_per_shard = num_key_value_heads // len(shards)
-    key_value_dim = dims_per_head * num_key_value_heads
+    with open(model_map_json, 'r') as json_map:
+        bin_index = json.load(json_map)
 
-    if len(shards) == 1:
-        state_dict = shards[0]
-    else: # sharded
-        state_dict = {}
-        for layer in range(n_layers):
-            state_dict[f"layers.{layer}.attention_norm.weight"] = shards[0][f"layers.{layer}.attention_norm.weight"].clone() # replicated
-            state_dict[f"layers.{layer}.ffn_norm.weight"] = shards[0][f"layers.{layer}.ffn_norm.weight"].clone() # replicated
+    weight_map = {
+        "model.embed_tokens.weight": "tok_embeddings.weight",
+        "model.layers.{}.self_attn.q_proj.weight": "layers.{}.attention.wq.weight",
+        "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.wk.weight",
+        "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.wv.weight",
+        "model.layers.{}.self_attn.o_proj.weight": "layers.{}.attention.wo.weight",
+        'model.layers.{}.self_attn.rotary_emb.inv_freq': None,
+        'model.layers.{}.mlp.gate_proj.weight': 'layers.{}.feed_forward.w1.weight',
+        "model.layers.{}.mlp.up_proj.weight": "layers.{}.feed_forward.w3.weight",
+        "model.layers.{}.mlp.down_proj.weight": "layers.{}.feed_forward.w2.weight",
+        "model.layers.{}.input_layernorm.weight": "layers.{}.attention_norm.weight",
+        "model.layers.{}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
+        "model.norm.weight": "norm.weight",
+        "lm_head.weight": "output.weight",
+    }
+    bin_files = {checkpoint_dir / bin for bin in bin_index["weight_map"].values()}
 
-            for wn, nh in [("wq", n_heads_per_shard), 
-                           ("wk", n_kv_heads_per_shard), 
-                           ("wv", n_kv_heads_per_shard)]:
-                state_dict[f"layers.{layer}.attention.{wn}.weight"] = torch.cat(
-                    [shards[i][f"layers.{layer}.attention.{wn}.weight"].view(nh, dims_per_head, dim) for i in range(len(shards))], dim=0
-                ).reshape(nh * len(shards) * dims_per_head, dim)
+    config_path = checkpoint_dir / "config.json"
+    with open(config_path, "r", encoding="utf-8") as cfg_file:
+        hf_config = json.load(cfg_file)
+    rope_scaling_cfg = hf_config.get("rope_scaling")
+    if rope_scaling_cfg:
+        raise ValueError(
+            "RoPE scaling detected in the HF checkpoint; Maester's LLaMA implementation currently "
+            "does not support scaled RoPE. Aborting conversion to avoid producing an invalid checkpoint."
+        )
+    hidden_size = hf_config["hidden_size"]
+    num_attention_heads = hf_config["num_attention_heads"]
+    num_key_value_heads = hf_config.get("num_key_value_heads", num_attention_heads)
 
-            state_dict[f"layers.{layer}.attention.wo.weight"] = torch.cat([shards[i][f"layers.{layer}.attention.wo.weight"] for i in range(len(shards))], dim=1)
-            state_dict[f"layers.{layer}.feed_forward.w1.weight"] = torch.cat([shards[i][f"layers.{layer}.feed_forward.w1.weight"] for i in range(len(shards))], dim=0)
-            state_dict[f"layers.{layer}.feed_forward.w2.weight"] = torch.cat([shards[i][f"layers.{layer}.feed_forward.w2.weight"] for i in range(len(shards))], dim=1)
-            state_dict[f"layers.{layer}.feed_forward.w3.weight"] = torch.cat([shards[i][f"layers.{layer}.feed_forward.w3.weight"] for i in range(len(shards))], dim=0)
+    merged_result = {}
+    for file in sorted(bin_files):
+        with safe_open(file, framework="pt", device="cpu") as f:
+            for k in f.keys():
+                merged_result[k] = f.get_tensor(k)
+    final_result = {}
+    
+    def unpermute(w: torch.Tensor, n_heads: int, dim1: int, dim2: int) -> torch.Tensor:
+        w = w.contiguous()
+        return (
+            w.view(n_heads, 2, dim1 // n_heads // 2, dim2)
+             .transpose(1, 2)
+             .reshape(dim1, dim2)
+        )
 
-        state_dict["norm.weight"] = shards[0]["norm.weight"]
-        state_dict["tok_embeddings.weight"] = torch.cat([shards[i]["tok_embeddings.weight"] for i in range(len(shards))], dim=0)
-        state_dict["output.weight"] = torch.cat([shards[i]["output.weight"] for i in range(len(shards))], dim=0)
+    for key, value in merged_result.items():
+        if "layers" in key:
+            abstract_key = re.sub(r'(\d+)', '{}', key)
+            layer_num = re.search(r'\d+', key).group(0)
+            new_key = weight_map[abstract_key]
+            if new_key is None:
+                continue
+            new_key = new_key.format(layer_num)
+        else:
+            new_key = weight_map[key]
 
-    print("Writing to DCP...")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+        if new_key.endswith("attention.wq.weight"):
+            dim_out, dim_in = value.shape
+            value = unpermute(value, num_attention_heads, dim_out, dim_in)
+        elif new_key.endswith("attention.wk.weight"):
+            dim_out, dim_in = value.shape
+            value = unpermute(value, num_key_value_heads, dim_out, dim_in)
+
+        final_result[new_key] = value
+
+    output_dir.mkdir(parents=True, exist_ok=True)
     storage_writer = DCP.filesystem.FileSystemWriter(output_dir)
-    DCP.save({"model": state_dict}, storage_writer=storage_writer)
+    DCP.save({"model": final_result}, 
+             storage_writer=storage_writer)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Convert Llama weights to DCP format.")
-    parser.add_argument(
-        "input_dir", type=Path, help="Input directory with original Llama weights."
-    )
-    parser.add_argument("output_dir", type=Path, help="Output directory for DCP.")
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Convert HuggingFace checkpoint.')
+    parser.add_argument('checkpoint', type=Path, help='Path to the source HF checkpoint directory')
+    parser.add_argument('output', type=Path, help='Destination directory for the DCP checkpoint')
+
     args = parser.parse_args()
-
-    convert_llama_weights(args.input_dir, args.output_dir)
+    convert_hf_checkpoint(
+        checkpoint_dir=args.checkpoint,
+        output_dir=args.output,
+    )
