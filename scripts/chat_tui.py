@@ -260,7 +260,11 @@ class PlainFormatter(PromptFormatter):
         if append_assistant_prefix:
             segments.append("Assistant:")
         prompt = "\n\n".join(segments)
-        return self.tokenizer.encode(prompt, add_special_tokens=True)
+        tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
+        bos_id = getattr(self.tokenizer, "bos_token_id", None)
+        if bos_id is not None and (not tokens or tokens[0] != bos_id):
+            tokens = [bos_id] + tokens
+        return tokens
 
     def stop_token_ids(self) -> set[int]:
         return set(self._stop)
@@ -280,8 +284,6 @@ class RawFormatter(PromptFormatter):
         for message in messages:
             parts.append(message["content"])
         text = "\n".join(parts)
-        if append_assistant_prefix and text:
-            text = text + "\n"
         tokens = self.tokenizer.encode(text, add_special_tokens=False)
         if self.include_bos:
             return [self.tokenizer.bos_token_id] + tokens
