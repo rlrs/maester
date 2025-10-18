@@ -110,15 +110,21 @@ def _run_experts_grouped_mm(
     # )
     # out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
     
-    h = F.silu(
-        torch._grouped_mm(x, w1.transpose(-2, -1), offs=offsets)
-    )
-    h = h * torch._grouped_mm(
-        x, w3.transpose(-2, -1), offs=offsets
-    )
-    out = torch._grouped_mm(h, w2.transpose(-2, -1), offs=offsets).type_as(x)
+    w1_t = w1.transpose(-2, -1).contiguous()
+    w2_t = w2.transpose(-2, -1).contiguous()
+    w3_t = w3.transpose(-2, -1).contiguous()
 
-    return out
+    gate = torch._grouped_mm(x, w1_t, offs=offsets)
+    gate = gate.to(dtype=x.dtype)
+    activated = F.silu(gate)
+
+    up = torch._grouped_mm(x, w3_t, offs=offsets)
+    up = up.to(dtype=x.dtype)
+
+    prod = activated * up
+    out = torch._grouped_mm(prod, w2_t, offs=offsets)
+
+    return out.to(dtype=x.dtype)
 
 class GroupedExperts(nn.Module):
     def __init__(
@@ -240,7 +246,8 @@ class TokenChoiceTopKRouter(nn.Module):
                     Number of tokens assigned to each expert with shape ``(num_experts,)``.
         """
         # scores shape (bs*slen, num_experts)
-        scores = self.gate(x)
+        self.gate = self.gate.to(torch.float32)
+        scores = self.gate(x.float())
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
@@ -255,12 +262,12 @@ class TokenChoiceTopKRouter(nn.Module):
         #       top_scores is still derived from the original scores.
         if expert_bias is not None:
             _, selected_experts_indices = torch.topk(
-                scores + expert_bias, k=self.top_k, dim=1
+                scores + expert_bias, k=self.top_k, dim=1, sorted=False
             )
             top_scores = scores.gather(dim=1, index=selected_experts_indices)
         else:
             top_scores, selected_experts_indices = torch.topk(
-                scores, k=self.top_k, dim=1
+                scores, k=self.top_k, dim=1, sorted=False
             )
 
         # debug override: balanced round-robin routing
@@ -276,12 +283,13 @@ class TokenChoiceTopKRouter(nn.Module):
         top_scores = top_scores * self.route_scale
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
+        # TODO: remove the float() workaround once torch.histc supports integer tensors.
         num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
+            selected_experts_indices.view(-1).float(),
             bins=self.num_experts,
             min=0,
             max=self.num_experts,
-        )
+        ).to(dtype=torch.int32, device=selected_experts_indices.device)
 
         return top_scores, selected_experts_indices, num_tokens_per_expert
 
@@ -327,25 +335,26 @@ class TokenReorderer(nn.Module):
                 - num_tokens_per_expert: Number of tokens assigned to each expert
         """
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
+        # TODO: remove the float() workaround once torch.histc supports integer tensors.
         num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
+            selected_experts_indices.view(-1).float(),
             bins=self.num_experts,
             min=0,
             max=self.num_experts,
-        )
+        ).to(dtype=torch.int32, device=selected_experts_indices.device)
 
-        # Reorder the token indices to match the order of the experts
-        # token_indices_experts_sorted shape (bs*slen*top_k,)
-        token_indices_experts_sorted = torch.argsort(
+        perm = torch.argsort(
             selected_experts_indices.view(-1), stable=True
         )
 
-        top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]
-        token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
+        top_scores_experts_sorted = top_scores.view(-1)[perm]
+        expert_indices_sorted = selected_experts_indices.view(-1)[perm]
+        token_indices_experts_sorted = perm // self.top_k
 
         return (
             top_scores_experts_sorted,
             token_indices_experts_sorted,
+            expert_indices_sorted,
             num_tokens_per_expert,
         )
 
@@ -408,7 +417,9 @@ class MoE(nn.Module):
             out (torch.Tensor): Output tensor with shape ``(bs, slen, dim)``.
         """
         bs, slen, dim = x.shape
+        input_dtype = x.dtype
         x = x.view(-1, dim)
+        x_float = x.to(torch.float32)
 
         # top_scores and selected_experts_indices shape (bs*slen*top_k,)
         # num_tokens_per_expert shape (num_experts,)
@@ -416,7 +427,7 @@ class MoE(nn.Module):
             top_scores,
             selected_experts_indices,
             num_tokens_per_expert,
-        ) = self.router(x, self.expert_bias)
+        ) = self.router(x_float, self.expert_bias)
 
         # tokens_per_expert will be used to update the expert bias for load balancing.
         # and also to count the expert usage
@@ -424,7 +435,7 @@ class MoE(nn.Module):
         #       first in the forward pass, and then in the backward pass. However, this has no
         #       effect on the expert bias update thanks to the torch.sign() operator.
         with torch.no_grad():
-            self.tokens_per_expert.add_(num_tokens_per_expert)
+            self.tokens_per_expert.add_(num_tokens_per_expert.to(torch.float32))
 
         # top_scores and token_indices_experts_sorted shape (bs*slen*top_k,)
         # num_tokens_per_expert shape (num_experts,)
@@ -436,46 +447,45 @@ class MoE(nn.Module):
         #       If tensor_paralllel_degree == expert_tensor_parallel_degree, they agree.
         (
             top_scores_experts_sorted,
-            token_indices_experts_sorted,
+            token_indices_per_entry,
+            expert_indices_sorted,
             num_tokens_per_expert,
         ) = self.reorderer(top_scores, selected_experts_indices)
 
-        # shape (bs*slen*top_k, dim)
-        token_indices_experts_sorted = token_indices_experts_sorted.reshape(
-            -1, 1
-        ).expand(-1, dim)
+        token_indices_experts_sorted = token_indices_per_entry.reshape(-1, 1).expand(-1, dim)
 
-        # shape (bs*slen*top_k, dim)
         routed_input = torch.gather(x, dim=0, index=token_indices_experts_sorted)
 
+        scores_flat = top_scores_experts_sorted.reshape(-1, 1).to(torch.float32)
         if self.score_before_experts:
             routed_input = (
-                routed_input.to(torch.float32)
-                * top_scores_experts_sorted.reshape(-1, 1)
+                routed_input.to(torch.float32) * scores_flat
             ).to(x.dtype)
 
-        # shape (bs*slen*top_k, dim)
         routed_output = self.experts(routed_input, num_tokens_per_expert)
+        routed_output = routed_output.to(torch.float32)
 
-        # shared expert
-        # Note: we execute the shared expert before scoring the output of the routed expert
-        # to "implicitly" overlap the shared expert compute with token combine communication
         if self.shared_experts is not None:
-            out = self.shared_experts(x)
+            out = self.shared_experts(x).to(torch.float32)
         else:
-            out = torch.zeros_like(x)
+            out = torch.zeros_like(x_float, dtype=torch.float32)
 
         if not self.score_before_experts:
-            routed_output = (
-                routed_output.to(torch.float32)
-                * top_scores_experts_sorted.reshape(-1, 1)
-            ).to(x.dtype)
+            routed_output = routed_output * scores_flat
 
-        out = out.scatter_add(
-            dim=0, index=token_indices_experts_sorted, src=routed_output
-        )
+        offset = 0
+        for expert_idx in range(self.experts.num_experts):
+            n = int(num_tokens_per_expert[expert_idx].item())
+            if n == 0:
+                continue
+            slice_indices = slice(offset, offset + n)
+            tokens = token_indices_per_entry[slice_indices]
+            contrib = routed_output[slice_indices]
+            out.index_add_(0, tokens, contrib)
+            offset += n
+
         out = out.reshape(bs, slen, dim)
-        return out
+        return out.to(input_dtype)
 
     def init_weights(
         self,
