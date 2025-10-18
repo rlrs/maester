@@ -7,15 +7,13 @@ generated token runs a full forward pass, mirroring the approach in
 ``eval_perplexity.py``.
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import math
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -32,9 +30,24 @@ from maester.models import model_name_to_cls, models_config
 
 DTYPE_MAP = {
     "float32": torch.float32,
-    "float16": torch.float16,
     "bfloat16": torch.bfloat16,
 }
+
+
+def _cast_non_complex_tensors(module: torch.nn.Module, target_dtype: torch.dtype) -> None:
+    """Cast all real-valued parameters and buffers in ``module`` to ``target_dtype``."""
+
+    for param in module.parameters(recurse=True):
+        if param.is_complex():
+            continue
+        if param.dtype != target_dtype:
+            param.data = param.data.to(target_dtype)
+
+    for buffer in module.buffers(recurse=True):
+        if buffer.is_complex():
+            continue
+        if buffer.dtype != target_dtype:
+            buffer.data = buffer.data.to(target_dtype)
 
 
 def load_config(config_arg: Optional[str]) -> Config:
@@ -86,17 +99,14 @@ def find_checkpoint(cfg: Config, explicit: Optional[str], step: Optional[int]) -
     return root / f"step-{latest}"
 
 
-def prepare_model_and_tokenizer(
-    cfg: Config,
-    device: torch.device,
-    dtype: Optional[torch.dtype],
-) -> tuple[torch.nn.Module, any]:
+def prepare_model_and_tokenizer(cfg: Config) -> tuple[torch.nn.Module, Any]:
     cfg = cfg.model_copy(
         update={
             "compile": False,
             "data_parallel_replicate_degree": 1,
             "data_parallel_shard_degree": 1,
             "tensor_parallel_degree": 1,
+            "expert_parallel_degree": 1,
             "enable_loss_parallel": False,
         }
     )
@@ -117,10 +127,6 @@ def prepare_model_and_tokenizer(
     model_config.max_seq_len = cfg.seq_len
 
     model = model_cls.from_model_args(model_config)
-    if dtype is not None:
-        model.to(device=device, dtype=dtype)
-    else:
-        model.to(device=device)
     model.eval()
 
     return model, tokenizer
@@ -285,6 +291,106 @@ class RawFormatter(PromptFormatter):
         return set(self._stop)
 
 
+class Glm4LayerBlockRunner(torch.nn.Module):
+    """Run GLM4 layers in configurable blocks to limit GPU memory usage."""
+
+    def __init__(
+        self,
+        base_model: torch.nn.Module,
+        block_size: int,
+        device: torch.device,
+        dtype: torch.dtype | None,
+    ) -> None:
+        super().__init__()
+        if block_size <= 0:
+            raise ValueError("block_size must be positive when layer block loading is enabled")
+        self.base_model = base_model
+        self.block_size = block_size
+        self.device = device
+        self._cpu_device = torch.device("cpu")
+        self.model_args = getattr(base_model, "model_args", None)
+        self.config = getattr(base_model, "config", None)
+
+        inference_dtype = dtype or base_model.tok_embeddings.weight.dtype
+        self._inference_dtype = inference_dtype
+        _cast_non_complex_tensors(self.base_model, inference_dtype)
+
+        self._transformer = self.base_model.model
+        self._layers = self._transformer.layers
+        self._layer_keys = list(self._layers.keys())
+
+    def _move_block(self, block_layers: list[torch.nn.Module], target: torch.device) -> None:
+        for layer in block_layers:
+            layer.to(device=target)
+
+    def _compute_positions(
+        self,
+        tokens: torch.Tensor,
+        position_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if position_ids is not None:
+            return position_ids.to(self._cpu_device, non_blocking=True)
+        seq_len = tokens.size(1)
+        positions = torch.arange(seq_len, dtype=torch.long, device=self._cpu_device)
+        return positions.unsqueeze(0).expand(tokens.size(0), -1)
+
+    def _prepare_attention_mask(self, attention_mask: torch.Tensor | None) -> torch.Tensor | None:
+        if attention_mask is None:
+            return None
+        return attention_mask.to(device=self.device, non_blocking=True)
+
+    def _gather_freqs(self, position_ids: torch.Tensor) -> torch.Tensor:
+        freqs = self._transformer.freqs_cis[position_ids]
+        return freqs.unsqueeze(2).to(device=self.device, non_blocking=True)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **_: Any,
+    ) -> torch.Tensor:
+        if labels is not None:
+            raise NotImplementedError("Layer block runner does not support training labels")
+
+        tokens_cpu = tokens.to(self._cpu_device, non_blocking=True)
+        hidden_states = self.base_model.tok_embeddings(tokens_cpu).to(self._inference_dtype)
+        batch_positions = self._compute_positions(tokens_cpu, position_ids)
+
+        hidden_states = hidden_states.to(self.device, non_blocking=True)
+        pos_gpu = batch_positions.to(self.device, non_blocking=True)
+        freqs_cis = self._gather_freqs(batch_positions)
+        attn_mask = self._prepare_attention_mask(attention_mask)
+
+        total_layers = len(self._layer_keys)
+        for start in range(0, total_layers, self.block_size):
+            end = min(start + self.block_size, total_layers)
+            block_keys = self._layer_keys[start:end]
+            block_layers = [self._layers[key] for key in block_keys]
+            self._move_block(block_layers, self.device)
+            for layer in block_layers:
+                hidden_states = layer(
+                    hidden_states=hidden_states,
+                    freqs_cis=freqs_cis,
+                    position_ids=pos_gpu,
+                    attention_mask=attn_mask,
+                )
+            self._move_block(block_layers, self._cpu_device)
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        hidden_states = hidden_states.to(self._cpu_device, non_blocking=True)
+        hidden_states = self._transformer.norm(hidden_states)
+
+        if self.base_model.config.tie_word_embeddings:
+            logits = torch.matmul(hidden_states, self.base_model.tok_embeddings.weight.t())
+        else:
+            logits = self.base_model.output(hidden_states)
+        return logits
+
+
 class ChatEngine:
     def __init__(
         self,
@@ -354,9 +460,10 @@ class ChatEngine:
         generated: list[int] = []
         pieces: list[str] = []
         prompt_len = context_ids.size(0)
+        stop_reason = "length"
 
         start = time.perf_counter()
-        for step in range(params.max_new_tokens):
+        for _ in range(params.max_new_tokens):
             logits = self.model(context_ids.unsqueeze(0))
             next_logits = logits[0, -1]
             token_id = self._sample_next(next_logits, params)
@@ -366,6 +473,7 @@ class ChatEngine:
             if token_id == self.tokenizer.eos_token_id:
                 stop_reason = "eos"
                 break
+
             generated.append(token_id)
             token_tensor = torch.tensor([token_id], device=self.device)
             context_ids = torch.cat([context_ids, token_tensor])
@@ -644,7 +752,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-path", type=str, default=None, help="Explicit checkpoint directory to load")
     parser.add_argument("--checkpoint-step", type=int, default=None, help="Step to load from config dump directory")
     parser.add_argument("--device", type=str, default="auto", help="Torch device (cuda, cuda:0, cpu, auto)")
-    parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "float16", "bfloat16", "float32"], help="Optional dtype override for model weights")
+    parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bfloat16", "float32"], help="Optional dtype override for model weights")
     parser.add_argument("--max-new-tokens", type=int, default=256, help="Maximum tokens to generate per reply")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (set 0 for greedy)")
     parser.add_argument("--top-p", type=float, default=0.95, help="Top-p nucleus sampling parameter")
@@ -665,6 +773,17 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         choices=["auto", "flex", "naive"],
         help="Attention kernel to use (Gemma supports 'flex' or 'naive').",
+    )
+    parser.add_argument(
+        "--layer-block-size",
+        type=int,
+        default=0,
+        help="Number of transformer layers to keep on the GPU at once (0 disables block streaming).",
+    )
+    parser.add_argument(
+        "--upcast-fp32",
+        action="store_true",
+        help="After loading the checkpoint, cast all real-valued tensors to float32 (keeps complex buffers intact).",
     )
     return parser.parse_args()
 
@@ -688,7 +807,7 @@ def main() -> None:
     device = resolve_device(args.device)
     dtype = None if args.dtype == "auto" else DTYPE_MAP[args.dtype]
 
-    model, tokenizer = prepare_model_and_tokenizer(cfg, device, dtype)
+    base_model, tokenizer = prepare_model_and_tokenizer(cfg)
 
     backend_override: str | None
     if args.attention_backend == "auto":
@@ -696,18 +815,48 @@ def main() -> None:
     else:
         backend_override = args.attention_backend
 
+    checkpoint = find_checkpoint(cfg, args.checkpoint_path, args.checkpoint_step)
+    logger.info("Loading checkpoint from %s", checkpoint)
+    dcp.load({"model": ModelWrapper(base_model)}, checkpoint_id=str(checkpoint))
+
+    if dtype is not None:
+        logger.info("Casting real-valued parameters/buffers to %s", dtype)
+        _cast_non_complex_tensors(base_model, dtype)
+    elif args.upcast_fp32:
+        logger.info("Upcasting real-valued parameters/buffers to float32 for inference")
+        _cast_non_complex_tensors(base_model, torch.float32)
+
     if backend_override is not None:
-        if hasattr(model, "set_attention_backend"):
-            model.set_attention_backend(backend_override)  # type: ignore[attr-defined]
+        if hasattr(base_model, "set_attention_backend"):
+            base_model.set_attention_backend(backend_override)  # type: ignore[attr-defined]
             logger.info("Configured attention backend: %s", backend_override)
         elif args.attention_backend != "auto":
             raise ValueError(
                 f"attention backend override '{backend_override}' is not supported for this model"
             )
 
-    checkpoint = find_checkpoint(cfg, args.checkpoint_path, args.checkpoint_step)
-    logger.info("Loading checkpoint from %s", checkpoint)
-    dcp.load({"model": ModelWrapper(model)}, checkpoint_id=str(checkpoint))
+    if args.layer_block_size > 0:
+        if cfg.model_name != "glm4":
+            raise ValueError("Layer block streaming is currently only supported for GLM4 models.")
+        base_model.to(torch.device("cpu"))
+        logger.info(
+            "Running GLM4 with layer block streaming (block_size=%d) on device %s",
+            args.layer_block_size,
+            device,
+        )
+        model = Glm4LayerBlockRunner(
+            base_model=base_model,
+            block_size=args.layer_block_size,
+            device=device,
+            dtype=dtype,
+        )
+    else:
+        base_model.to(device=device)
+        if dtype is not None:
+            base_model.to(dtype=dtype)
+        model = base_model
+
+    model.eval()
 
     if args.chat_template == "auto":
         template = "chatml" if cfg.sft is not None else "raw"
@@ -738,7 +887,7 @@ def main() -> None:
         tokenizer=tokenizer,
         formatter=formatter,
         device=device,
-        max_seq_len=model.model_args.max_seq_len,
+        max_seq_len=model.model_args.max_position_embeddings,
     )
 
     params = GenerationParams(
