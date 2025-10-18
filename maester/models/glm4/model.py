@@ -203,6 +203,8 @@ def apply_rotary_emb(
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
     rotary_dim: int,
+    *,
+    rotary_dtype: torch.dtype | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Apply rotary embeddings to input tensors using the given frequency tensor.
@@ -234,27 +236,38 @@ def apply_rotary_emb(
     if half == 0:
         return xq, xk
 
-    xq_complex = torch.complex(
-        xq_rot[..., :half].float(),
-        xq_rot[..., half:].float(),
-    )
-    xk_complex = torch.complex(
-        xk_rot[..., :half].float(),
-        xk_rot[..., half:].float(),
-    )
+    # Convert complex frequencies into cos/sin tables matching HF behaviour.
+    if freqs_cis.ndim == 2:
+        freqs_slice = freqs_cis[: xq.shape[1]]
+        cos = torch.view_as_real(freqs_slice)[..., 0]
+        sin = torch.view_as_real(freqs_slice)[..., 1]
+        cos = torch.cat([cos, cos], dim=-1)
+        sin = torch.cat([sin, sin], dim=-1)
+        cos = reshape_for_broadcast(cos, xq_rot)
+        sin = reshape_for_broadcast(sin, xq_rot)
+    elif freqs_cis.ndim == xq_rot.ndim:
+        cos = torch.view_as_real(freqs_cis)[..., 0]
+        sin = torch.view_as_real(freqs_cis)[..., 1]
+        cos = torch.cat([cos, cos], dim=-1)
+        sin = torch.cat([sin, sin], dim=-1)
+    else:
+        raise ValueError(f"Unsupported freqs_cis shape {freqs_cis.shape}")
 
-    if freqs_cis.ndim != xq_complex.ndim:
-        freqs_cis = reshape_for_broadcast(freqs_cis, xq_complex)
+    target_dtype = rotary_dtype if rotary_dtype is not None else xq_rot.dtype
+    cos = cos.to(dtype=target_dtype)
+    sin = sin.to(dtype=target_dtype)
 
-    xq_out = torch.view_as_real(xq_complex * freqs_cis)
-    xk_out = torch.view_as_real(xk_complex * freqs_cis)
+    if cos.dtype != xq_rot.dtype:
+        cos = cos.to(dtype=xq_rot.dtype)
+        sin = sin.to(dtype=xq_rot.dtype)
 
-    xq_out = xq_out.reshape(*xq_out.shape[:-2], -1)
-    xk_out = xk_out.reshape(*xk_out.shape[:-2], -1)
+    def rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., :half]
+        x2 = x[..., half:]
+        return torch.cat((-x2, x1), dim=-1)
 
-    # Match HF ordering by interleaving even/odd features within the rotated slice.
-    xq_out = torch.cat([xq_out[..., ::2], xq_out[..., 1::2]], dim=-1)
-    xk_out = torch.cat([xk_out[..., ::2], xk_out[..., 1::2]], dim=-1)
+    xq_out = (xq_rot * cos) + (rotate_half(xq_rot) * sin)
+    xk_out = (xk_rot * cos) + (rotate_half(xk_rot) * sin)
 
     if xq_pass.numel():
         xq_out = torch.cat([xq_out, xq_pass], dim=-1)
@@ -334,7 +347,12 @@ class Glm4MoeAttention(nn.Module):
             xq = self.q_norm(xq)
             xk = self.k_norm(xk)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, rotary_dim=self.rotary_dim)
+        xq, xk = apply_rotary_emb(
+            xq,
+            xk,
+            freqs_cis=freqs_cis,
+            rotary_dim=self.rotary_dim,
+        )
 
         # Repeat k/v heads if n_kv_heads < n_heads
         xk = repeat_kv(xk, self.num_key_value_groups)
@@ -366,7 +384,7 @@ class Glm4MoeAttention(nn.Module):
 
         # assert output.shape == (bs, seqlen, self.n_heads, self.head_dim), f"attn: {output.shape} != {(bs, seqlen, self.n_heads, self.head_dim)}"
         output = output.view(bs, seqlen, -1)
-        output = self.o_proj(output)
+        output = self.o_proj(output.to(dtype=hidden_states.dtype))
         return output
     
     def init_weights(self):
