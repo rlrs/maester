@@ -168,9 +168,10 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
     Returns:
         torch.Tensor: Precomputed frequency tensor with complex exponentials.
     """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
+    base = torch.arange(0, dim, 2, dtype=torch.float32)[: dim // 2]
+    freqs = 1.0 / (theta ** (base / dim))
+    t = torch.arange(end, dtype=torch.float32, device=freqs.device)
+    freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
