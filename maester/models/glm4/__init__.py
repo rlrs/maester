@@ -97,7 +97,11 @@ glm4_configs = {
 
         moe_args = MoEArgs(
             num_experts=64,
+            score_func="sigmoid",
+            route_norm=True,
+            top_k=8,
             num_shared_experts=1,
+            score_before_experts=False,
             use_grouped_mm=True,
         ),
         moe_intermediate_size=1024,
