@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 from maester.log_utils import logger
 from maester.models.moe import MoE, FeedForward, MoEArgs
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 # -------------------------
@@ -378,7 +379,8 @@ class Glm4MoeAttention(nn.Module):
             output = self.o_proj(attn_output)
         else:
             # (bs, n_heads, seqlen, head_dim)
-            output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True, enable_gqa=True, scale=self.attn_scale)
+            with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True, enable_gqa=True, scale=self.attn_scale)
             output = output.transpose(
                 1, 2
             ).contiguous()  # (bs, seqlen, n_heads, head_dim)

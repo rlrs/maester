@@ -53,7 +53,7 @@ def parallelize_deepseek(
             logger.warning("Compiling MoE layers is broken")
             apply_compile(model.model)
         else:
-            apply_compile(model.model, fullgraph=False)
+            apply_compile(model.model, fullgraph=True)
 
     dp_mesh: DeviceMesh | None = None
     if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
@@ -205,6 +205,7 @@ def apply_ac(model: nn.Module, ac_config: Config):
 
 def apply_compile(model: nn.Module, fullgraph: bool = False):
     """Compile each transformer layer individually."""
+    torch._dynamo.config.capture_scalar_outputs = True # experimental, avoid graph break on MoE
     for layer_id, layer in model.layers.items():
         compiled_layer = torch.compile(layer, fullgraph=fullgraph)
         model.layers[layer_id] = compiled_layer
@@ -279,7 +280,7 @@ def apply_moe_ep_tp(
     ep_mesh: DeviceMesh | None,
     ep_tp_mesh: DeviceMesh | None,
 ):
-    for transformer_block in model.layers.values():
+    for transformer_block in model.model.layers.values():
         if not transformer_block.moe_enabled:
             continue
 
