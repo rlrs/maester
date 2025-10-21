@@ -308,7 +308,7 @@ def main():
             global_micro_step = train_state.step * grad_accum_steps
 
             while train_state.step < cfg.train_num_steps:
-                optimizer.zero_grad(set_to_none=True)
+                optimizers.zero_grad(set_to_none=True)
 
                 for micro_idx in range(grad_accum_steps):
                     global_micro_step += 1
@@ -476,8 +476,8 @@ def main():
                             "padding/avg_length": all_lengths.float().mean().item(),
                             "padding/std_length": all_lengths.float().std().item(),
                         })
-                    for i in range(len(optimizer.param_groups)):
-                        metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
+                    # for i in range(len(optimizer.param_groups)):
+                    #     metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
                     # for gn, (name, _) in zip(grad_norms, model.named_parameters()):
                     #     cn = clean_param_name(name)
                     #     metrics[f"{cn}/grad_norm"] = gn
