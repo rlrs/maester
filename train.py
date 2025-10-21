@@ -476,7 +476,7 @@ def main():
                             "padding/avg_length": all_lengths.float().mean().item(),
                             "padding/std_length": all_lengths.float().std().item(),
                         })
-                    for i in range(len(optimizer.param_groups)):
+                    for i in range(len(optimizers.param_groups)):
                         metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
                     # for gn, (name, _) in zip(grad_norms, model.named_parameters()):
                     #     cn = clean_param_name(name)
