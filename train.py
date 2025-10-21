@@ -308,7 +308,7 @@ def main():
             global_micro_step = train_state.step * grad_accum_steps
 
             while train_state.step < cfg.train_num_steps:
-                optimizer.zero_grad(set_to_none=True)
+                optimizers.zero_grad(set_to_none=True)
 
                 for micro_idx in range(grad_accum_steps):
                     global_micro_step += 1
