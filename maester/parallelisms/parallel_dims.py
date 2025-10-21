@@ -17,9 +17,10 @@ class ParallelDims:
     world_size: int
     enable_loss_parallel: bool
 
+    _world_mesh: DeviceMesh = None
+
     def __post_init__(self):
         self._validate()
-        self._world_mesh = None  # Lazy initialization
 
     def _validate(self):
         dp_replicate, dp_shard, tp, ep = self.dp_replicate, self.dp_shard, self.tp, self.ep
@@ -42,7 +43,7 @@ class ParallelDims:
 
         if ep > 1:
             #assert ep % cp == 0 and (dp_shard * cp) % ep == 0
-            assert dp_shard % ep == 0
+            assert ep % tp == 0 and (dp_shard * tp) % ep == 0
 
     def build_mesh(self):
         if self.ep > 1:
@@ -71,14 +72,30 @@ class ParallelDims:
         # initialized:
         # Mesh for data loading (no communication on this mesh)
         dp_mesh_dim_names = []
+        # Mesh for param sharding
+        dp_shard_cp_mesh_dim_names = []
+        # Mesh for loss all-reduce
+        dp_cp_mesh_dim_names = []
 
         if self.dp_replicate_enabled:
             dp_mesh_dim_names.append("dp_replicate")
+            dp_cp_mesh_dim_names.append("dp_replicate")
         if self.dp_shard_enabled:
             dp_mesh_dim_names.append("dp_shard")
+            dp_shard_cp_mesh_dim_names.append("dp_shard")
+            dp_cp_mesh_dim_names.append("dp_shard")
+        # if self.cp_enabled:
+        #     dp_shard_cp_mesh_dim_names.append("cp")
+        #     dp_cp_mesh_dim_names.append("cp")
 
         if dp_mesh_dim_names != []:
             mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
+        if dp_shard_cp_mesh_dim_names != []:
+            mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(
+                mesh_dim_name="dp_shard_cp"
+            )
+        if dp_cp_mesh_dim_names != []:
+            mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
 
         return mesh
 
@@ -87,8 +104,8 @@ class ParallelDims:
         # dp_shard = dp_shard_mod_ep * dp_shard_in_ep
         # ep = dp_shard_in_ep * cp
         # NOTE: cp not implemented
-        dp_shard_mod_ep = self.dp_shard // self.ep
-        dp_shard_in_ep = self.ep
+        dp_shard_mod_ep = self.dp_shard * self.tp // self.ep
+        dp_shard_in_ep = self.ep // self.tp
 
         dims = []
         names = []
@@ -139,7 +156,7 @@ class ParallelDims:
         #     ep_mesh_dim_names.append("cp")
 
         mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
-        mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard")
+        mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_cp")
         mesh[tuple(dp_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_cp")
         mesh[tuple(ep_mesh_dim_names)]._flatten(mesh_dim_name="ep")
 
@@ -174,6 +191,10 @@ class ParallelDims:
     @property
     def loss_parallel_enabled(self):
         return self.tp > 1 and self.enable_loss_parallel
+
+    @property
+    def fsdp_gradient_divide_factor(self) -> int:
+        return self.dp_replicate * self.dp_shard# * self.cp
     
     @property
     def world_mesh(self) -> DeviceMesh:

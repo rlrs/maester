@@ -25,7 +25,21 @@ from collections import defaultdict
 from maester.config import Config, TORCH_DTYPE_MAP
 from maester.parallelisms.parallel_dims import ParallelDims
 from maester.log_utils import logger
-from maester.models.deepseek.expert_parallel import ExpertParallel, ExpertTensorParallel, TensorParallel, NoParallel
+from .expert_parallel import ExpertParallel, ExpertTensorParallel, TensorParallel, NoParallel
+
+# for selective op activation checkpointing
+_save_list = {
+    torch.ops.aten.mm.default,
+    torch.ops.aten._scaled_dot_product_efficient_attention.default,
+    torch.ops.aten._scaled_dot_product_flash_attention.default,
+    torch.ops._c10d_functional.reduce_scatter_tensor.default,
+    torch.ops._c10d_functional.all_to_all_single.default,
+    # for low precision training, it's useful to always save
+    # the result of max, since the absolute maximum is
+    # used to compute the scaling factor for quantization.
+    torch.ops.aten.max.default,
+    torch._higher_order_ops.flex_attention,
+}
 
 def parallelize_deepseek(
     model: nn.Module,
@@ -49,18 +63,14 @@ def parallelize_deepseek(
         apply_ac(model.model, config)
 
     if config.compile:
-        if parallel_dims.ep_enabled:
-            logger.warning("Compiling MoE layers is broken")
-            apply_compile(model.model)
-        else:
-            apply_compile(model.model, fullgraph=True)
+        apply_compile(model.model)
 
     dp_mesh: DeviceMesh | None = None
     if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
         if parallel_dims.dp_replicate_enabled:
-            dp_mesh_dim_names = ("dp_replicate", "dp_shard")
+            dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
         else:
-            dp_mesh_dim_names = ("dp_shard",)
+            dp_mesh_dim_names = ("dp_shard_cp",)
         dp_mesh = world_mesh[tuple(dp_mesh_dim_names)]
 
         # the mesh dim names of which the MoE params are sharded on via FSDP/HSDP
@@ -77,11 +87,13 @@ def parallelize_deepseek(
             reduce_dtype=TORCH_DTYPE_MAP[config.mixed_precision_reduce],
             cpu_offload=config.enable_cpu_offload,
             reshard_after_forward_policy=config.fsdp_reshard_after_forward,
+            ep_degree=parallel_dims.ep,
             dp_mod_ep_mesh=(
                 world_mesh[tuple(dp_mod_ep_mesh_dim_names)]
-                if dp_mod_ep_mesh_dim_names
+                if parallel_dims.ep_enabled
                 else None
             ),
+            # gradient_divide_factor=parallel_dims.fsdp_gradient_divide_factor # TODO
         ) 
 
         if parallel_dims.dp_replicate_enabled:
@@ -92,17 +104,7 @@ def parallelize_deepseek(
         if config.enable_cpu_offload:
             logger.info("Applied CPU Offloading to the model")
 
-# for selective op activation checkpointing
-_save_list = {
-    torch.ops.aten.mm.default,
-    torch.ops.aten._scaled_dot_product_efficient_attention.default,
-    torch.ops.aten._scaled_dot_product_flash_attention.default,
-    torch.ops._c10d_functional.reduce_scatter_tensor.default,
-    # for low precision training, it's useful to always save
-    # the result of max, since the absolute maximum is
-    # used to compute the scaling factor for quantization.
-    torch.ops.aten.max.default,
-}
+
 
 
 def _apply_ac_to_transformer_block(
@@ -203,10 +205,13 @@ def apply_ac(model: nn.Module, ac_config: Config):
 
     logger.info(f"Applied {ac_config.ac_mode} activation checkpointing to the model")
 
-def apply_compile(model: nn.Module, fullgraph: bool = False):
+def apply_compile(model: nn.Module):
     """Compile each transformer layer individually."""
     torch._dynamo.config.capture_scalar_outputs = True # experimental, avoid graph break on MoE
     for layer_id, layer in model.layers.items():
+        fullgraph = True
+        if layer.moe_enabled: # TODO: remove when Moe supports fullgraph
+            fullgraph = False
         compiled_layer = torch.compile(layer, fullgraph=fullgraph)
         model.layers[layer_id] = compiled_layer
     logger.info("Compiled each transformer layer with torch.compile")
@@ -242,37 +247,77 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    for layer_id, transformer_block in model.model.layers.items():
-        if reshard_after_forward_policy == "always":
+    match reshard_after_forward_policy:
+        case "always":
             reshard_after_forward = True
-        elif reshard_after_forward_policy == "never":
+        case "never":
             reshard_after_forward = False
-        elif reshard_after_forward_policy == "default":
-            # As an optimization, do not reshard after forward for the last
-            # transformer block since FSDP would prefetch it immediately
-            reshard_after_forward = int(layer_id) < len(model.model.layers) - 1
-        else:
+        case "default":
+            reshard_after_forward = True
+        case _:
             raise ValueError(
                 f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
             )
-        
+
+    if model.tok_embeddings is not None:
+        fully_shard(
+            model.tok_embeddings,
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward,
+        )
+
+    for layer_id, transformer_block in model.model.layers.items():
         # NOTE: in an MoE layer, the router and the shared experts
         #       are sharded together with the TransformerBlock
         if transformer_block.moe_enabled and ep_degree > 1: # TODO: fix this
             print("Applying FSDP with EP")
             fsdp_mod_ep_config = fsdp_config.copy()
             fsdp_mod_ep_config["mesh"] = dp_mod_ep_mesh
+
+            # NOTE: EP already shards the routed experts on dim 0 (num_experts).
+            #       When dp_mod_ep * ep > num_experts, FSDPs default dim-0 sharding
+            #       causes inefficiency, so we choose to do FSDP sharding on dim-1.
+            #       Even when EP is not used, we may still want to shard the experts
+            #       on a non-0 dim. For now it may not be worth the complexity to support
+            #       shard_placement_fn on the outer TransformerBlock-level FSDP.
+            _experts_shard_placement_fn = None
+            assert dp_mod_ep_mesh is not None
+            assert hasattr(transformer_block, "moe")
+            if (
+                dp_mod_ep_mesh.size() * ep_degree
+                > transformer_block.moe.experts.num_experts
+            ):
+                _experts_shard_placement_fn = lambda param: Shard(1)
+
             fully_shard(
                 transformer_block.moe.experts,
                 **fsdp_mod_ep_config,
                 reshard_after_forward=reshard_after_forward,
+                shard_placement_fn=_experts_shard_placement_fn,
             )
+
+            # TODO
+            # transformer_block.moe.experts.set_gradient_divide_factor(
+            #     gradient_divide_factor
+            # )
         fully_shard(
             transformer_block,
             **fsdp_config,
             reshard_after_forward=True,
         )
-    fully_shard(model, **fsdp_config, reshard_after_forward=True)
+
+    # As an optimization, do not reshard_after_forward the last layers by default
+    # since FSDP would prefetch them immediately after the forward pass
+    if model.model.norm is not None and model.output is not None:
+        fully_shard(
+            [model.model.norm, model.output],
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward_policy == "always",
+        )
+    fully_shard(model, **fsdp_config)
+
+    # TODO: set up explicit prefetching when EP is enabled, as D2H syncs
+    # in EP could interfere with implicit prefetching in FSDP
 
 def apply_moe_ep_tp(
     model: nn.Module,
@@ -297,16 +342,29 @@ def apply_moe_ep_tp(
                 ),
                 # replicate computation for the router
                 "moe.router.gate": NoParallel(),
-                # input Replicate, output Partial
-                "moe.shared_expert": TensorParallel(),
             }
+            # if ep_mesh is not None and not etp_enabled: # TODO
+            #     # If TP is borrowed for EP, then split the tokens across TP ranks so that
+            #     # the reorderer, the all-to-all comms, and routed experts computation
+            #     # are effectively running Sequence Parallel (split along the folded bs*slen dim)
+            #     moe_layer_plan.update({"moe.reorderer": ReordererSequenceParallel()})
+            if transformer_block.moe.shared_experts is not None:
+                moe_layer_plan.update(
+                    {
+                        "moe.shared_experts.w1": ColwiseParallel(),
+                        "moe.shared_experts.w2": RowwiseParallel(
+                            output_layouts=Partial()
+                        ),
+                        "moe.shared_experts.w3": ColwiseParallel(),
+
+                    }
+                )
             parallelize_module(
                 module=transformer_block,
                 device_mesh=tp_mesh,
                 parallelize_plan=moe_layer_plan,
             )
 
-        # if ep_mesh is not None:
         experts_mesh, experts_plan = None, None
         if ep_mesh is None:
             experts_mesh = tp_mesh
@@ -318,7 +376,7 @@ def apply_moe_ep_tp(
             experts_plan = ExpertParallel()
         else:
             experts_mesh = ep_tp_mesh
-            experts_plan = ExpertTensorParallel(tp_mesh=tp_mesh, ep_mesh=ep_mesh)
+            experts_plan = ExpertTensorParallel()
         parallelize_module(
             module=transformer_block.moe.experts,
             device_mesh=experts_mesh,
