@@ -4,26 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from functools import partial
+
 import torch
 import torch.nn as nn
 from torch.distributed._functional_collectives import (
-    all_to_all_single,
-    all_to_all_single_autograd,
-)
-from torch.distributed.tensor import (
-    DeviceMesh,
-    distribute_module,
-    distribute_tensor,
-    DTensor,
-    Partial,
-    Replicate,
-    Shard,
-)
+    all_to_all_single, all_to_all_single_autograd)
+from torch.distributed.tensor import (DeviceMesh, DTensor, Partial, Replicate,
+                                      Shard, distribute_module,
+                                      distribute_tensor)
 from torch.distributed.tensor.parallel import ParallelStyle
 from torch.distributed.tensor.placement_types import Placement
 
 from maester.models.moe.utils import _permute, _unpermute
-
 
 
 # implementation of Tensor Parallel for the GroupedExperts in MoE
