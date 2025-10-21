@@ -31,6 +31,7 @@ class DatasetConfig(BaseSettings):
     num_data_workers: int = 1
     # col_name: str = "tokens"
     # file_type: str = "arrow"
+    dataset_type: str = "parquet"
 
 
 class SFTConfig(BaseSettings):
