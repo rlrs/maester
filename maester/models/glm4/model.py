@@ -324,6 +324,18 @@ class Glm4MoeAttention(nn.Module):
         if rotary_dim % 2 != 0:
             rotary_dim -= 1
         self.rotary_dim = max(rotary_dim, 2)
+        self._attention_backend = "cudnn"
+
+    def set_attention_backend(self, backend: str) -> None:
+        backend_normalized = backend.lower()
+        if backend_normalized in {"cudnn", "auto"}:
+            self._attention_backend = "cudnn"
+        elif backend_normalized in {"naive", "math"}:
+            self._attention_backend = "naive"
+        elif backend_normalized in {"flash"}:
+            self._attention_backend = "flash"
+        else:
+            raise ValueError(f"Unsupported attention backend '{backend}'. Expected 'cudnn', 'flash', or 'naive'.")
 
     def forward(
         self,
@@ -379,7 +391,13 @@ class Glm4MoeAttention(nn.Module):
             output = self.o_proj(attn_output)
         else:
             # (bs, n_heads, seqlen, head_dim)
-            with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            if self._attention_backend == "naive":
+                sdpa_backend = SDPBackend.MATH
+            elif self._attention_backend == "cudnn":
+                sdpa_backend = SDPBackend.CUDNN_ATTENTION
+            elif self._attention_backend == "flash":
+                sdpa_backend = SDPBackend.FLASH_ATTENTION
+            with sdpa_kernel(sdpa_backend):
                 output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True, enable_gqa=True, scale=self.attn_scale)
             output = output.transpose(
                 1, 2
@@ -689,6 +707,10 @@ class Glm4MoeTextModel(nn.Module):
         # Initialize output layer
         if not self.config.tie_word_embeddings:
             nn.init.normal_(self.output.weight, mean=0.0, std=self.config.initializer_range)
+    
+    def set_attention_backend(self, backend: str) -> None:
+        for layer in self.model.layers.values():
+            layer.self_attn.set_attention_backend(backend)
 
     def forward(
         self,
