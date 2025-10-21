@@ -65,8 +65,11 @@ def parallelize_deepseek(
     if config.compile:
         apply_compile(model.model)
 
+    use_fsdp = parallel_dims.dp_enabled or (
+            world_mesh.ndim == 1 and world_mesh.size() == 1
+        )
     dp_mesh: DeviceMesh | None = None
-    if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
+    if use_fsdp or parallel_dims.ep_enabled:
         if parallel_dims.dp_replicate_enabled:
             dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
         else:

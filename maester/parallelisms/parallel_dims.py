@@ -57,14 +57,14 @@ class ParallelDims:
         names = []
         for d, name in zip(
             [self.dp_replicate, self.dp_shard, self.tp],
-            ["dp_replicate", "dp_shard", "tp"],
+            ["dp_replicate", "dp_shard_cp", "tp"],
         ):
             if d > 1:
                 dims.append(d)
                 names.append(name)
         if dims == []: # edge case for non-distributed mesh w/ 1 GPU
             dims = [1]
-            names = ("dp",)
+            names = ("dp_shard_cp",)
         logger.info(f"Building {len(dims)}-D device mesh with {names}, {dims}")
         mesh = init_device_mesh(device_type, dims, mesh_dim_names=names)
 
