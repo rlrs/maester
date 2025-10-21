@@ -12,8 +12,8 @@ import pytest
 def test_gemma_dcp_checkpoints_exist():
     """Test that DCP checkpoints exist for Gemma models."""
     checkpoints = {
-        "1B": Path("google-gemma-1b-pt-dcp"),
-        "4B": Path("google-gemma-4b-pt-dcp"),
+        "1B": Path("google-gemma-3-1b-pt-dcp"),
+        "4B": Path("google-gemma-3-4b-pt-dcp"),
     }
     
     available = {}
@@ -28,8 +28,8 @@ def test_gemma_dcp_checkpoints_exist():
 
 
 @pytest.mark.parametrize("model_size,dcp_path,hf_model_name,port", [
-    ("1B", "google-gemma-1b-pt-dcp", "google/gemma-3-1b-pt", "12355"),
-    ("4B", "google-gemma-4b-pt-dcp", "google/gemma-3-4b-pt", "12356"),
+    ("1B", "google-gemma-3-1b-pt-dcp", "google/gemma-3-1b-pt", "12355"),
+    ("4B", "google-gemma-3-4b-pt-dcp", "google/gemma-3-4b-pt", "12356"),
 ])
 def test_gemma3_logits_comparison(model_size, dcp_path, hf_model_name, port):
     """Test Gemma3 model logits against HuggingFace implementation."""
@@ -162,12 +162,9 @@ def test_gemma3_logits_comparison(model_size, dcp_path, hf_model_name, port):
             hf_outputs = hf_model(input_ids)
             hf_logits = hf_outputs.logits
             
-            # Handle potential vocab size mismatch
-            # HF model might have vision tokens that we don't use for text-only training
-            if hf_logits.shape[-1] > our_logits.shape[-1]:
-                print(f"  Note: HF model has {hf_logits.shape[-1] - our_logits.shape[-1]} extra tokens (likely vision tokens)")
-                print(f"  Comparing only text vocabulary ({our_logits.shape[-1]} tokens)")
-                hf_logits = hf_logits[:, :, :our_logits.shape[-1]]
+            # Vocab sizes should match now that we include vision tokens
+            assert hf_logits.shape[-1] == our_logits.shape[-1], \
+                f"Vocab size mismatch: HF has {hf_logits.shape[-1]}, ours has {our_logits.shape[-1]}"
         
         # Compare logits
         max_diff = torch.max(torch.abs(hf_logits - our_logits)).item()
@@ -208,8 +205,7 @@ def test_gemma3_config_structure():
     
     # Test 4B config  
     config_4b = gemma3_configs["4B"]
-    # NON-STANDARD: We use text-only vocab size, not the full multimodal vocab
-    assert config_4b.vocab_size == 262_144  # Text-only tokens (vision tokens removed)
+    assert config_4b.vocab_size == 262_208  # Full vocab including vision tokens
     assert config_4b.dim == 2560
     assert config_4b.n_layers == 34
     assert config_4b.sliding_window_size == 1024

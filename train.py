@@ -24,7 +24,9 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from maester.checkpoint import CheckpointManager
 from maester.config import Config
+from maester.data_monitor import DataMonitor
 from maester.datasets.experimental_otf import build_experimental_data_loader
+# from maester.datasets.experimental import build_experimental_data_loader # TODO: clean up datasets integration
 from maester.log_utils import init_logger, logger
 from maester.lr_scheduling import get_lr_scheduler
 from maester.memory import cleanup_before_training
@@ -39,10 +41,11 @@ from maester.models import (
 from maester.parallelisms import ParallelDims
 from maester.profiling import (maybe_enable_memory_snapshot,
                                maybe_enable_profiling)
+from maester.sft import build_sft_data_loader
 from maester.utils import (clean_param_name, clip_grad_norm, dist_max, dist_mean, get_num_flop_per_token,
                            get_num_params, get_peak_flops, init_distributed,
                            set_pg_timeouts)
-
+from nccl_preflight import run_nccl_preflight
 
 # Training state that is saved in checkpoints
 @dataclass
@@ -80,8 +83,11 @@ def main():
     else:
         logger.info("Using configuration from config.py")
         cfg = Config()
-    logger.info(f"Configuration: {cfg}")
 
+    # SFT imports if enabled
+    if cfg.sft is not None:
+        logger.info("SFT mode enabled")
+    
     # take control of garbage collection to avoid stragglers
     gc.disable()
     gc.collect(1)
@@ -99,6 +105,10 @@ def main():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     init_distributed(cfg)
 
+    if os.environ.get("RUN_NCCL_PREFLIGHT", "0").lower() in {"1", "true", "yes"}:
+        logger.info("Running NCCL preflight checks (unset RUN_NCCL_PREFLIGHT or set to 0 to skip)")
+        run_nccl_preflight()
+
     train_state = TrainState()
     with maybe_enable_memory_snapshot(
         cfg, global_step=train_state.step
@@ -113,8 +123,7 @@ def main():
         else:
             dp_degree, dp_rank = 1, 0
         logger.info(f"world mesh: {world_mesh}")
-        if parallel_dims.dp_enabled:
-            logger.info(f"dp mesh: {dp_mesh}")
+        #logger.info(f"dp mesh: {dp_mesh}")
 
         # Get tokenizer to determine vocab size
         if os.path.isfile(cfg.tokenizer_name):
@@ -130,10 +139,7 @@ def main():
         # 2. vocab size from tokenizer
         # 3. max_seq_len base on inputs
         model_config.norm_type = cfg.norm_type
-        # Get vocab size from tokenizer (vocab_size is base vocabulary without added tokens)
-        # If model config already has a vocab_size set, respect it (e.g. for padded vocabularies)
-        if not hasattr(model_config, 'vocab_size') or model_config.vocab_size <= 0:
-            # Only set vocab size from tokenizer if not already configured
+        if not hasattr(model_config, 'vocab_size') or model_config.vocab_size <= 0: 
             model_config.vocab_size = len(tokenizer)
         model_config.max_seq_len = cfg.seq_len
         if cfg.enable_mup:
@@ -181,7 +187,7 @@ def main():
         # allocate sharded model on GPU and initialize weights via DTensor
         model.to_empty(device="cuda")
         model.init_weights()
-
+        
         # register hooks after compile?
         # get_logits_metrics, cleanup_monitoring, reinit_storage = register_logits_monitoring(
         #     model, 
@@ -227,15 +233,60 @@ def main():
                     logger.info(f"No activation hook registered for {module_name}")
             logger.info(f"Activation hooks registered for {len(activation_hooks)} modules")
 
-        data_loader = build_experimental_data_loader(cfg, rank=dp_rank, world_size=dp_degree)
+        # Create appropriate dataloader based on mode
+        if cfg.sft is not None:
+            data_loader = build_sft_data_loader(cfg, rank=dp_rank, world_size=dp_degree)
+        else:
+            data_loader = build_experimental_data_loader(cfg, rank=dp_rank, world_size=dp_degree)
 
         # data_monitor = DataMonitor(train_state, log_freq=cfg.log_freq)
 
-        # Build optimizers using model-specific builder
-        optimizers_builder = model_name_to_optimizers_builder[cfg.model_name]
-        optimizers = optimizers_builder(model, cfg, parallel_dims)
-        
-        scheduler = get_lr_scheduler(optimizers, cfg)
+        if cfg.enable_mup:
+            mup_decay_params = []
+            decay_params = []
+            nodecay_params = []
+            for name, param in model.named_parameters():
+                if param.dim() >= 2:
+                    if 'attention' in name or 'feed_forward' in name:
+                        # logger.info(f"Mup weight: {name}")
+                        mup_decay_params.append(param)
+                    else:
+                        # logger.info(f"Decay weight: {name}")
+                        decay_params.append(param)
+                else:
+                    # logger.info(f"Nodecay weight: {name}")
+                    nodecay_params.append(param)
+            optimizer: torch.optim.Optimizer = cfg.opt_class([
+                {'params': mup_decay_params, 'weight_decay': cfg.opt_cfg['weight_decay'], 'lr': cfg.opt_cfg['lr'] / model_config.mup_width_mul},
+                {'params': decay_params, 'weight_decay': cfg.opt_cfg['weight_decay'], 'lr': cfg.opt_cfg['lr']},
+                {'params': nodecay_params, 'weight_decay': 0.0, 'lr': cfg.opt_cfg['lr']},
+            ], **cfg.opt_cfg)
+        else:
+            decay_params = []
+            nodecay_params = []
+            for name, param in model.named_parameters():
+                if "tok_embeddings" in name:
+                    if dp_rank == 0:
+                        logger.info(f"Nodecay weight: {name}")
+                    nodecay_params.append(param)  
+                elif param.dim() >= 2:
+                    if dp_rank == 0:
+                        logger.info(f"Decay weight: {name}")
+                    decay_params.append(param)
+                else:
+                    if dp_rank == 0:
+                        logger.info(f"Nodecay weight: {name}")
+                    nodecay_params.append(param) 
+            weight_decay = cfg.opt_cfg.get('weight_decay', 0.1)
+            optimizer: torch.optim.Optimizer = cfg.opt_class([{
+                'params': decay_params,
+                'weight_decay': weight_decay
+            },
+            {
+                'params': nodecay_params,
+                'weight_decay': 0.0
+            }], **cfg.opt_cfg)
+        scheduler = get_lr_scheduler(optimizer, cfg)
 
         metric_logger = build_metric_logger(cfg)
 
@@ -281,60 +332,101 @@ def main():
 
             # variables for metric logging
             losses_since_last_log: list[torch.Tensor] = []
+            padding_lengths_since_last_log: list[torch.Tensor] = []
             ntokens_since_last_log = 0
             total_tokens = 0
             data_loading_times: list[float] = []
             time_last_log = timer()
             gpu_memory_monitor.reset_peak_stats()
 
-            # while (epoch := train_state.step // dataset_steps_in_epoch) < cfg.train_num_epochs:
+            grad_accum_steps = max(1, cfg.gradient_accumulation_steps)
+            fsdp_can_toggle_sync = hasattr(model, "set_requires_gradient_sync")
+            skip_sync_during_accum = (
+                grad_accum_steps > 1 and not cfg.gradient_accumulation_sync_each_step
+            )
+            global_micro_step = train_state.step * grad_accum_steps
+
             while train_state.step < cfg.train_num_steps:
+                optimizer.zero_grad(set_to_none=True)
+
+                for micro_idx in range(grad_accum_steps):
+                    global_micro_step += 1
+                    torch.manual_seed(global_micro_step + dp_rank)
+
+                    data_load_start = timer()
+                    batch = next(data_iterator)
+
+                    input_ids = batch["input_ids"]
+                    labels = batch["labels"]
+
+                    # Get position_ids if available (currently only from packed SFT data)
+                    # TODO: Consider generating position_ids for all data loaders for consistency
+                    position_ids = batch.get("position_ids", None)
+
+                    # Get document_ids if available (for flex attention document masking in packed data)
+                    document_ids = batch.get("document_ids", None)
+
+                    # Collect padding stats if available (SFT mode)
+                    if "stats" in batch and "actual_lengths" in batch["stats"]:
+                        padding_lengths_since_last_log.append(batch["stats"]["actual_lengths"])
+
+                    ntokens_since_last_log += labels.numel()
+                    data_loading_times.append(timer() - data_load_start)
+
+                    input_ids = input_ids.cuda()
+                    labels = labels.cuda()
+                    if position_ids is not None:
+                        position_ids = position_ids.cuda()
+                    if document_ids is not None:
+                        document_ids = document_ids.cuda()
+
+                    sync_grads_now = True
+                    if skip_sync_during_accum:
+                        sync_grads_now = micro_idx == grad_accum_steps - 1
+
+                    if fsdp_can_toggle_sync and grad_accum_steps > 1:
+                        model.set_requires_gradient_sync(sync_grads_now)
+
+                    with loss_parallel_ctx():
+                        if cfg.enable_cut_cross_entropy:
+                            loss = model(
+                                input_ids,
+                                labels,
+                                position_ids=position_ids,
+                                document_ids=document_ids,
+                            )
+                        else:
+                            pred = model(
+                                input_ids,
+                                position_ids=position_ids,
+                                document_ids=document_ids,
+                            )
+                            loss = loss_fn(pred, labels)
+                            del pred
+
+                        losses_since_last_log.append(loss.detach())
+                        scaled_loss = loss / grad_accum_steps
+                        scaled_loss.backward()
+
+                    if (
+                        fsdp_can_toggle_sync
+                        and grad_accum_steps > 1
+                        and skip_sync_during_accum
+                        and not sync_grads_now
+                    ):
+                        model.set_requires_gradient_sync(True)
+
+                grad_norms = clip_grad_norm(  # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
+                    model.parameters(), cfg.max_grad_norm, foreach=True
+                )
+                optimizer.step()
+                scheduler.step()
                 train_state.step += 1
-                torch.manual_seed(train_state.step + dp_rank) # seeding with dp_rank to ensure identical inputs for TP groups
-                if train_state.step > 1 and train_state.step % cfg.gc_freq == 0:
+
+                if train_state.step % cfg.gc_freq == 0:
                     gc.collect(1)
 
-                data_load_start = timer()
-                batch = next(data_iterator)
-                input_ids, labels = batch
-                # logger.info(f"step {train_state.step} training on input_ids (element 0) {input_ids[0, :]}")
-                ntokens_since_last_log += labels.numel()
-                data_loading_times.append(timer() - data_load_start)
-
-                input_ids = input_ids.cuda()
-                labels = labels.cuda()
-
-                optimizers.zero_grad()
-
-                # data_monitor.log_batch_samples(input_ids, labels, data_loader.dataset)
-                # data_monitor.log_dataset_stats(data_loader.dataset)
-
-                # non-pp loss parallel, pp is not implemented
-                with loss_parallel_ctx():
-                    if cfg.enable_cut_cross_entropy:
-                        loss = model(input_ids, labels) # using cut cross-entropy fused kernel
-                    else:
-                        pred = model(input_ids)
-
-                        # data_monitor.log_predictions(pred, labels, data_loader.dataset)
-
-                        loss = loss_fn(pred, labels)
-                        # pred.shape=(bs, seq_len, vocab_size)
-                        # need to free to before bwd to avoid peaking memory
-                        del pred
-                    loss.backward()
-
-
-                # TODO: re-enable grad clipping (broken w/ MoE) and/or monitoring?
-                # grad_norms = clip_grad_norm( # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
-                #     model.parameters(), cfg.max_grad_norm, foreach=True
-                # )
-                optimizers.step()
-                scheduler.step()
-
                 weight_scale_stats = weight_scale_monitor.step_monitor()
-
-                losses_since_last_log.append(loss)
 
                 # log metrics
                 if train_state.step == 1 or train_state.step % cfg.log_freq == 0:
@@ -375,6 +467,14 @@ def main():
                     time_end_to_end = time_delta / cfg.log_freq
                     time_data_loading = np.mean(data_loading_times)
                     time_data_loading_pct = 100 * np.sum(data_loading_times) / time_delta
+                    
+                    # Aggregate data loading times across ALL ranks (TP ranks load redundantly)
+                    # Flatten world mesh to get all ranks
+                    global_mesh = world_mesh._flatten() if hasattr(world_mesh, '_flatten') else world_mesh
+                    global_avg_data_loading = dist_mean(time_data_loading, global_mesh).item()
+                    global_max_data_loading = dist_max(time_data_loading, global_mesh).item()
+                    global_avg_data_loading_pct = dist_mean(time_data_loading_pct, global_mesh).item()
+                    global_max_data_loading_pct = dist_max(time_data_loading_pct, global_mesh).item()
 
                     gpu_mem_stats = gpu_memory_monitor.get_peak_stats()
 
@@ -387,8 +487,10 @@ def main():
                         "mfu(%)": mfu,
                         "data/total_tokens": total_tokens * parallel_dims.dp_shard * parallel_dims.dp_replicate,
                         "time/end_to_end(s)": time_end_to_end,
-                        "time/data_loading(s)": time_data_loading,
-                        "time/data_loading(%)": time_data_loading_pct,
+                        "time/data_loading_avg(s)": global_avg_data_loading,
+                        "time/data_loading_max(s)": global_max_data_loading,
+                        "time/data_loading_avg(%)": global_avg_data_loading_pct,
+                        "time/data_loading_max(%)": global_max_data_loading_pct,
                         "memory/max_active(GiB)": gpu_mem_stats.max_active_gib,
                         "memory/max_active(%)": gpu_mem_stats.max_active_pct,
                         "memory/max_reserved(GiB)": gpu_mem_stats.max_reserved_gib,
@@ -396,7 +498,23 @@ def main():
                         "memory/num_alloc_retries": gpu_mem_stats.num_alloc_retries,
                         "memory/num_ooms": gpu_mem_stats.num_ooms,
                     }
-                    for i in range(len(optimizers.param_groups)):
+                    
+                    # Add padding stats if available (SFT mode)
+                    if padding_lengths_since_last_log:
+                        all_lengths = torch.cat(padding_lengths_since_last_log)
+                        seq_len = input_ids.shape[1]  # Max sequence length
+                        
+                        # Calculate efficiency: what % of tokens are actual content (not padding)
+                        total_actual_tokens = all_lengths.sum().item()
+                        total_batch_tokens = all_lengths.numel() * seq_len
+                        efficiency = total_actual_tokens / total_batch_tokens
+                        
+                        metrics.update({
+                            "padding/efficiency": efficiency,  # % of tokens that are actual content
+                            "padding/avg_length": all_lengths.float().mean().item(),
+                            "padding/std_length": all_lengths.float().std().item(),
+                        })
+                    for i in range(len(optimizer.param_groups)):
                         metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
                     # for gn, (name, _) in zip(grad_norms, model.named_parameters()):
                     #     cn = clean_param_name(name)
@@ -430,10 +548,11 @@ def main():
                         f"mfu={mfu:.2f}%, "
                         f"memory: {gpu_mem_stats.max_reserved_gib:5.2f}GiB"
                         f"({gpu_mem_stats.max_reserved_pct:.2f}%) "
-                        f"time/data_loading={time_data_loading:.2f}s ({time_data_loading_pct:.2f}%)"
+                        f"time/data_loading={global_avg_data_loading:.2f}s (max={global_max_data_loading:.2f}s, {global_max_data_loading_pct:.2f}%)"
                     )
 
                     losses_since_last_log.clear()
+                    padding_lengths_since_last_log.clear()
                     ntokens_since_last_log = 0
                     data_loading_times.clear()
                     time_last_log = timer()
@@ -466,5 +585,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-

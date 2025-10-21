@@ -6,6 +6,7 @@
 
 import math
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, ConstantLR
+from .config import Config
 
 # standard linear warmup, half-cosine schedule
 def linear_warmup_cosine(warmup_steps, total_steps, eta_min=0.1):
@@ -34,7 +35,7 @@ def linear_warmup_constant_sqrt_decay(warmup_steps, total_steps, cooldown_steps)
     return schedule
 
 
-def get_lr_scheduler(optimizer, cfg):
+def get_lr_scheduler(optimizer, cfg: Config):
     """Build the selected LR scheduler"""
     if cfg.scheduler == "constant":
         return ConstantLR(optimizer, factor=1.0)

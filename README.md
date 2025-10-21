@@ -1,171 +1,107 @@
 # Maester
 
-A high-performance distributed training framework for large language models, built on top of PyTorch and heavily inspired by `torchtitan`.
+Maester is a PyTorch training stack for large language models. It includes
+reference implementations of Gemma 3 and Llama, distributed utilities, dataset
+pipelines, and job management tooling used for multi-GPU training runs (e.g. on
+LUMI).
 
-## Features
-
-- **μP (muP) Implementation**: Principled parameter scaling that allows training hyperparameters to transfer between different model sizes
-- **Distributed Training**: Efficient multi-GPU and multi-node training capabilities
-- **Custom Job Management**: Advanced job scheduling and management system
-- **Experimental Dataloader**: Modified version of IBM's dataloader contribution with on-the-fly tokenization
-- **SLURM Integration**: Optimized for supercomputer environments (LUMI)
-
-## Installation
+## Install
 
 ```bash
-# Clone the repository
 git clone https://github.com/rlrs/maester.git
 cd maester
-
-# Install dependencies
 uv sync
+# select the appropriate PyTorch build if needed, e.g.
+# uv sync --extra cuda        # CUDA 12.8 wheels
+# uv sync --extra rocm        # ROCm 6.3 wheels
+# uv sync --extra cuda-nightly / rocm-nightly for nightly builds
 ```
 
-## Requirements
+If you plan to pull gated Hugging Face models (e.g. Gemma tokenizers) or log to
+Weights & Biases, run the usual CLI logins before training:
 
-- Python >= 3.10
-- PyTorch >= 2.5, ideally nightly
-- The framework is set up for training on the LUMI supercomputer, which uses SLURM and AMD GPUs. Most features are not specific to this setup, though.
+```bash
+hf auth login
+wandb login
+```
 
-## Usage
+## Repository map
 
-### Framework Overview
+- `maester/models/` – model definitions and shared layers
+- `maester/datasets/experimental_otf.py` – on-the-fly Parquet text loader
+- `maester/sft/` – conversation dataset and packing helpers for SFT
+- `maester/parallelisms/` – tensor/data parallel setup + checkpointing
+- `configs/` – ready-to-use experiment configs (Gemma 3 variants, etc.)
+- `scripts/` – data converters, packers, checkpoint converters
+- `tests/` – regression tests for datasets, masking, and models
 
-#### Configuration System
+## Configure and run training
 
-The framework uses a Pydantic-based configuration system that allows for:
-- Configuration via JSON files, environment variables, and command-line arguments
-- Strict type checking and validation
-- Nested configurations for model, training, and infrastructure settings
-
-#### Job Management
-
-The framework uses a structured approach to job management, centered around self-contained job directories and Pydantic-based configuration:
-
-#### Configuration System
-- Base configuration defined in `maester/config.py` using Pydantic
-- Configurations can be provided via YAML files, environment variables, or command-line arguments
-- All job-specific configurations are automatically serialized to JSON in the job directory
-
-#### Job Directory Structure
-Each job gets its own directory under `jobs/` containing:
-- `config.json`: Complete configuration snapshot for reproducibility
-- `slurm.sh`: Generated SLURM script from template
-- `logs/`: Directory for SLURM output and error logs
-- `checkpoints/`: Training checkpoints and model states
-
-#### Job Submission Tools
-
-##### submit.py
-- Takes a Pydantic configuration from `maester/config.py`
-- Creates a job directory with all necessary files
-- Generates a SLURM script from `templates/slurm.sh`
-- Jobs can be resubmitted directly with `sbatch jobs/name/slurm.sh`
-
-##### sweep.py
-- Extends the base configuration system from `maester/config.py`
-- Allows parameter modifications through `sweep_config.py`
-- Creates separate job directories for each parameter combination
-- Provides tools for:
-  - Sweep submission and monitoring
-  - Result analysis and visualization
-  - Job management (cancel, retry, etc.)
-
-#### SLURM Integration
-- Template-based SLURM script generation (`templates/slurm.sh`)
-- Container-specific setup in `scripts/slurm/`
-- Automatic handling of:
-  - Resource allocation
-  - Environment setup
-  - Log management
-  - Container binding and configuration
-
-#### Example Usage
-
-1. Submit a single job:
+1. **Create a job directory** – `submit.py` renders a config snapshot and SLURM
+   script under `jobs/<job-name>/`:
    ```bash
-   # Submit with config file
-   python submit.py config.yaml
-   
-   # Resubmit existing job
-   sbatch jobs/my_job/slurm.sh
+   python submit.py --config-file configs/gemma3/4b-sft.toml
    ```
-
-2. Run a parameter sweep:
+2. **Local / non-SLURM run** – use the job directory with `torchrun`:
    ```bash
-   # Define sweep parameters in sweep_config.py
+   torchrun --standalone --nproc_per_node=8 train.py jobs/<job-name>
+   ```
+   `train.py` reads `jobs/<job-name>/config.json`, initialises distributed
+   state, builds the configured data loader, and logs throughput, padding
+   efficiency, and data-loading time.
+3. **SLURM run** – submit the generated script:
+   ```bash
+   sbatch jobs/<job-name>/slurm.sh
+   ```
+   The template lives in `templates/slurm.sh`; customise it (and
+   `scripts/slurm/`) for your cluster. On LUMI, export `RUN_NCCL_PREFLIGHT=1`
+   inside the script so `nccl_preflight.py` runs before training.
+4. **Sweeps** – define parameter grids in `sweep_config.py`, then:
+   ```bash
    python sweep.py submit sweep_config.py
-   
-   # Monitor sweep status
-   python sweep.py status sweeps/my_sweep
+   python sweep.py status sweeps/<sweep-name>
    ```
 
-### Running Training Jobs
+## Optional supervised fine-tuning
 
-#### On SLURM Systems (Recommended)
-Use the job submission system:
-```bash
-# Submit a single training job
-python submit.py config.yaml
+Setting `cfg.sft` switches the loader to `PackedSFTDataset`, which outputs
+`position_ids` and `document_ids` so FlexAttention respects conversation
+boundaries.
 
-# Or run a parameter sweep
-python sweep.py submit sweep_config.py
-```
+Typical workflow:
 
-#### Direct Execution
-For development or non-SLURM environments, you can run the training script directly:
-```bash
-torchrun --nproc_per_node=8 train.py
-```
+1. Convert conversations to Parquet: `scripts/jsonl_convo_to_parquet.py` (JSONL)
+   or `scripts/hf_convo_to_parquet.py` (HuggingFace datasets).
+2. Pack sequences with `scripts/pack_sft_data.py` to generate fixed-length inputs
+   plus boundary metadata.
+3. Validate with `pytest tests/test_sft.py`, `pytest tests/test_packed_sft.py`,
+   and `pytest tests/test_packed_attention.py`.
+4. Point `cfg.sft.packed_path` at the packed file and launch training as above.
 
-### Converting and Uploading Checkpoints
+## Additional settings
 
-Convert and upload checkpoints to Hugging Face:
-```bash
-python scripts/convert_dcp_to_hf.py \
-    jobs/mistral-7b/checkpoints/ \
-    ../output-dir/hf/ \
-    --upload org-name/model-name \
-    --name step-400 \
-    --base base-model-name
-```
+- Activation checkpointing: configure `cfg.ac_mode` (`full`, `selective`, or
+  `none`) and `cfg.selective_ac_option`.
+- Optimizer grouping: embeddings and bias/low-rank parameters skip weight decay
+  by default (see `train.py`). Adjust the optimizer section of your config to
+  change this behaviour.
+- FlexAttention document masking is implemented in
+  `maester/models/gemma/model.py::make_document_mask_wrapper` and covered by
+  `tests/test_packed_attention.py`.
 
-## μP (muP) Validation
+## Testing and troubleshooting
 
-The framework implements μP (muP) parametrization for principled hyperparameter transfer between models of different scales. Here are two validation experiments:
+- Run targeted tests with `pytest`, e.g. `pytest tests/test_packed_sft.py`.
+- Job logs live under `jobs/<job-name>/logs/` and include padding and
+  data-loading statistics.
+- For LUMI, enable the NCCL preflight check by exporting
+  `RUN_NCCL_PREFLIGHT=1` in your SLURM script.
 
-### Coordinate Check
-![Coordinate Check](assets/coord-check.png)
-A basic validation of the μP implementation showing expected behavior across different model scales.
+## Credits and license
 
-### Learning Rate Transfer
-<img src="assets/mutransfer.png" width="300" alt="Learning Rate Transfer">
-
-Demonstration of successful learning rate transfer between models of different sizes, a key benefit of μP parametrization.
-
-The plots themselves can be reproduced using the scripts in the `plots/` directory.
-
-## Project Structure
-
-- `maester/`: Core library code
-  - `datasets/`: Dataset implementations including experimental dataloader
-  - `parallelisms/`: Distributed training implementations
-- `scripts/`: Utility scripts for training, conversion, etc.
-- `jobs/`: Job management and configuration
-- `tests/`: Test suite (WIP)
-
-## Credits
-
-This project builds upon several open-source projects:
-
-- [pytorch/torchtitan](https://github.com/pytorch/torchtitan): Many core features are based on `torchtitan`.
-- [IBM's experimental dataloader](https://github.com/pytorch/torchtitan/pull/376): Distributed dataloader contribution. This framework uses a modified, on-the-fly tokenization pipeline that reads raw texts from Parquet files.
-- [μP (muP)](https://github.com/microsoft/mup): Implementation inspired by Microsoft's muP framework for principled hyperparameter transfer.
-
-## License
-
-See the [LICENSE](LICENSE) file for details.
+Inspired by [pytorch/torchtitan](https://github.com/pytorch/torchtitan) and IBM’s
+experimental dataloader work. Licensed under the terms in [LICENSE](LICENSE).
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Pull requests are welcome; include regression tests when possible.

@@ -62,15 +62,26 @@ def parallelize_llama(
             )
         apply_compile(model)
 
-    if parallel_dims.dp_shard_enabled:
-        if parallel_dims.dp_replicate_enabled:
-            dp_mesh = world_mesh["dp_replicate", "dp_shard"]
+    use_fsdp = parallel_dims.dp_shard_enabled or (
+        world_mesh.ndim == 1 and world_mesh.size() == 1
+    )
+
+    if use_fsdp:
+        if parallel_dims.dp_shard_enabled:
+            if parallel_dims.dp_replicate_enabled:
+                dp_mesh = world_mesh["dp_replicate", "dp_shard"]
+            else:
+                dp_mesh = world_mesh["dp"]
         else:
-            dp_mesh = world_mesh["dp"]
-        
-        apply_fsdp(model, dp_mesh, param_dtype=TORCH_DTYPE_MAP[config.mixed_precision_param], 
-                   reduce_dtype=TORCH_DTYPE_MAP[config.mixed_precision_reduce])
-        if parallel_dims.dp_replicate_enabled:
+            dp_mesh = world_mesh if world_mesh.ndim == 1 else world_mesh["dp"]
+
+        apply_fsdp(
+            model,
+            dp_mesh,
+            param_dtype=TORCH_DTYPE_MAP[config.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[config.mixed_precision_reduce],
+        )
+        if parallel_dims.dp_shard_enabled and parallel_dims.dp_replicate_enabled:
             logger.info("Applied HSDP to the model")
         else:
             logger.info("Applied FSDP to the model")

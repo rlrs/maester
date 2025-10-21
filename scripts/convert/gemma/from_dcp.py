@@ -38,8 +38,7 @@ from torch.distributed.checkpoint._traverse import set_element
 from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.state_dict_loader import _load_state_dict
 
-# Import our model configs
-from maester.models.gemma import gemma_configs, gemma3_configs
+from maester.models.gemma import gemma3_configs
 
 
 class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
@@ -88,6 +87,31 @@ def convert_gemma_from_dcp(
         model_type: "text" or "multimodal"
     """
     
+    # Validate original model directory if provided
+    if original_model_dir:
+        if not original_model_dir.exists():
+            raise ValueError(f"Original model directory does not exist: {original_model_dir}")
+        
+        # Check for essential files
+        has_config = (original_model_dir / "config.json").exists()
+        has_model = (
+            (original_model_dir / "model.safetensors").exists() or 
+            (original_model_dir / "model.safetensors.index.json").exists() or
+            (original_model_dir / "pytorch_model.bin").exists() or
+            (original_model_dir / "pytorch_model.bin.index.json").exists()
+        )
+        
+        if not has_config and not has_model:
+            raise ValueError(
+                f"Original model directory {original_model_dir} does not contain required files. "
+                f"Expected at least one of: config.json, model.safetensors, model.safetensors.index.json, "
+                f"pytorch_model.bin, or pytorch_model.bin.index.json"
+            )
+        
+        if not has_config:
+            print(f"Warning: No config.json found in {original_model_dir}")
+        if not has_model:
+            print(f"Warning: No model weights found in {original_model_dir}")
     print(f"Loading checkpoint from {checkpoint_dir}")
     
     # Load the DCP checkpoint
@@ -191,9 +215,6 @@ def convert_gemma_from_dcp(
             model_type = "text"
         print(f"Detected model type: {model_type}")
     
-    # For multimodal models, restore vision tokens if needed
-    if model_type == "multimodal":
-        state_dict = restore_vision_tokens(state_dict, original_model_dir)
     
     # Split any qkv projections in the state dict
     state_dict = split_qkv_projections(state_dict, config)
@@ -205,7 +226,7 @@ def convert_gemma_from_dcp(
         hf_state_dict = convert_to_hf_multimodal_model(state_dict, original_model_dir, config)
     
     # Save in HuggingFace format
-    save_hf_checkpoint(hf_state_dict, output_dir, original_model_dir, config)
+    save_hf_checkpoint(hf_state_dict, output_dir, original_model_dir, job_config)
     
     print(f"Successfully converted to {output_dir}")
 
@@ -319,61 +340,6 @@ def map_to_hf_multimodal_key(key: str, tensor: torch.Tensor) -> Optional[str]:
     return None
 
 
-def restore_vision_tokens(state_dict: Dict[str, torch.Tensor], original_model_dir: Optional[Path] = None) -> Dict[str, torch.Tensor]:
-    """
-    Restore vision tokens to embeddings for multimodal models.
-    
-    During training, we removed the 64 vision tokens to create text-only vocab (262,144).
-    Now we need to restore them from the original model to match the original size (262,208).
-    """
-    new_state_dict = {}
-    text_only_vocab_size = 262_144
-    original_vocab_size = 262_208
-    
-    for key, value in state_dict.items():
-        if key == "tok_embeddings.weight" and value.shape[0] == text_only_vocab_size:
-            if original_model_dir:
-                # Load vision token embeddings from original model
-                print("Loading vision token embeddings from original model...")
-                from safetensors import safe_open
-                
-                # Find the file containing embeddings
-                index_path = original_model_dir / "model.safetensors.index.json"
-                if index_path.exists():
-                    with open(index_path, 'r') as f:
-                        index = json.load(f)
-                    
-                    embed_key = "language_model.model.embed_tokens.weight"
-                    if embed_key in index["weight_map"]:
-                        file_name = index["weight_map"][embed_key]
-                        file_path = original_model_dir / file_name
-                        
-                        with safe_open(file_path, framework="pt", device="cpu") as f:
-                            orig_embeddings = f.get_tensor(embed_key)
-                            # Extract vision tokens (last 64)
-                            vision_embeddings = orig_embeddings[text_only_vocab_size:original_vocab_size]
-                            # Convert to same dtype as our embeddings
-                            vision_embeddings = vision_embeddings.to(value.dtype)
-                            
-                            # Concatenate text embeddings with vision embeddings
-                            new_value = torch.cat([value, vision_embeddings], dim=0)
-                            print(f"Restored embeddings from {value.shape[0]} to {new_value.shape[0]} tokens (added {vision_embeddings.shape[0]} vision tokens from original)")
-                            new_state_dict[key] = new_value
-                            continue
-                
-                print("Warning: Could not find embeddings in original model, padding with zeros")
-            
-            # Fallback: pad with zeros if we can't load from original
-            num_vision_tokens = original_vocab_size - text_only_vocab_size
-            padding = torch.zeros(num_vision_tokens, value.shape[1], dtype=value.dtype)
-            new_value = torch.cat([value, padding], dim=0)
-            print(f"Restored embeddings from {value.shape[0]} to {new_value.shape[0]} tokens (padded with zeros)")
-            new_state_dict[key] = new_value
-        else:
-            new_state_dict[key] = value
-    
-    return new_state_dict
-
 
 def split_qkv_projections(state_dict: Dict[str, torch.Tensor], config: Optional[Dict[str, Any]] = None) -> Dict[str, torch.Tensor]:
     """Split combined qkv_proj back into separate q, k, v projections."""
@@ -462,6 +428,53 @@ def split_qkv_projections(state_dict: Dict[str, torch.Tensor], config: Optional[
     return new_state_dict
 
 
+def update_tokenizer_config_for_sft(output_dir: Path, job_config: Dict[str, Any]):
+    """Update tokenizer_config.json with chat template based on SFT configuration."""
+    tokenizer_config_path = output_dir / "tokenizer_config.json"
+    
+    if not tokenizer_config_path.exists():
+        print("Warning: tokenizer_config.json not found, skipping chat template update")
+        return
+    
+    # Load existing tokenizer config
+    with open(tokenizer_config_path, "r") as f:
+        tokenizer_config = json.load(f)
+    
+    sft_config = job_config.get("sft", {})
+    
+    # Get the template type and tokens
+    template_type = sft_config.get("template", "chatml")
+    im_start_token = sft_config.get("im_start_token", "<start_of_turn>")
+    im_end_token = sft_config.get("im_end_token", "<end_of_turn>")
+    
+    if template_type == "chatml":
+        # Create Gemma-style chat template with our custom tokens
+        # This is a simplified version - you may want to copy the full template from the Gemma config
+        chat_template = (
+            "{{ bos_token }}"
+            "{% for message in messages %}"
+            "{% if message['role'] == 'user' %}"
+            f"{im_start_token}user\n{{{{ message['content'] }}}}{im_end_token}\n"
+            "{% elif message['role'] == 'assistant' %}"
+            f"{im_start_token}model\n{{{{ message['content'] }}}}{im_end_token}\n"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}"
+            f"{im_start_token}model\n"
+            "{% endif %}"
+        )
+        
+        # Update the config
+        tokenizer_config["chat_template"] = chat_template
+        
+        # Save updated config
+        with open(tokenizer_config_path, "w") as f:
+            json.dump(tokenizer_config, f, indent=2)
+        
+        print(f"Updated tokenizer_config.json with {template_type} chat template using tokens: {im_start_token}, {im_end_token}")
+    else:
+        print(f"Warning: Unknown template type '{template_type}', skipping chat template update")
+
 def load_vision_components(original_model_dir: Path) -> Dict[str, torch.Tensor]:
     """Load vision components from original model."""
     vision_state_dict = {}
@@ -503,7 +516,7 @@ def save_hf_checkpoint(
     state_dict: Dict[str, torch.Tensor], 
     output_dir: Path, 
     original_model_dir: Optional[Path],
-    config: Optional[Dict[str, Any]] = None
+    job_config: Optional[Dict[str, Any]] = None
 ):
     """Save checkpoint in HuggingFace format."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -555,7 +568,7 @@ def save_hf_checkpoint(
         import shutil
         
         # Config files
-        config_files = ["config.json", "generation_config.json", "tokenizer_config.json"]
+        config_files = ["config.json", "generation_config.json", "tokenizer_config.json", "preprocessor_config.json"]
         
         # Tokenizer files - both standard and Gemma-specific
         tokenizer_files = [
@@ -570,6 +583,10 @@ def save_hf_checkpoint(
                 shutil.copy2(src, output_dir / file_name)
                 print(f"Copied {file_name}")
     
+    # Update tokenizer_config.json with chat template if SFT was enabled
+    if job_config and job_config.get("sft", {}):
+        update_tokenizer_config_for_sft(output_dir, job_config)
+        
     print(f"Saved checkpoint to {output_dir}")
 
 

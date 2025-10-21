@@ -1,5 +1,6 @@
 # IBM experimental dataloader contributed to torchtitan but not merged.
 # Modified here to include on-the-fly tokenization, reading raw texts from Parquet.
+import bisect
 import csv
 import hashlib
 import json
@@ -7,7 +8,8 @@ import math
 import os
 import random
 import time
-from typing import Any, Callable, List, Optional, Set
+from collections import OrderedDict
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -886,6 +888,10 @@ class ParquetDataset(_Stateful_Dataset):
         max_chunksize: int = 1024,
         verbose: bool = False,
         shuffle: bool = True,
+        data_column: str = "text",
+        process_fn: Optional[Callable] = None,
+        raw_data_mode: bool = False,
+        cache_row_groups: bool = True,
     ):
         super(ParquetDataset, self).__init__(rank, worldsize)
         self.seed = seed
@@ -898,8 +904,15 @@ class ParquetDataset(_Stateful_Dataset):
         self.bos = bos_token
         self.drop = strip_tokens
         self.verbose = verbose
+        self.data_column = data_column
+        self.raw_data_mode = raw_data_mode
+        self.process_fn = process_fn or self._default_process
+        self.cache_row_groups = cache_row_groups  # toggle to keep parquet row groups in memory
         self.docset: List[Any] = []  # map of doc indices to (file_path, min docid, max docid)
         self.docs_per_file = {}
+        # Row-group metadata and cache keyed by file path, used to avoid repeated scans and reads
+        self._row_group_prefix: Dict[str, List[int]] = {}
+        self._row_group_cache: Dict[str, OrderedDict[int, pa.Table]] = {}
 
         # Guaranteed inconsistent shuffling across workers
         random.seed(self.seed + rank)
@@ -986,6 +999,10 @@ class ParquetDataset(_Stateful_Dataset):
             "lcg_state",
         ]
 
+    def _default_process(self, data):
+        """Default processing: tokenize text data."""
+        return self.tokenizer.encode(data, add_special_tokens=False, padding=False, truncation=False)
+
     def _generate_dataset_hash(self):
         """Generate a unique hash for the dataset based on file names and sizes."""
         hasher = hashlib.md5()
@@ -1033,13 +1050,34 @@ class ParquetDataset(_Stateful_Dataset):
                 return shardid, docrange, min_d
         raise RuntimeError("This should be unreachable")
 
+    def _prepare_row_group_metadata(self, path: str, reader: pq.ParquetFile):
+        num_groups = reader.num_row_groups
+        assert num_groups > 0, f"Parquet file {path} has no row groups"
+
+        if path not in self._row_group_prefix:
+            prefix = []
+            running_total = 0
+            for i in range(num_groups):
+                running_total += reader.metadata.row_group(i).num_rows
+                prefix.append(running_total)
+            self._row_group_prefix[path] = prefix
+
+        if self.cache_row_groups and path not in self._row_group_cache:
+            self._row_group_cache[path] = OrderedDict()
+
     def _get_reader(self, path, newpath, reader):
         if newpath != path:
-            del reader
+            if self.cache_row_groups and path in self._row_group_cache:
+                self._row_group_cache.pop(path, None)
+            if reader is not None:
+                del reader
             if self.verbose:
                 logger.info(f"Worker {self.rank} opening new file {newpath}")
             reader = pq.ParquetFile(newpath)
             path = newpath
+            self._prepare_row_group_metadata(path, reader)
+        elif path and path not in self._row_group_prefix:
+            self._prepare_row_group_metadata(path, reader)
         return path, reader
 
     def _construct_chunk(self, j, doc, n_chunks):
@@ -1076,20 +1114,29 @@ class ParquetDataset(_Stateful_Dataset):
             if state < size:
                 return state
             
-    def _read_specific_row(self, reader, row_index):
-        row_group_index = 0
-        rows_seen = 0
-        for i in range(reader.num_row_groups):
-            num_rows = reader.metadata.row_group(i).num_rows
-            if rows_seen + num_rows > row_index:
-                row_group_index = i
-                break
-            rows_seen += num_rows
+    def _read_specific_row(self, path, reader, row_index):
+        prefix = self._row_group_prefix[path]
+        row_group_index = bisect.bisect_right(prefix, row_index)
+        assert (
+            row_group_index < len(prefix)
+        ), f"Row index {row_index} exceeds total rows for {path}"
+        rows_before_group = prefix[row_group_index - 1] if row_group_index > 0 else 0
+        row_offset = row_index - rows_before_group
 
-        row_offset = row_index - rows_seen
-        table = reader.read_row_group(row_group_index)
-        row = table.slice(row_offset, 1)
-        return row
+        if not self.cache_row_groups:
+            table = reader.read_row_group(row_group_index, columns=[self.data_column])
+            return table.slice(row_offset, 1)
+
+        cache = self._row_group_cache[path]
+        if row_group_index in cache:
+            table = cache[row_group_index]
+            cache.move_to_end(row_group_index)
+        else:
+            table = reader.read_row_group(row_group_index, columns=[self.data_column])
+            cache[row_group_index] = table
+            cache.move_to_end(row_group_index)
+
+        return table.slice(row_offset, 1)
 
     def __iter__(self):
         docset_offset = self.docset_index
@@ -1136,12 +1183,59 @@ class ParquetDataset(_Stateful_Dataset):
                 newpath = file_path
                 path, reader = self._get_reader(path, newpath, reader)
                 
-                table = self._read_specific_row(reader, local_row)
-                text = table['text'][0].as_py()
-                doc = self.tokenizer.encode(text, add_special_tokens=False, padding=False, truncation=False)
-                if len(doc) < 2:
-                    logger.warning(f"Empty document detected at {file_path}:{local_row}")
-                    continue
+                table = self._read_specific_row(path, reader, local_row)
+                data = table[self.data_column][0].as_py()
+                
+                if self.raw_data_mode:
+                    # In raw data mode, yield the data directly without processing
+                    self.docs_seen += 1
+                    self.percent_seen = (self.docs_seen * 100 / (self._len + 1e-9))
+                    self.completed_current_doc = True
+                    yield data
+                else:
+                    # Normal mode: process and chunk the data
+                    doc = self.process_fn(data)
+                    if len(doc) < 2:
+                        logger.warning(f"Empty document detected at {file_path}:{local_row}")
+                        continue
+
+                    if doc[0] in self.drop:
+                        doc = doc[1:]
+                    if doc[-1] in self.drop:
+                        doc = doc[:-1]
+
+                    doclen = len(doc) + 1 if self.bos is None else len(doc) + 2
+                    if doclen >= self.min_length:
+                        n_chunks = math.ceil(doclen / self.chunksize)
+                        for j in range(n_chunks):
+                            if i == 0 and not self.completed_current_doc and j < residual_chunks:
+                                pass # skip already processed chunks
+                                # doclcg = self.lcg_state # use saved lcg state when resuming
+                            else:
+                                self.chunk_index = j
+                                # Document complete, update stats
+                                if j == n_chunks - 1:
+                                    self.docs_seen += 1
+                                    self.percent_seen = (self.docs_seen * 100 / (self._len + 1e-9))
+                                    self.chunk_index = -1
+                                    self.completed_current_doc = True
+                                out = self._construct_chunk(j, doc, n_chunks)
+                                # print(f"ParquetDataset: yielding chunk {j}/{n_chunks}, length {len(out)}, first tokens: {out[:5]}...")
+                                yield out
+
+            # Load any chunks initially skipped in first doc (only in non-raw mode)
+            if not self.raw_data_mode:
+                self.docset_index = docset_offset
+                self.lcg_state = lcg_offset
+                file_path, docrange, mindoc = self._get_docid(docset_offset)
+                # Use the saved document mapping from the first document processing
+                doclcg = first_doc_mapping
+                local_row = doclcg + mindoc
+                newpath = file_path
+                path, reader = self._get_reader(path, newpath, reader)
+                table = self._read_specific_row(path, reader, local_row)
+                data = table[self.data_column][0].as_py()
+                doc = self.process_fn(data)
 
                 if doc[0] in self.drop:
                     doc = doc[1:]
@@ -1151,48 +1245,11 @@ class ParquetDataset(_Stateful_Dataset):
                 doclen = len(doc) + 1 if self.bos is None else len(doc) + 2
                 if doclen >= self.min_length:
                     n_chunks = math.ceil(doclen / self.chunksize)
-                    for j in range(n_chunks):
-                        if i == 0 and not self.completed_current_doc and j < residual_chunks:
-                            pass # skip already processed chunks
-                            # doclcg = self.lcg_state # use saved lcg state when resuming
-                        else:
-                            self.chunk_index = j
-                            # Document complete, update stats
-                            if j == n_chunks - 1:
-                                self.docs_seen += 1
-                                self.percent_seen = (self.docs_seen * 100 / (self._len + 1e-9))
-                                self.chunk_index = -1
-                                self.completed_current_doc = True
-                            out = self._construct_chunk(j, doc, n_chunks)
-                            # print(f"ParquetDataset: yielding chunk {j}/{n_chunks}, length {len(out)}, first tokens: {out[:5]}...")
-                            yield out
-
-            # Load any chunks initially skipped in first doc
-            self.docset_index = docset_offset
-            self.lcg_state = lcg_offset
-            file_path, docrange, mindoc = self._get_docid(docset_offset)
-            # Use the saved document mapping from the first document processing
-            doclcg = first_doc_mapping
-            local_row = doclcg + mindoc
-            newpath = file_path
-            path, reader = self._get_reader(path, newpath, reader)
-            table = self._read_specific_row(reader, local_row)
-            text = table['text'][0].as_py()
-            doc = self.tokenizer.encode(text, add_special_tokens=False, padding=False, truncation=False)
-
-            if doc[0] in self.drop:
-                doc = doc[1:]
-            if doc[-1] in self.drop:
-                doc = doc[:-1]
-
-            doclen = len(doc) + 1 if self.bos is None else len(doc) + 2
-            if doclen >= self.min_length:
-                n_chunks = math.ceil(doclen / self.chunksize)
-                for j in range(residual_chunks):
-                    self.chunk_index = j
-                    out = self._construct_chunk(j, doc, n_chunks)
-                    # print(f"ParquetDataset: yielding chunk {j}/{n_chunks}, first tokens: {out[:5]}...")
-                    yield out
+                    for j in range(residual_chunks):
+                        self.chunk_index = j
+                        out = self._construct_chunk(j, doc, n_chunks)
+                        # print(f"ParquetDataset: yielding chunk {j}/{n_chunks}, first tokens: {out[:5]}...")
+                        yield out
 
     def load_state_dict(self, state_dicts, sharded_input=False):
         assert self.load_worldsize == self.worldsize, f"ParquetDataset does not support rescaling: from {self.load_worldsize} to {self.worldsize}"
@@ -1487,7 +1544,7 @@ def build_experimental_data_loader(cfg, rank, world_size):
         t = data_seq.clone()[1:]
         data_seq = data_seq[:-1]
         t[:prompt_len] = -100
-        return data_seq, t
+        return {"input_ids": data_seq, "labels": t}
     
     if os.path.isfile(cfg.tokenizer_name):
         tokenizer = PreTrainedTokenizerFast(tokenizer_file=cfg.tokenizer_name)
@@ -1514,6 +1571,7 @@ def build_experimental_data_loader(cfg, rank, world_size):
         weights=weights,
         seed=42,
         verbose=(rank == 0),
+        cache_row_groups=cfg.dataset.cache_row_groups,
         # n_logical_shards=cfg.dataset.data_logical_shards,
     )
 
@@ -1529,11 +1587,15 @@ def build_experimental_data_loader(cfg, rank, world_size):
     data = Preprocess_Dataset(data, causal_lm)
     # Enable auto-saving
     if cfg.enable_checkpoint: # and not cfg.model_weights_only: # model_weights_only is only for final weight export...
+        grad_accum_steps = getattr(cfg, "gradient_accumulation_steps", 1)
+        grad_accum_steps = max(1, grad_accum_steps)
+        # Track optimizer-scale steps so dataloader checkpoints line up with model checkpoints
+        steps_per_checkpoint_step = cfg.train_batch_size * grad_accum_steps
         data = Checkpoint_Dataset(
             data,
             os.path.join(cfg.dump_dir, cfg.job_name, cfg.checkpoint_folder, "dataloader"),
             cfg.checkpoint_interval,
-            cfg.train_batch_size,
+            steps_per_checkpoint_step,
         )
     # warning: things *will* break with num_workers > 1
     return torch.utils.data.DataLoader(

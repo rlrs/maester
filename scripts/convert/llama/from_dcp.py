@@ -96,8 +96,8 @@ if __name__ == "__main__":
         hf_config.torch_dtype = dtype
         hf_config.num_hidden_layers = max([int(re.search(r'layers.(\d+)', k).group(1)) for k in sd.keys() if 'layers' in k]) + 1
         hf_config.hidden_size = sd['layers.0.attention.wq.weight'].shape[0]
-        hf_config.num_attention_heads = 24 # TODO: read all these from a config
-        hf_config.num_key_value_heads = 8
+#        hf_config.num_attention_heads = 32 # TODO: read all these from a config
+#        hf_config.num_key_value_heads = 8
         hf_config.intermediate_size = sd['layers.0.feed_forward.w1.weight'].shape[0]
         hf_config.vocab_size = sd['tok_embeddings.weight'].shape[0]
         hf_config.bos_token_id = hf_tokenizer.bos_token_id

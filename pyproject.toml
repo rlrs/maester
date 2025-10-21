@@ -5,9 +5,13 @@ description = "Add your description here"
 authors = [
     { name = "Rasmus Larsen", email = "rasmus.larsen@alexandra.dk" }
 ]
+readme = "README.md"
+requires-python = ">= 3.11, <3.12"
+
+# Base deps (Linux CPU-only works from PyPI)
 dependencies = [
-    "torch>=2.6",
-    "transformers>=4.47.1",
+    "torch>=2.7",
+    "transformers>=4.54.0",
     "datasets>=2.16.0",
     "numpy<2",
     "matplotlib>=3.8.4",
@@ -18,17 +22,10 @@ dependencies = [
     "sentencepiece",
     "pydantic",
     "tensorboard",
-    # "distributed-shampoo",
-    "pydantic-settings>=2.6.0",
-    # "pytorch-triton-rocm",
-    # "torchvision",
-    # "torchdata",
-    # "scandeval",
-    "triton",
-    "cut-cross-entropy"
+    "pydantic-settings[toml]>=2.6.0",
+    "triton>=3",  # OpenAI Triton (PyPI). Not the same as pytorch-triton.
+    "cut-cross-entropy",
 ]
-readme = "README.md"
-requires-python = ">= 3.10, <3.12"
 
 [build-system]
 requires = ["hatchling"]
@@ -40,49 +37,83 @@ allow-direct-references = true
 [tool.hatch.build.targets.wheel]
 packages = ["maester/"]
 
+# ────────────────────────── uv (Linux-only) ──────────────────────────
 [tool.uv]
+# Only solve for Linux.
+environments = ["sys_platform == 'linux'"]
+
+# Prevent mixing CUDA/ROCm and stable/nightly.
 conflicts = [
-    #[
-    #    { extra = "rocm" },
-    #    { extra = "cuda" }
-    #],
-    [
-        { extra = "rocm" },
-        { extra = "inference" }
-    ]
+  [ { extra = "cuda" },         { extra = "cuda-nightly" } ],
+  [ { extra = "rocm" },         { extra = "rocm-nightly" } ],
+  [ { extra = "cuda" },         { extra = "rocm" } ],
+  [ { extra = "cuda" },         { extra = "rocm-nightly" } ],
+  [ { extra = "cuda-nightly" }, { extra = "rocm" } ],
+  [ { extra = "cuda-nightly" }, { extra = "rocm-nightly" } ],
 ]
 
+# PyTorch indices (stable + nightly)
 [[tool.uv.index]]
-name = "pytorch-rocm"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128-nightly"
+url = "https://download.pytorch.org/whl/nightly/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm63"
+url = "https://download.pytorch.org/whl/rocm6.3"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm63-nightly"
 url = "https://download.pytorch.org/whl/nightly/rocm6.3"
 explicit = true
 
-[[tool.uv.index]]
-name = "pytorch-cuda"
-url = "https://download.pytorch.org/whl/nightly/cu124"
-explicit = true
+# Route packages to indices only when the matching extra is selected
+[tool.uv.sources]
+# Git sources
+distributed-shampoo = { git = "https://github.com/facebookresearch/optimizers.git" }
+cut-cross-entropy   = { git = "https://github.com/apple/ml-cross-entropy.git" }
 
-[project.optional-dependencies]
-rocm = [
-    "torch",
-    "torchvision",
-    "torchdata",
-    "triton",
-    "pytorch-triton-rocm"
+# Core PyTorch
+torch = [
+  { index = "pytorch-cu128",          extra = "cuda" },
+  { index = "pytorch-cu128-nightly",  extra = "cuda-nightly" },
+  { index = "pytorch-rocm63",         extra = "rocm" },
+  { index = "pytorch-rocm63-nightly", extra = "rocm-nightly" },
 ]
-# cuda = [
-#     "torch",
-#     "torchvision",
-#     "torchdata",
-#     "triton"
-# ]
-# inference = [
-#     "scandeval",
-#     "vllm",
-#     "scandeval",
-#     "xformers>=0.0.28",
-# ]
 
+# Companions
+torchvision = [
+  { index = "pytorch-cu128",          extra = "cuda" },
+  { index = "pytorch-cu128-nightly",  extra = "cuda-nightly" },
+  { index = "pytorch-rocm63",         extra = "rocm" },
+  { index = "pytorch-rocm63-nightly", extra = "rocm-nightly" },
+]
+
+torchdata = [
+  { index = "pytorch-cu128",          extra = "cuda" },
+  { index = "pytorch-cu128-nightly",  extra = "cuda-nightly" },
+  { index = "pytorch-rocm63",         extra = "rocm" },
+  { index = "pytorch-rocm63-nightly", extra = "rocm-nightly" },
+]
+
+# PyTorch's Triton runtime wheels
+pytorch-triton = [
+  { index = "pytorch-cu128",          extra = "cuda" },
+  { index = "pytorch-cu128-nightly",  extra = "cuda-nightly" },
+]
+
+pytorch-triton-rocm = [
+  { index = "pytorch-rocm63",         extra = "rocm" },
+  { index = "pytorch-rocm63-nightly", extra = "rocm-nightly" },
+]
+
+# ────────────────────────── Linting / typing ──────────────────────────
 [tool.pylint."MESSAGES CONTROL"]
 max-line-length = 120
 disable = ["missing-class-docstring"]
@@ -91,25 +122,41 @@ disable = ["missing-class-docstring"]
 venvPath = "."
 venv = ".venv"
 
-[tool.uv.sources]
-distributed-shampoo = { git = "https://github.com/facebookresearch/optimizers.git" }
-cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git" }
-torch = [
-    { index = "pytorch-rocm", extra = "rocm" },
-    #{ index = "pytorch-cuda", extra = "cuda" },
+# ────────────────────────── Optional dependency groups ──────────────────────────
+# IMPORTANT: Any package gated by `tool.uv.sources` + `extra=...` must also appear here.
+
+[project.optional-dependencies]
+# CUDA 12.8 (stable)
+cuda = [
+    "torch>=2.7",
+    "torchvision",
+    "torchdata",
+    "pytorch-triton==3.3.0",
+    "triton==3.3.1"
 ]
-torchvision = [
-    { index = "pytorch-rocm", extra = "rocm" },
-    #{ index = "pytorch-cuda", extra = "cuda" },
+
+# CUDA 12.8 (nightly)
+cuda-nightly = [
+    "torch>=2.7",
+    "torchvision",
+    "torchdata",
+    "pytorch-triton",
 ]
-pytorch-triton-rocm = [
-    { index = "pytorch-rocm", extra = "rocm" },
+
+# ROCm 6.3 (stable)
+rocm = [
+    "torch>=2.7",
+    "torchvision",
+    "torchdata",
+    "pytorch-triton-rocm",
+    "liger-kernel",
 ]
-torchdata = [
-    { index = "pytorch-rocm", extra = "rocm" },
-    #{ index = "pytorch-cuda", extra = "cuda" },
+
+# ROCm 6.3 (nightly)
+rocm-nightly = [
+    "torch>=2.7",
+    "torchvision",
+    "torchdata",
+    "pytorch-triton-rocm",
+    "liger-kernel",
 ]
-# triton = [
-#     { index = "pytorch-rocm", extra = "rocm" },
-#     { index = "pytorch-cuda", extra = "cuda" },
-# ]
