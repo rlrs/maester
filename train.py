@@ -408,11 +408,11 @@ def main():
                     # TODO: re-enable grad norm logging?
                     # param_to_name = {param: name for name, param in model.named_parameters()}
                     # exp_avgs, exp_avg_sqs, param_names = [], [], []
-                    # for group in optimizer.param_groups:
+                    # for group in optimizers.param_groups:
                     #     for p in group['params']:
                     #         if p.grad is None:
                     #             continue
-                    #         state = optimizer.state[p]
+                    #         state = optimizers.state[p]
                     #         if 'exp_avg' in state:  # Check if states initialized
                     #             exp_avgs.append(state['exp_avg'])
                     #             exp_avg_sqs.append(state['exp_avg_sq'])
