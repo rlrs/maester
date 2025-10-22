@@ -112,47 +112,6 @@ class ModelArgs:
         return nparams, num_flops_per_token
 
 
-# -------------------------
-# GLM4 MoE Model Implementation
-# -------------------------
-# Adapted from https://github.com/huggingface/transformers/blob/e11a00a16f925b7d3b52f5007bdce3464edb361f/src/transformers/models/glm4_moe/modeling_glm4_moe.py
-
-# def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-#     """
-#     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-#     num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-#     """
-#     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-#     if n_rep == 1:
-#         return hidden_states
-#     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-#     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-# def rotate_half(x):
-#     """Rotates half the hidden dims of the input."""
-#     x1 = x[..., : x.shape[-1] // 2]
-#     x2 = x[..., x.shape[-1] // 2 :]
-#     return torch.cat((-x2, x1), dim=-1)
-
-# def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-#     """Applies Rotary Position Embedding to the query and key tensors."""
-#     cos = cos.unsqueeze(unsqueeze_dim)
-#     sin = sin.unsqueeze(unsqueeze_dim)
-
-#     # Keep half or full tensor for later concatenation
-#     rotary_dim = cos.shape[-1]
-#     q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-#     k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-
-#     # Apply rotary embeddings on the first half or full tensor
-#     q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-#     k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
-
-#     # Concatenate back to full shape
-#     q_embed = torch.cat([q_embed, q_pass], dim=-1)
-#     k_embed = torch.cat([k_embed, k_pass], dim=-1)
-#     return q_embed, k_embed
-
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     """
     Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
@@ -466,101 +425,6 @@ class Glm4MoeMLP(nn.Module):
         if self.down_proj.bias is not None:
             self.down_proj.bias.data.zero_()
 
-# class Glm4MoeTopkRouter(nn.Module):
-#     def __init__(self, config: ModelArgs):
-#         super().__init__()
-#         self.config = config
-#         self.top_k = config.num_experts_per_tok
-#         self.n_routed_experts = config.n_routed_experts
-#         self.routed_scaling_factor = config.routed_scaling_factor
-#         self.n_group = config.n_group
-#         self.topk_group = config.topk_group
-#         self.norm_topk_prob = config.norm_topk_prob
-
-#         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.dim)))
-#         self.register_buffer("e_score_correction_bias", torch.zeros((self.n_routed_experts), dtype=torch.float32))
-
-#     def forward(self, hidden_states):
-#         hidden_states = hidden_states.view(-1, self.config.dim)
-#         router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
-#         return router_logits
-
-# class Glm4MoeNaiveMoe(nn.Module):
-#     """ModuleList of experts."""
-
-#     def __init__(self, config: ModelArgs):
-#         super().__init__()
-#         self.num_experts = config.n_routed_experts
-#         self.experts = nn.ModuleList(
-#             [Glm4MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
-#         )
-
-#     def forward(
-#         self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
-#     ) -> torch.Tensor:
-#         final_hidden_states = torch.zeros_like(hidden_states)
-#         expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
-
-#         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-#         for expert_idx in expert_hit:
-#             idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
-#             current_state = hidden_states[top_x].reshape(-1, hidden_states.shape[-1])
-#             current_hidden_states = self.experts[expert_idx](current_state) * top_k_weights[top_x, idx, None]
-#             final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-#         return final_hidden_states
-
-# class Glm4MoeMoE(nn.Module):
-#     """A mixed expert module containing shared experts."""
-
-#     def __init__(self, config: ModelArgs):
-#         super().__init__()
-#         self.config = config
-#         self.experts = Glm4MoeNaiveMoe(config)
-#         self.gate = Glm4MoeTopkRouter(config)
-#         self.shared_experts = Glm4MoeMLP(
-#             config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
-#         )
-#         self.n_routed_experts = config.n_routed_experts
-#         self.n_group = config.n_group
-#         self.topk_group = config.topk_group
-#         self.norm_topk_prob = config.norm_topk_prob
-#         self.routed_scaling_factor = config.routed_scaling_factor
-#         self.top_k = config.num_experts_per_tok
-
-#     def route_tokens_to_experts(self, router_logits):
-#         router_logits = router_logits.sigmoid()
-#         router_logits = router_logits + self.gate.e_score_correction_bias
-#         group_scores = (
-#             router_logits.view(-1, self.n_group, self.n_routed_experts // self.n_group).topk(2, dim=-1)[0].sum(dim=-1)
-#         )
-#         group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-#         group_mask = torch.zeros_like(group_scores)
-#         group_mask.scatter_(1, group_idx, 1)
-#         score_mask = (
-#             group_mask.unsqueeze(-1)
-#             .expand(-1, self.n_group, self.n_routed_experts // self.n_group)
-#             .reshape(-1, self.n_routed_experts)
-#         )
-#         scores_for_choice = router_logits.masked_fill(~score_mask.bool(), 0.0)
-#         topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
-#         topk_weights = router_logits.gather(1, topk_indices)
-#         if self.norm_topk_prob:
-#             denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
-#             topk_weights /= denominator
-#         topk_weights = topk_weights * self.routed_scaling_factor
-#         return topk_indices, topk_weights
-
-#     def forward(self, hidden_states):
-#         residuals = hidden_states
-#         orig_shape = hidden_states.shape
-#         router_logits = self.gate(hidden_states)
-#         topk_indices, topk_weights = self.route_tokens_to_experts(router_logits)
-#         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-#         hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(*orig_shape)
-#         residuals_flat = residuals.view(-1, residuals.size(-1))
-#         shared = self.shared_experts(residuals_flat).view_as(residuals)
-#         hidden_states = hidden_states + shared
-#         return hidden_states
 
 class Glm4MoeDecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
@@ -615,29 +479,6 @@ class Glm4MoeDecoderLayer(nn.Module):
         self.input_layernorm.reset_parameters()
         self.post_attention_layernorm.reset_parameters()
 
-# class Glm4MoeRotaryEmbedding(nn.Module):
-#     def __init__(self, config: ModelArgs, device=None):
-#         super().__init__()
-#         self.config = config
-#         self.max_seq_len_cached = config.max_position_embeddings
-#         self.original_max_seq_len = config.max_position_embeddings
-
-#         # Compute the inverse frequency
-#         inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, config.head_dim, 2).float() / config.head_dim))
-#         self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-#     def forward(self, x, position_ids):
-#         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-#         position_ids_expanded = position_ids[:, None, :].float()
-
-#         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-#         with torch.autocast(device_type=device_type, enabled=False):
-#             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-#             emb = torch.cat((freqs, freqs), dim=-1)
-#             cos = emb.cos()
-#             sin = emb.sin()
-
-#         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 class Glm4MoeTextModel(nn.Module):
     """GLM4 MoE Text Model compatible with training setup."""
@@ -670,36 +511,6 @@ class Glm4MoeTextModel(nn.Module):
         nn.init.normal_(self.tok_embeddings.weight, std=self.config.initializer_range)
 
         self.model.init_weights()
-
-        # # Initialize layers
-        # for layer in self.model.layers.values():
-        #     # Initialize attention weights
-        #     nn.init.normal_(layer.self_attn.q_proj.weight, mean=0.0, std=self.config.initializer_range)
-        #     nn.init.normal_(layer.self_attn.k_proj.weight, mean=0.0, std=self.config.initializer_range)
-        #     nn.init.normal_(layer.self_attn.v_proj.weight, mean=0.0, std=self.config.initializer_range)
-        #     nn.init.normal_(layer.self_attn.o_proj.weight, mean=0.0, std=self.config.initializer_range)
-
-            # # Initialize MLP weights
-            # if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate_proj'):  # Dense MLP
-            #     nn.init.normal_(layer.mlp.gate_proj.weight, mean=0.0, std=self.config.initializer_range)
-            #     nn.init.normal_(layer.mlp.up_proj.weight, mean=0.0, std=self.config.initializer_range)
-            #     nn.init.normal_(layer.mlp.down_proj.weight, mean=0.0, std=self.config.initializer_range)
-            # else:  # MoE
-                # # Initialize router
-                # nn.init.normal_(layer.moe.gate.weight, mean=0.0, std=self.config.initializer_range)
-                # # Initialize experts
-                # for expert in layer.moe.experts.experts:
-                #     nn.init.normal_(expert.gate_proj.weight, mean=0.0, std=self.config.initializer_range)
-                #     nn.init.normal_(expert.up_proj.weight, mean=0.0, std=self.config.initializer_range)
-                #     nn.init.normal_(expert.down_proj.weight, mean=0.0, std=self.config.initializer_range)
-                # # Initialize shared experts
-                # nn.init.normal_(layer.moe.shared_experts.gate_proj.weight, mean=0.0, std=self.config.initializer_range)
-                # nn.init.normal_(layer.moe.shared_experts.up_proj.weight, mean=0.0, std=self.config.initializer_range)
-                # nn.init.normal_(layer.moe.shared_experts.down_proj.weight, mean=0.0, std=self.config.initializer_range)
-
-            # # Initialize normalization layers
-            # layer.input_layernorm.reset_parameters()
-            # layer.post_attention_layernorm.reset_parameters()
 
         # Initialize final norm
         self.model.norm.reset_parameters()
