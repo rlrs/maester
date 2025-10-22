@@ -32,7 +32,6 @@ class ModelArgs:
     max_position_embeddings: int = 131072
     initializer_range: float = 0.02
     rms_norm_eps: float = 1e-05  # Updated to match MoE config
-    use_cache: bool = True
     tie_word_embeddings: bool = False
     rope_theta: float = 10000.0
     rope_scaling: Optional[dict] = None
@@ -45,14 +44,7 @@ class ModelArgs:
     # MoE-specific parameters
     moe_args: MoEArgs = field(default_factory=MoEArgs)
     moe_intermediate_size: int = 1408
-    num_experts_per_tok: int = 8
-    n_shared_experts: int = 1
-    n_routed_experts: int = 128
-    routed_scaling_factor: float = 1.0
-    n_group: int = 1
-    topk_group: int = 1
     first_k_dense_replace: int = 1
-    norm_topk_prob: bool = True
     use_qk_norm: bool = False
 
 
@@ -84,7 +76,7 @@ class ModelArgs:
         nparams_sparse_active = (
             nparams_moe_router
             + nparams_shared_expert
-            + nparams_experts * self.num_experts_per_tok // self.n_routed_experts
+            + nparams_experts * self.moe_args.top_k // max(self.moe_args.num_experts, 1)
         )
 
         logger.info(
