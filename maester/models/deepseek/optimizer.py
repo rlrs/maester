@@ -42,7 +42,7 @@ def build_deepseek_optimizers(model: nn.Module, cfg: Config, parallel_dims: Para
         hook_stats.clear()
         
         # Iterate through model layers
-        for layer_name, layer in model.layers.items():
+        for layer_name, layer in model.model.layers.items():
             if hasattr(layer, 'moe_enabled') and layer.moe_enabled:
                 moe = layer.moe
                 if hasattr(moe, 'load_balance_coeff') and moe.load_balance_coeff is not None:
