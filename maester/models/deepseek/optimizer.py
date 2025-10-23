@@ -43,9 +43,11 @@ def build_deepseek_optimizers(model: nn.Module, cfg: Config, parallel_dims: Para
         
         # Iterate through model layers
         for layer_name, layer in model.model.layers.items():
-            if hasattr(layer, 'moe_enabled') and layer.moe_enabled:
+            if layer.moe_enabled:
                 moe = layer.moe
-                if hasattr(moe, 'load_balance_coeff') and moe.load_balance_coeff is not None:
+                if moe.load_balance_coeff is None:
+                    continue  # No load balancing for this layer TODO: log?
+                else:
                     # Sync tokens_per_expert across data parallel ranks if needed
                     if dp_cp_mesh is not None:
                         torch.distributed.all_reduce(
