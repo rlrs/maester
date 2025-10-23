@@ -133,9 +133,13 @@ class Muon(torch.optim.Optimizer):
                 self.mesh = p._spec.device_mesh
                 
                 if pg["use_muon"]:
-                    self.state[p] = dict(m=torch.zeros_like(p))
                     if p.ndim < 2:
                         raise ValueError(f"0/1D parameters are banned from Muon; user provided {p.shape=}")
+                    m_buf = torch.zeros_like(p.flatten(1))
+                    self.state[p] = dict(
+                        m=m_buf,
+                        param_shape=tuple(p.shape),
+                    )
                     if p.ndim > 2:
                         print(f"WARNING: muon used for {p.shape=}")
                 else:
@@ -150,9 +154,25 @@ class Muon(torch.optim.Optimizer):
         if group["use_muon"]:
             pg, lr, wd, momentum = group["params"], group["lr"], group["wd"], group["momentum"]
             pg = [p for p in pg if p.grad is not None]
-            list_p = [p.data for p in pg]
-            list_g = [p.grad.flatten(1) for p in pg]
-            list_m = [self.state[p]["m"] for p in pg]
+            list_p = []
+            list_g = []
+            list_m = []
+            for p in pg:
+                g = p.grad.flatten(1)
+                m = self.state[p]["m"]
+                if "param_shape" not in self.state[p]:
+                    self.state[p]["param_shape"] = tuple(p.shape)
+                if m.shape != g.shape:
+                    if m.numel() != g.numel():
+                        raise RuntimeError(
+                            f"Muon momentum buffer mismatched for parameter with shape {p.shape}; "
+                            f"got buffer {m.shape} and grad {g.shape}"
+                        )
+                    m = m.reshape(g.shape)
+                    self.state[p]["m"] = m
+                list_p.append(p.data)
+                list_g.append(g)
+                list_m.append(m)
             torch._foreach_lerp_(list_m, list_g, 1 - momentum)  # EMA momentum
             torch._foreach_lerp_(list_g, list_m, momentum)  # nestrov momentum (for NS input)
             # Note: weight decay moved to deferred_work after NS
@@ -209,7 +229,7 @@ class Muon(torch.optim.Optimizer):
             p.mul_(1 - lr * wd)
             # update parameter with NS'd grad
             lr_scale = max(1, p.size(-2) / p.size(-1)) ** 0.5
-            p.add_(g, alpha=-lr * lr_scale)
+            p.add_(g.view(p.shape), alpha=-lr * lr_scale)
 
         i = 0
         for group in muon_groups:
@@ -220,8 +240,16 @@ class Muon(torch.optim.Optimizer):
                     gather_lists = [torch.zeros_like(g.to_local()) for _ in range(ws)]
                     gather(g.to_local(), gather_lists, dst=dest_rank, async_op=True) 
                     g_full_block = torch.cat(gather_lists, dim=0)
-                    g_full_block.copy_(zeropower_via_newtonschulz(g_full_block, steps=group["ns_steps"]))
-                    g_full_block = g_full_block.view_as(p).type_as(p)
+                    flat_shape = g_full_block.shape
+                    if p.ndim > 2:
+                        ns_input = g_full_block.view(*p.shape)
+                    else:
+                        ns_input = g_full_block
+                    ns_output = zeropower_via_newtonschulz(ns_input, steps=group["ns_steps"])
+                    if p.ndim > 2:
+                        g_full_block = ns_output.view(flat_shape).to(dtype=p.dtype)
+                    else:
+                        g_full_block = ns_output.to(dtype=p.dtype)
                 else:
                     
                     g_local = g.to_local()
