@@ -66,8 +66,8 @@ def parallelize_deepseek(
         apply_compile(model)
 
     use_fsdp = parallel_dims.dp_enabled or (
-            world_mesh.ndim == 1 and world_mesh.size() == 1
-        )
+        world_mesh.ndim == 1 and world_mesh.size() == 1
+    )
     dp_mesh: DeviceMesh | None = None
     if use_fsdp or parallel_dims.ep_enabled:
         if parallel_dims.dp_replicate_enabled:
