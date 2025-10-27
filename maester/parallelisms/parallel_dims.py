@@ -194,6 +194,10 @@ class ParallelDims:
 
     @property
     def fsdp_gradient_divide_factor(self) -> int:
+        # This is needed for FSDP-sharded experts when Expert Parallel is enabled.
+        # Although the FSDP sharding of experts is done on a mesh of a different size than
+        # other parameters, the gradient division factor should be consistent with data.
+        # NOTE: no cp yet
         return self.dp_replicate * self.dp_shard# * self.cp
     
     @property
