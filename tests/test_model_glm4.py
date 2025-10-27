@@ -40,7 +40,7 @@ from maester.models.glm4.model import Glm4MoeRMSNorm
 GLM4_DCP_ROOT = Path("models/glm-4.5-air-base-dcp")
 HF_MODEL_NAME = "zai-org/GLM-4.5-Air-Base"
 HF_LOCAL_ENV = "MAESTER_GLM4_HF_PATH"
-HF_FALLBACK_DIR = Path("/work/OliverKinch#1271/models/GLM-4.5-Air")
+HF_FALLBACK_DIR = Path("models/glm-4.5-air-base-hf")
 NUM_LAYERS_UNDER_TEST = 4
 HF_LAYER_PREFIXES = tuple(
     ["model.embed_tokens."]
