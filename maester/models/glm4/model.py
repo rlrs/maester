@@ -482,14 +482,26 @@ class Glm4MoeTextModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.n_layers = config.n_layers
 
+        rotary_dim = int(config.head_dim * config.partial_rotary_factor)
+        if rotary_dim <= 0 or rotary_dim > config.head_dim:
+            rotary_dim = config.head_dim
+        if rotary_dim % 2 != 0:
+            rotary_dim -= 1
+        self.rotary_dim = max(rotary_dim, 2)
+        self.layers = nn.ModuleDict({
+            str(layer_idx): Glm4MoeDecoderLayer(config, layer_idx)
+            for layer_idx in range(config.n_layers)
+        })
+        self.norm = Glm4MoeRMSNorm(config.dim, eps=config.rms_norm_eps)
+        self.register_buffer(
+            "freqs_cis", self._precompute_freqs_cis(self.rotary_dim), persistent=False
+        )
+
         self.tok_embeddings = nn.Embedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.dim,
             padding_idx=config.pad_token_id
         )
-
-        # Core transformer model (like GemmaTextModel)
-        self.model = Glm4MoeModel(config)
 
         if config.tie_word_embeddings:
             self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
@@ -499,32 +511,27 @@ class Glm4MoeTextModel(nn.Module):
 
     def init_weights(self):
         """Initialize weights following GLM4 pattern."""
-        # Initialize embeddings
         nn.init.normal_(self.tok_embeddings.weight, std=self.config.initializer_range)
+        
+        for layer in self.layers.values():
+            layer.init_weights()
 
-        self.model.init_weights()
-
-        # Initialize final norm
-        self.model.norm.reset_parameters()
-
-        # Initialize output layer
+        self.norm.reset_parameters()
+        
         if not self.config.tie_word_embeddings:
             nn.init.normal_(self.output.weight, mean=0.0, std=self.config.initializer_range)
-    
-    def set_attention_backend(self, backend: str) -> None:
-        for layer in self.model.layers.values():
-            layer.self_attn.set_attention_backend(backend)
 
-    def __getattr__(self, name: str):
-        """
-        Delegate attribute access to self.model if not found in self.
-        This allows accessing model.layers instead of model.model.layers.
-        """
-        try:
-            return super().__getattribute__(name)
-        except AttributeError:
-            # If attribute not found in self, try to get it from self.model
-            return getattr(self.model, name)
+    def _precompute_freqs_cis(self, rotary_dim: int | None = None) -> torch.Tensor:
+        rotary_dim = rotary_dim or self.rotary_dim
+        return precompute_freqs_cis(
+            rotary_dim,
+            self.model_args.max_position_embeddings * 2,
+            self.model_args.rope_theta,
+        )
+
+    def set_attention_backend(self, backend: str) -> None:
+        for layer in self.layers.values():
+            layer.self_attn.set_attention_backend(backend)
 
     def forward(
         self,
@@ -535,7 +542,6 @@ class Glm4MoeTextModel(nn.Module):
     ):
         del document_ids
         batch_size, seq_len = tokens.shape
-
         hidden_states = self.tok_embeddings(tokens)
 
         if position_ids is not None:
@@ -544,11 +550,7 @@ class Glm4MoeTextModel(nn.Module):
             input_positions = torch.arange(0, seq_len, dtype=torch.long, device=tokens.device)
             input_positions = input_positions.unsqueeze(0).expand(batch_size, -1)
 
-        hidden_states = self.model(
-            hidden_states=hidden_states,
-            position_ids=input_positions,
-            attention_mask=None,
-        )
+        hidden_states = self._process_hidden_states(hidden_states, input_positions)
 
         if labels is not None:
             from cut_cross_entropy import linear_cross_entropy, LinearCrossEntropyImpl
@@ -564,6 +566,33 @@ class Glm4MoeTextModel(nn.Module):
             if self.config.tie_word_embeddings:
                 return torch.matmul(hidden_states, self.tok_embeddings.weight.t())
             return self.output(hidden_states)
+
+    def _process_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        # Get freqs_cis based on position_ids if provided
+        if position_ids is not None:
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)
+            position_ids = position_ids.long().to(device=self.freqs_cis.device)
+            freqs_cis = self.freqs_cis[position_ids]
+            freqs_cis = freqs_cis.unsqueeze(2)
+        else:
+            freqs_cis = self.freqs_cis
+        
+        for layer in self.layers.values():
+            hidden_states = layer(
+                hidden_states=hidden_states,
+                freqs_cis=freqs_cis,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+            )
+
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
 
     @classmethod
     def from_model_args(cls, model_args: ModelArgs) -> "Glm4MoeTextModel":
@@ -593,73 +622,3 @@ class Glm4MoeRMSNorm(nn.Module):
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
-
-class Glm4MoeModel(nn.Module):
-    def __init__(self, model_args: ModelArgs):
-        super().__init__()
-        self.model_args = model_args
-        rotary_dim = int(model_args.head_dim * model_args.partial_rotary_factor)
-        if rotary_dim <= 0 or rotary_dim > model_args.head_dim:
-            rotary_dim = model_args.head_dim
-        if rotary_dim % 2 != 0:
-            rotary_dim -= 1
-        self.rotary_dim = max(rotary_dim, 2)
-        self.layers = nn.ModuleDict({
-            str(layer_idx): Glm4MoeDecoderLayer(model_args, layer_idx)
-            for layer_idx in range(model_args.n_layers)
-        })
-        self.norm = Glm4MoeRMSNorm(model_args.dim, eps=model_args.rms_norm_eps)
-        self.register_buffer(
-            "freqs_cis", self._precompute_freqs_cis(self.rotary_dim), persistent=False
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        batch_size, seq_len, _ = hidden_states.size()
-        
-        # Get freqs_cis based on position_ids if provided
-        if position_ids is not None:
-            if position_ids.dim() == 1:
-                position_ids = position_ids.unsqueeze(0)
-            assert position_ids.shape[0] == batch_size and position_ids.shape[1] == seq_len, (
-                "position_ids must match the shape of tokens"
-            )
-            # Ensure indices live on the same device as cached freqs
-            position_ids = position_ids.long().to(device=self.freqs_cis.device)
-            # Index into precomputed freqs_cis using custom position_ids
-            # Gathered frequencies have shape [batch_size, seq_len, head_dim // 2]
-            freqs_cis = self.freqs_cis[position_ids]
-            # Unsqueeze an explicit head axis so attention can broadcast over heads
-            freqs_cis = freqs_cis.unsqueeze(2)
-        else:
-            freqs_cis = self.freqs_cis
-        
-        for layer in self.layers.values():
-            hidden_states = layer(
-                hidden_states=hidden_states,
-                freqs_cis=freqs_cis,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-            )
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
-    
-    def init_weights(self, buffer_device: torch.device | None = None):
-        buffer_device = buffer_device or self.freqs_cis.device
-        for layer in self.layers.values():
-            layer.init_weights(buffer_device)
-
-    def _precompute_freqs_cis(self, rotary_dim: int | None = None) -> torch.Tensor:
-        rotary_dim = rotary_dim or self.rotary_dim
-        freqs_cis = precompute_freqs_cis(
-            rotary_dim,
-            # Need to compute until at least the max token limit for generation
-            # (use 2x max sequence length to be safe)
-            self.model_args.max_position_embeddings * 2,
-            self.model_args.rope_theta,
-        )
-        return freqs_cis
