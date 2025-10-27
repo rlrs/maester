@@ -86,7 +86,7 @@ def _load_maester_base(device: torch.device):
     
     # Load norm
     norm = Glm4MoeRMSNorm(base_config.dim, eps=base_config.rms_norm_eps).to(device=device)
-    dcp.load({"model.model.norm": norm}, reader)
+    dcp.load({"model.norm": norm}, reader)
     
     # Load output head on CPU
     output = torch.nn.Linear(base_config.dim, base_config.vocab_size, bias=False).to(device="cpu")
@@ -226,7 +226,7 @@ def _load_layer_and_weights(
     
     # Load Maester layer
     ma_layer = Glm4MoeDecoderLayer(maester_base["config"], layer_idx).to(device=device)
-    dcp.load({f"model.model.layers.{layer_idx}": ma_layer}, storage_reader=maester_base["reader"])
+    dcp.load({f"model.layers.{layer_idx}": ma_layer}, storage_reader=maester_base["reader"])
     
     # Convert to float32
     for param in ma_layer.parameters():

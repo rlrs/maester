@@ -515,6 +515,17 @@ class Glm4MoeTextModel(nn.Module):
         for layer in self.model.layers.values():
             layer.self_attn.set_attention_backend(backend)
 
+    def __getattr__(self, name: str):
+        """
+        Delegate attribute access to self.model if not found in self.
+        This allows accessing model.layers instead of model.model.layers.
+        """
+        try:
+            return super().__getattribute__(name)
+        except AttributeError:
+            # If attribute not found in self, try to get it from self.model
+            return getattr(self.model, name)
+
     def forward(
         self,
         tokens: torch.Tensor,
