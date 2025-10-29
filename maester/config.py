@@ -1,12 +1,11 @@
-from pydantic import BaseModel, ConfigDict, Field, ImportString
+from pydantic import Field, ImportString
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     TomlConfigSettingsSource,
 )
-from pydantic.fields import FieldInfo
-from typing import Callable, Type, Any
+from typing import Callable, Any, Literal
 from pathlib import Path
 import torch
 
@@ -83,6 +82,7 @@ class Config(BaseSettings):
     data_parallel_shard_degree: int = 8
     data_parallel_replicate_degree: int = 1
     tensor_parallel_degree: int = 1
+    expert_parallel_degree: int = 1
     train_batch_size: int = 2 # per device; 2 * 8 gpus * 32 nodes * 8192 seqlen = ~4M tokens per batch
     gradient_accumulation_steps: int = 1
     gradient_accumulation_sync_each_step: bool = False
@@ -148,10 +148,25 @@ class Config(BaseSettings):
     # fsdp
     mixed_precision_param: str = 'bfloat16'
     mixed_precision_reduce: str = 'float32'
+    enable_cpu_offload: bool = False
+    fsdp_reshard_after_forward: Literal["default", "never", "always"] = "default"
 
     # activation checkpointing
     ac_mode: str = "none"  # "full" | "selective" | "none"
     selective_ac_option: str | int = "op"
+    per_op_sac_force_recompute_mm_shapes_by_fqns: list[str] = Field(
+        default_factory=lambda: ["moe.router.gate"]
+    )
+    """
+    When per-op selective ac is used, this list of fully qualified names is used
+    to determine which mm shapes to force recompute, rather than being considered
+    by rest of the sac policy, e.g save every other mm. Only nn.Linear modules are
+    supported today.
+
+    Note: this config applies to mms not limited to those matching the specified
+    fqns, e.g. if "moe.router.gate", corresponding to Linear(in, out), is specified,
+    ANY mm with shape matching (*, in) x (in, out) will be force recomputed.
+    """
 
     # experimental
     enable_async_tensor_parallel: bool = False
