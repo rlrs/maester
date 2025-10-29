@@ -308,7 +308,7 @@ def main():
             global_micro_step = train_state.step * grad_accum_steps
 
             while train_state.step < cfg.train_num_steps:
-                optimizer.zero_grad(set_to_none=True)
+                optimizers.zero_grad(set_to_none=True)
 
                 for micro_idx in range(grad_accum_steps):
                     global_micro_step += 1
@@ -377,9 +377,10 @@ def main():
                     ):
                         model.set_requires_gradient_sync(True)
 
-                grad_norms = clip_grad_norm(  # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
-                    model.parameters(), cfg.max_grad_norm, foreach=True
-                )
+                # TODO: re-enable grad clipping (broken w/ MoE) and/or monitoring?
+                # grad_norms = clip_grad_norm( # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
+                #     model.parameters(), cfg.max_grad_norm, foreach=True
+                # )
                 optimizers.step()
                 scheduler.step()
                 train_state.step += 1
@@ -407,11 +408,11 @@ def main():
                     # TODO: re-enable grad norm logging?
                     # param_to_name = {param: name for name, param in model.named_parameters()}
                     # exp_avgs, exp_avg_sqs, param_names = [], [], []
-                    # for group in optimizer.param_groups:
+                    # for group in optimizers.param_groups:
                     #     for p in group['params']:
                     #         if p.grad is None:
                     #             continue
-                    #         state = optimizer.state[p]
+                    #         state = optimizers.state[p]
                     #         if 'exp_avg' in state:  # Check if states initialized
                     #             exp_avgs.append(state['exp_avg'])
                     #             exp_avg_sqs.append(state['exp_avg_sq'])
@@ -475,8 +476,8 @@ def main():
                             "padding/avg_length": all_lengths.float().mean().item(),
                             "padding/std_length": all_lengths.float().std().item(),
                         })
-                    for i in range(len(optimizers.param_groups)):
-                        metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
+                    # for i in range(len(optimizer.param_groups)):
+                    #     metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
                     # for gn, (name, _) in zip(grad_norms, model.named_parameters()):
                     #     cn = clean_param_name(name)
                     #     metrics[f"{cn}/grad_norm"] = gn

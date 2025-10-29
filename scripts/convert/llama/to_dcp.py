@@ -1,5 +1,7 @@
 import argparse
 import json
+import re
+import sys
 from pathlib import Path
 
 import torch
@@ -98,7 +100,6 @@ def convert_hf_checkpoint(
              storage_writer=storage_writer)
 
 if __name__ == '__main__':
-    import argparse
     parser = argparse.ArgumentParser(description='Convert HuggingFace checkpoint.')
     parser.add_argument('checkpoint', type=Path, help='Path to the source HF checkpoint directory')
     parser.add_argument('output', type=Path, help='Destination directory for the DCP checkpoint')

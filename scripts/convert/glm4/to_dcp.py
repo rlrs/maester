@@ -25,11 +25,11 @@ def group_expert_weights(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch
     Group routed experts and reshape shared experts into grouped format.
 
     Expects temporary keys:
-      - Routed:  "__group__layers.{L}.moe.experts.{E}.w{1|2|3}"
-      - Shared:  "__shared__layers.{L}.moe.shared_expert.w{1|2|3}"
+      - Routed:  "__group__layers.{L}.moe.experts.{E}.w{1|2|3}.weight"
+      - Shared:  "__shared__layers.{L}.moe.shared_experts.w{1|2|3}.weight"
     Produces:
-      - "layers.{L}.moe.experts.w{1|2|3}" -> [num_experts, in_features, out_features]
-      - "layers.{L}.moe.shared_expert.w{1|2|3}" -> [1, in_features, out_features]
+      - "layers.{L}.moe.experts.w{1|2|3}.weight" -> [num_experts, in_features, out_features]
+      - "layers.{L}.moe.shared_experts.w{1|2|3}.weight" -> [1, in_features, out_features]
     """
     new_state = {}
     expert_groups: Dict[str, Dict[int, torch.Tensor]] = {}
@@ -41,13 +41,13 @@ def group_expert_weights(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch
             # layers.L.moe.experts.E.w{1|2|3}
             layer_idx = parts[1]
             expert_idx = int(parts[4])
-            wtype = parts[5]
-            group_key = f"model.layers.{layer_idx}.moe.experts.{wtype}"
+            wtype = parts[5]  # "w1" | "w2" | "w3"
+            group_key = f"layers.{layer_idx}.moe.experts.{wtype}"  # no .weight
             expert_groups.setdefault(group_key, {})[expert_idx] = v
         elif k.startswith("__shared__"):
             actual_key = k[len("__shared__"):]
-            transposed = v#.t()
-            new_state["model." + actual_key] = transposed#.unsqueeze(0)
+            transposed = v
+            new_state[actual_key] = transposed  # shared_experts keeps .weight
         else:
             new_state[k] = v
 
@@ -59,10 +59,10 @@ def group_expert_weights(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch
         proto = next(iter(experts.values()))
         for i in range(max_idx + 1):
             if i in experts:
-                ex_list.append(experts[i])#.t())  # [in, out]
+                ex_list.append(experts[i])
             else:
-                ex_list.append(torch.zeros(proto.shape[1], proto.shape[0], dtype=proto.dtype))
-        grouped = torch.stack(ex_list, dim=0)  # [num_experts, in, out]
+                ex_list.append(torch.zeros(proto.shape[0], proto.shape[1], dtype=proto.dtype))
+        grouped = torch.stack(ex_list, dim=0)  # [num_experts, out, in]
         new_state[group_key] = grouped
     return new_state
 
@@ -144,14 +144,14 @@ def map_hf_key_glm4(key: str) -> str | None:
         if f"model.layers.{layer_idx}.mlp." in key:
             # Router (MoE)
             if key.endswith("mlp.gate.weight"):
-                return f"model.layers.{layer_idx}.moe.router.gate.weight"
+                return f"layers.{layer_idx}.moe.router.gate.weight"
             if key.endswith("mlp.gate.e_score_correction_bias"):
-                return f"model.layers.{layer_idx}.moe.expert_bias"
+                return f"layers.{layer_idx}.moe.expert_bias"
 
             # Shared experts (MoE)
             if ".mlp.shared_experts." in key:
                 if key.endswith("gate_proj.weight"):
-                    return f"__shared__layers.{layer_idx}.moe.shared_experts.w1.weight" # note "expert" vs "experts"!
+                    return f"__shared__layers.{layer_idx}.moe.shared_experts.w1.weight"
                 if key.endswith("up_proj.weight"):
                     return f"__shared__layers.{layer_idx}.moe.shared_experts.w3.weight"
                 if key.endswith("down_proj.weight"):
@@ -176,11 +176,6 @@ def map_hf_key_glm4(key: str) -> str | None:
                     return f"model.layers.{layer_idx}.mlp.up_proj.weight"
                 if key.endswith("down_proj.weight"):
                     return f"model.layers.{layer_idx}.mlp.down_proj.weight"
-
-    # Some HF shards put a duplicate vocab head under the last layer
-    # if key.endswith("shared_head.head.weight"):
-    #     # GLM4 doesn't use tied embeddings by default (similar to DeepSeek)
-    #     return "output.weight"
 
     return None
 
