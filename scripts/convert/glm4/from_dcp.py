@@ -143,13 +143,9 @@ def _build_hf_config(
         "rope_theta": model_args.rope_theta,
         "rope_scaling": model_args.rope_scaling,
         "tie_word_embeddings": model_args.tie_word_embeddings,
-        "use_cache": model_args.use_cache,
-        "n_group": model_args.n_group,
-        "topk_group": model_args.topk_group,
+        "use_cache": True,
         "first_k_dense_replace": model_args.first_k_dense_replace,
-        "norm_topk_prob": getattr(model_args, "norm_topk_prob", True),
         "use_qk_norm": model_args.use_qk_norm,
-        "routed_scaling_factor": getattr(model_args, "routed_scaling_factor", 1.0),
     }
 
     moe_args = getattr(model_args, "moe_args", None)
@@ -157,8 +153,14 @@ def _build_hf_config(
         routed = getattr(moe_args, "num_experts", None)
         shared = getattr(moe_args, "num_shared_experts", None)
         per_tok = getattr(moe_args, "top_k", None)
+        route_scale = getattr(moe_args, "route_scale", None)
+
         if routed is not None:
             config["n_routed_experts"] = routed
+            config["n_group"] = routed
+        if route_scale is not None:
+            config["routed_scaling_factor"] = route_scale
+
         if shared is not None:
             config["n_shared_experts"] = shared
         if per_tok is not None:
@@ -176,6 +178,7 @@ def _build_hf_config(
             config["n_shared_experts"] = shared
         if per_tok is not None:
             config["num_experts_per_tok"] = per_tok
+            config["topk_group"] = per_tok
 
     bos_token, eos_token, pad_token = _select_dataset_tokens(model_args, job_config)
     if pad_token is not None:

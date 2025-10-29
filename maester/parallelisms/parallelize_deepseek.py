@@ -60,13 +60,16 @@ def parallelize_deepseek(
         )
 
     if config.ac_mode != "none":
-        apply_ac(model.model, config)
+        apply_ac(model, config)
 
     if config.compile:
-        apply_compile(model.model)
+        apply_compile(model)
 
+    use_fsdp = parallel_dims.dp_enabled or (
+        world_mesh.ndim == 1 and world_mesh.size() == 1
+    )
     dp_mesh: DeviceMesh | None = None
-    if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
+    if use_fsdp or parallel_dims.ep_enabled:
         if parallel_dims.dp_replicate_enabled:
             dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
         else:
@@ -267,7 +270,7 @@ def apply_fsdp(
             reshard_after_forward=reshard_after_forward,
         )
 
-    for layer_id, transformer_block in model.model.layers.items():
+    for layer_id, transformer_block in model.layers.items():
         # NOTE: in an MoE layer, the router and the shared experts
         #       are sharded together with the TransformerBlock
         if transformer_block.moe_enabled and ep_degree > 1: # TODO: fix this
@@ -311,9 +314,9 @@ def apply_fsdp(
 
     # As an optimization, do not reshard_after_forward the last layers by default
     # since FSDP would prefetch them immediately after the forward pass
-    if model.model.norm is not None and model.output is not None:
+    if model.norm is not None and model.output is not None:
         fully_shard(
-            [model.model.norm, model.output],
+            [model.norm, model.output],
             **fsdp_config,
             reshard_after_forward=reshard_after_forward_policy == "always",
         )
@@ -328,7 +331,7 @@ def apply_moe_ep_tp(
     ep_mesh: DeviceMesh | None,
     ep_tp_mesh: DeviceMesh | None,
 ):
-    for transformer_block in model.model.layers.values():
+    for transformer_block in model.layers.values():
         if not transformer_block.moe_enabled:
             continue
 
