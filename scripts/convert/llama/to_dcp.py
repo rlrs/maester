@@ -1,8 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
+import argparse
 import json
 import re
 import sys
@@ -15,8 +11,6 @@ from safetensors import safe_open
 # support running without installing as a package
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
-
-from maester.models import models_config
 
 
 @torch.inference_mode()
@@ -104,7 +98,6 @@ def convert_hf_checkpoint(
              storage_writer=storage_writer)
 
 if __name__ == '__main__':
-    import argparse
     parser = argparse.ArgumentParser(description='Convert HuggingFace checkpoint.')
     parser.add_argument('checkpoint', type=Path, help='Path to the source HF checkpoint directory')
     parser.add_argument('output', type=Path, help='Destination directory for the DCP checkpoint')

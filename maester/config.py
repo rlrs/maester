@@ -5,8 +5,7 @@ from pydantic_settings import (
     SettingsConfigDict,
     TomlConfigSettingsSource,
 )
-from pydantic.fields import FieldInfo
-from typing import Callable, Type, Any
+from typing import Callable, Any, Literal
 from pathlib import Path
 import torch
 
@@ -83,6 +82,7 @@ class Config(BaseSettings):
     data_parallel_shard_degree: int = 8
     data_parallel_replicate_degree: int = 1
     tensor_parallel_degree: int = 1
+    expert_parallel_degree: int = 1
     train_batch_size: int = 2 # per device; 2 * 8 gpus * 32 nodes * 8192 seqlen = ~4M tokens per batch
     gradient_accumulation_steps: int = 1
     gradient_accumulation_sync_each_step: bool = False
@@ -103,7 +103,7 @@ class Config(BaseSettings):
     log_rank0_only: bool = True
     save_tb_folder: str = "tb"
     enable_tensorboard: bool = False
-    enable_wandb: bool = True
+    enable_wandb: bool = False
     wandb_entity: str = "danish-foundation-models"
     wandb_project: str = "default-project"
 
@@ -130,28 +130,59 @@ class Config(BaseSettings):
     mup_log_coord_check: bool = False
 
     # optimizer
-    opt_class: ImportString[Callable] = 'torch.optim.AdamW'
-    opt_cfg: dict[str, Any] = dict( # TODO: don't use dict, not validateable
-        lr = 1e-5, # max lr, schedule reduces it at points
-        betas = (0.9, 0.95),
-        weight_decay=0.1,
-        eps=1e-9,
-        # foreach=True, # foreach might work where fused doesn't
-        fused=True
-    )
+    # Muon for 2D+ params (except embeddings/output), AdamW for embeddings/output/1D params
+    optimizer_groups: list[dict[str, Any]] = [
+        {
+            'opt_class': 'maester.optimizers.Muon',
+            'opt_cfg': {
+                'lr': 0.02,
+                'momentum': 0.95,
+                'ns_steps': 5,
+                'wd': 0.01
+            },
+            'min_dim': 2,
+            'exclude_names': ['tok_embeddings', 'output']  # These use AdamW instead
+        },
+        {
+            'opt_class': 'torch.optim.AdamW',
+            'opt_cfg': {
+                'lr': 3e-4,
+                'betas': (0.9, 0.95),
+                'weight_decay': 0.0,  # No weight decay for embeddings/output/1D params
+                'eps': 1e-9,
+                'fused': True
+            },
+            'min_dim': 0  # Catches everything not assigned to first group
+        }
+    ]
 
     # lr schedule
     scheduler: str = "linear_warmup_cosine"
-    warmup_steps: int = 50
-    cooldown_steps: int = 100  # used for some schedules
+    cooldown_steps: int = 200
+    warmup_steps: int = 100
 
     # fsdp
     mixed_precision_param: str = 'bfloat16'
     mixed_precision_reduce: str = 'float32'
+    enable_cpu_offload: bool = False
+    fsdp_reshard_after_forward: Literal["default", "never", "always"] = "default"
 
     # activation checkpointing
     ac_mode: str = "none"  # "full" | "selective" | "none"
     selective_ac_option: str | int = "op"
+    per_op_sac_force_recompute_mm_shapes_by_fqns: list[str] = Field(
+        default_factory=lambda: ["moe.router.gate"]
+    )
+    """
+    When per-op selective ac is used, this list of fully qualified names is used
+    to determine which mm shapes to force recompute, rather than being considered
+    by rest of the sac policy, e.g save every other mm. Only nn.Linear modules are
+    supported today.
+
+    Note: this config applies to mms not limited to those matching the specified
+    fqns, e.g. if "moe.router.gate", corresponding to Linear(in, out), is specified,
+    ANY mm with shape matching (*, in) x (in, out) will be force recomputed.
+    """
 
     # experimental
     enable_async_tensor_parallel: bool = False

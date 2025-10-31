@@ -216,6 +216,30 @@ def make_document_mask_wrapper(base_mask_fn, document_ids):
     return wrapped_mask_fn
 
 
+def _compute_dense_mask(mask_fn, batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor:
+    """Materialize a dense boolean mask from a Gemma mask function."""
+
+    if mask_fn is None:
+        raise ValueError("mask_fn must be provided to compute dense mask")
+
+    b = torch.arange(batch_size, device=device).view(batch_size, 1, 1, 1)
+    h = torch.arange(1, device=device).view(1, 1, 1, 1)
+    q_idx = torch.arange(seq_len, device=device).view(1, 1, seq_len, 1)
+    kv_idx = torch.arange(seq_len, device=device).view(1, 1, 1, seq_len)
+    mask = mask_fn(b, h, q_idx, kv_idx)
+    if mask.dtype != torch.bool:
+        mask = mask.bool()
+    return mask
+
+
+def _block_mask_to_dense(block_mask, batch_size: int, seq_len: int, device: torch.device) -> torch.Tensor | None:
+    if block_mask is None:
+        return None
+    mask_tuple = block_mask.as_tuple()
+    mask_fn = mask_tuple[-1]
+    return _compute_dense_mask(mask_fn, batch_size, seq_len, device)
+
+
 class GemmaAttention(nn.Module):
 
     def __init__(
@@ -261,7 +285,7 @@ class GemmaAttention(nn.Module):
 
         self.attn_type = attn_type
         self.sliding_window_size = config.sliding_window_size
-        self.attention_backend = "flex"  # FlexAttention is required for Gemma masks
+        self.attention_backend = "flex"  # default backend
 
         # Pre-compute block mask for FlexAttention
         if self.attn_type == "local_sliding" and self.sliding_window_size is not None:
@@ -272,12 +296,19 @@ class GemmaAttention(nn.Module):
         max_seq_len = config.max_seq_len
         self.block_mask = create_block_mask(mask_fn, None, None, max_seq_len, max_seq_len)
         
+    def set_backend(self, backend: str) -> None:
+        if backend not in {"flex", "naive"}:
+            raise ValueError(f"Unsupported attention backend: {backend}")
+        self.attention_backend = backend
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         freqs_cis: torch.Tensor,
         mask: torch.Tensor,
         local_mask: torch.Tensor | None = None,
+        dense_mask: torch.Tensor | None = None,
+        dense_local_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states_shape = hidden_states.shape
         assert len(hidden_states_shape) == 3
@@ -301,40 +332,70 @@ class GemmaAttention(nn.Module):
         xk = apply_rotary_emb(xk, freqs_cis=freqs_cis)
 
         # Select appropriate mask
-        if (
+        use_local = (
             self.attn_type == "local_sliding"
             and self.sliding_window_size is not None
             and local_mask is not None
-        ):
-            attn_mask = local_mask
-        else:
-            attn_mask = mask
+        )
+        attn_mask = local_mask if use_local else mask
+        dense_attn_mask = dense_local_mask if use_local else dense_mask
 
-        if self.attention_backend != "flex":
-            raise ValueError("GemmaAttention now requires FlexAttention backend")
-
-        # FlexAttention
         # Transpose to [batch_size, n_heads, seq_len, head_dim]
         q = xq.transpose(1, 2)
         k = xk.transpose(1, 2)
         v = xv.transpose(1, 2)
 
-        output = torch.compile(_flex_attention, fullgraph=True)(
-            q,
-            k,
-            v,
-            block_mask=attn_mask,
-            scale=self.scaling,
-            enable_gqa=self.num_kv_heads != self.num_heads,
-            # kernel_options={ # on smaller GPUs like 4090, set these if you get triton shared memory errors
-            #     "BLOCK_M": 16, "BLOCK_N": 16,  # forward
-            #     "BLOCK_M1": 16, "BLOCK_N1": 16, "BLOCK_M2": 16, "BLOCK_N2": 16  # backwards
-            # }
-        )
-        
-        # [batch_size, seq_len, hidden_dim]
+        if self.attention_backend == "flex":
+            output = torch.compile(_flex_attention, fullgraph=True)(
+                q,
+                k,
+                v,
+                block_mask=attn_mask,
+                scale=self.scaling,
+                enable_gqa=self.num_kv_heads != self.num_heads,
+            )
+        elif self.attention_backend == "naive":
+            if self.num_kv_heads != self.num_heads:
+                k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
+                v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
+
+            if dense_attn_mask is None:
+                mask_bool = torch.ones(
+                    batch_size,
+                    1,
+                    input_len,
+                    input_len,
+                    device=q.device,
+                    dtype=torch.bool,
+                )
+            else:
+                mask_bool = dense_attn_mask.to(device=q.device)
+                if mask_bool.dtype != torch.bool:
+                    mask_bool = mask_bool.bool()
+
+            if mask_bool.shape[0] != batch_size:
+                mask_bool = mask_bool.expand(batch_size, -1, -1, -1)
+            if mask_bool.shape[1] == 1 and self.num_heads > 1:
+                mask_bool = mask_bool.expand(batch_size, self.num_heads, -1, -1)
+            elif mask_bool.shape[1] != self.num_heads:
+                mask_bool = mask_bool.expand(batch_size, self.num_heads, -1, -1)
+
+            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
+            min_value = torch.finfo(scores.dtype).min
+            scores = scores.masked_fill(~mask_bool, min_value)
+            attn = torch.softmax(scores, dim=-1)
+            attn = torch.where(
+                mask_bool,
+                attn,
+                torch.zeros_like(attn),
+            )
+            output = torch.matmul(attn, v)
+        else:
+            raise ValueError(f"Unknown attention backend {self.attention_backend}")
+
         output = output.transpose(1, 2).contiguous().view(
-            batch_size, input_len, -1)
+            batch_size, input_len, -1
+        )
         output = self.o_proj(output)
         return output
     
@@ -380,6 +441,8 @@ class Gemma2DecoderLayer(nn.Module):
         freqs_cis: torch.Tensor,
         mask: torch.Tensor,
         local_mask: torch.Tensor,
+        dense_mask: torch.Tensor | None,
+        dense_local_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         # Self Attention
         residual = hidden_states
@@ -389,6 +452,8 @@ class Gemma2DecoderLayer(nn.Module):
             freqs_cis=freqs_cis,
             mask=mask,
             local_mask=local_mask,
+            dense_mask=dense_mask,
+            dense_local_mask=dense_local_mask,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
@@ -439,6 +504,8 @@ class GemmaModel(nn.Module):
         freqs_cis: dict[str, torch.Tensor], # attn_type -> freqs_cis
         mask: torch.Tensor,
         local_mask: torch.Tensor,
+        dense_mask: torch.Tensor | None,
+        dense_local_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         for i in range(len(self.layers)):
             layer: Gemma2DecoderLayer = self.layers[i] # type: ignore
@@ -447,6 +514,8 @@ class GemmaModel(nn.Module):
                 freqs_cis=freqs_cis.get(layer.attn_type),
                 mask=mask,
                 local_mask=local_mask,
+                dense_mask=dense_mask,
+                dense_local_mask=dense_local_mask,
             )
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -537,7 +606,11 @@ class GemmaTextModel(nn.Module):
         
         # Initialize the model layers
         self.model.init_weights(self.config.init_std)
-    
+
+    def set_attention_backend(self, backend: str) -> None:
+        for layer in self.model.layers:
+            layer.self_attn.set_backend(backend)
+
     def forward(
         self,
         tokens: torch.Tensor,
@@ -573,9 +646,42 @@ class GemmaTextModel(nn.Module):
             input_positions = torch.arange(0, seq_len, dtype=torch.long, device=tokens.device)
             input_positions = input_positions.unsqueeze(0).expand(batch_size, -1)
 
+        requires_dense_mask = any(
+            getattr(layer.self_attn, "attention_backend", "flex") != "flex"
+            for layer in self.model.layers
+        )
+
         if document_ids is not None:
-            global_mask = create_block_mask(
-                make_document_mask_wrapper(causal_mask, document_ids),
+            global_mask_fn = make_document_mask_wrapper(causal_mask, document_ids)
+        else:
+            global_mask_fn = causal_mask
+
+        global_mask = create_block_mask(
+            global_mask_fn,
+            batch_size,
+            None,
+            seq_len,
+            seq_len,
+            device=tokens.device,
+        ).to(tokens.device)
+
+        dense_global_mask = (
+            _compute_dense_mask(global_mask_fn, batch_size, seq_len, tokens.device)
+            if requires_dense_mask
+            else None
+        )
+
+        if self.config.sliding_window_size:
+            if document_ids is not None:
+                local_mask_fn = make_document_mask_wrapper(
+                    make_sliding_window_mask_fn(self.config.sliding_window_size),
+                    document_ids,
+                )
+            else:
+                local_mask_fn = make_sliding_window_mask_fn(self.config.sliding_window_size)
+
+            local_mask = create_block_mask(
+                local_mask_fn,
                 batch_size,
                 None,
                 seq_len,
@@ -583,41 +689,14 @@ class GemmaTextModel(nn.Module):
                 device=tokens.device,
             ).to(tokens.device)
 
-            if self.config.sliding_window_size:
-                local_mask = create_block_mask(
-                    make_document_mask_wrapper(
-                        make_sliding_window_mask_fn(self.config.sliding_window_size),
-                        document_ids,
-                    ),
-                    batch_size,
-                    None,
-                    seq_len,
-                    seq_len,
-                    device=tokens.device,
-                ).to(tokens.device)
-            else:
-                local_mask = None
+            dense_local_mask = (
+                _compute_dense_mask(local_mask_fn, batch_size, seq_len, tokens.device)
+                if requires_dense_mask
+                else None
+            )
         else:
-            global_mask = create_block_mask(
-                causal_mask,
-                None,
-                None,
-                seq_len,
-                seq_len,
-                device=tokens.device,
-            ).to(tokens.device)
-
-            if self.config.sliding_window_size:
-                local_mask = create_block_mask(
-                    make_sliding_window_mask_fn(self.config.sliding_window_size),
-                    None,
-                    None,
-                    seq_len,
-                    seq_len,
-                    device=tokens.device,
-                ).to(tokens.device)
-            else:
-                local_mask = None
+            local_mask = None
+            dense_local_mask = None
 
         # Select frequencies based on positions
         assert input_positions.shape == (batch_size, seq_len), "input_positions must match tokens shape"
@@ -633,6 +712,8 @@ class GemmaTextModel(nn.Module):
             freqs_cis=freqs_cis_dict,
             mask=global_mask,
             local_mask=local_mask,
+            dense_mask=dense_global_mask,
+            dense_local_mask=dense_local_mask,
         )
         
         # Compute loss or logits
@@ -728,11 +809,28 @@ class Gemma3MultiModalModel(nn.Module):
             "local_sliding": self.local_freqs_cis,
             "global": self.global_freqs_cis,
         }
+        batch_size, seq_len = input_token_ids.shape
+        requires_dense_mask = any(
+            getattr(layer.self_attn, "attention_backend", "flex") != "flex"
+            for layer in self.model.layers
+        )
+        dense_mask = (
+            _block_mask_to_dense(mask, batch_size, seq_len, hidden_states.device)
+            if requires_dense_mask
+            else None
+        )
+        dense_local_mask = (
+            _block_mask_to_dense(local_mask, batch_size, seq_len, hidden_states.device)
+            if requires_dense_mask and local_mask is not None
+            else None
+        )
         hidden_states = self.model(
             hidden_states=hidden_states,
             freqs_cis=freqs_cis,
             mask=mask,
             local_mask=local_mask,
+            dense_mask=dense_mask,
+            dense_local_mask=dense_local_mask,
         )
         embedder_weight = self.text_token_embedder.weight
 

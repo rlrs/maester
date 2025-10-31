@@ -21,9 +21,17 @@ from torch.utils._foreach_utils import (
     _has_foreach_support,
 )
 from torch.nn.utils.clip_grad import _clip_grads_with_norm_
+from torch._utils import _get_available_device_type, _get_device_module
 
 from maester.log_utils import logger
 from maester.models.gemma.model import Embedding as GemmaEmbedding
+
+def get_device_info() -> tuple[str, torch.device]:
+    device_type = _get_available_device_type() or "cuda"
+    device_module = _get_device_module(device_type)  # default device_module:torch.cuda
+    return device_type, device_module
+
+device_type, device_module = get_device_info()
 
 def dist_max(x: int | float, mesh: DeviceMesh) -> torch.Tensor:
     tensor = torch.tensor(x).cuda()
@@ -302,3 +310,9 @@ def clean_param_name(name: str) -> str:
         return f"output/{'/'.join(parts[-2:])}"
     else:
         return f"other/{'/'.join(parts[-2:])}"
+
+def has_cuda_capability(major: int, minor: int) -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (
+        major,
+        minor,
+    )
