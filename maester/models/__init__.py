@@ -44,5 +44,5 @@ model_name_to_optimizers_builder = {
     "mistral": build_optimizers,
     "gemma3": build_optimizers,
     "deepseek": build_deepseek_optimizers,
-    "glm4": build_optimizers,
+    "glm4": build_deepseek_optimizers,
 }

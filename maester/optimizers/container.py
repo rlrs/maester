@@ -10,6 +10,7 @@ from torch.distributed.checkpoint.state_dict import (
 
 from maester.config import Config
 from maester.parallelisms import ParallelDims
+from maester.log_utils import logger
 
 
 class OptimizersContainer(Optimizer, Stateful):
@@ -112,7 +113,7 @@ class OptimizersContainer(Optimizer, Stateful):
 
 
 def build_optimizers(model: nn.Module, cfg: Config, parallel_dims: ParallelDims) -> OptimizersContainer:
-    """Build default optimizers with optional MuP support.
+    """Build optimizers with optional MuP or multi-optimizer support.
     
     Args:
         model: The model to optimize
@@ -122,6 +123,10 @@ def build_optimizers(model: nn.Module, cfg: Config, parallel_dims: ParallelDims)
     Returns:
         OptimizersContainer with configured optimizer(s)
     """
+    # MuP path (special parameter grouping with LR scaling)
+    # TODO: This is a temporary solution. MuP should be better integrated with the
+    # optimizer_groups system, possibly by supporting per-parameter LR multipliers
+    # or by making MuP a wrapper that modifies optimizer groups.
     if cfg.enable_mup:
         # MuP parameter grouping
         mup_decay_params = []
@@ -140,24 +145,95 @@ def build_optimizers(model: nn.Module, cfg: Config, parallel_dims: ParallelDims)
         # Get MuP width multiplier from model config
         mup_width_mul = getattr(model.model_args, 'mup_width_mul', 1.0)
         
-        optimizer = cfg.opt_class([
+        # Use first optimizer group's config for MuP
+        if not cfg.optimizer_groups:
+            raise ValueError("optimizer_groups must be defined when using MuP")
+        
+        opt_group = cfg.optimizer_groups[0]
+        opt_class = opt_group['opt_class']
+        if isinstance(opt_class, str):
+            module_path, class_name = opt_class.rsplit('.', 1)
+            import importlib
+            module = importlib.import_module(module_path)
+            opt_class = getattr(module, class_name)
+        
+        opt_cfg = opt_group['opt_cfg'].copy()
+        base_lr = opt_cfg.get('lr', 3e-4)
+        weight_decay = opt_cfg.get('weight_decay', 0.1)
+        
+        optimizer = opt_class([
             {
                 'params': mup_decay_params, 
-                'weight_decay': cfg.opt_cfg['weight_decay'], 
-                'lr': cfg.opt_cfg['lr'] / mup_width_mul
+                'weight_decay': weight_decay, 
+                'lr': base_lr / mup_width_mul
             },
             {
                 'params': decay_params, 
-                'weight_decay': cfg.opt_cfg['weight_decay'], 
-                'lr': cfg.opt_cfg['lr']
+                'weight_decay': weight_decay, 
+                'lr': base_lr
             },
             {
                 'params': nodecay_params, 
                 'weight_decay': 0.0, 
-                'lr': cfg.opt_cfg['lr']
+                'lr': base_lr
             },
-        ], **cfg.opt_cfg)
-    else:
-        optimizer = cfg.opt_class(model.parameters(), **cfg.opt_cfg)
+        ], **opt_cfg)
+        return OptimizersContainer(model, [optimizer])
     
-    return OptimizersContainer(model, [optimizer])
+    # Multi-optimizer path (includes single optimizer as special case)
+    else:
+        # Build optimizers from groups with validation
+        all_params = {name: param for name, param in model.named_parameters()}
+        assigned_params = set()
+        optimizers = []
+        
+        for i, group in enumerate(cfg.optimizer_groups):
+            group_params = []
+            group_param_names = []
+            
+            for name, param in model.named_parameters():
+                # Skip if already assigned to a previous group (first match wins)
+                if name in assigned_params:
+                    continue
+                    
+                # Check dimension filter
+                min_dim = group.get('min_dim', 0)
+                
+                if param.dim() >= min_dim:
+                    # Check name exclusion
+                    if not any(excl in name for excl in group.get('exclude_names', [])):
+                        group_params.append(param)
+                        group_param_names.append(name)
+                        assigned_params.add(name)
+            
+            if group_params:
+                # Import optimizer class from string if needed
+                opt_class = group['opt_class']
+                if isinstance(opt_class, str):
+                    # Handle string imports like 'torch.optim.AdamW' or 'maester.optimizers.Muon'
+                    module_path, class_name = opt_class.rsplit('.', 1)
+                    import importlib
+                    module = importlib.import_module(module_path)
+                    opt_class = getattr(module, class_name)
+                
+                optimizer = opt_class(group_params, **group['opt_cfg'])
+                optimizers.append(optimizer)
+                
+                # Log parameter assignments
+                logger.info(f"Optimizer group {i} ({opt_class.__name__}): {len(group_params)} parameters")
+                logger.info(f"  Config: min_dim={group.get('min_dim', 0)}, exclude_names={group.get('exclude_names', [])}")
+                logger.info(f"  Learning rate: {group['opt_cfg'].get('lr', 'default')}")
+                logger.info(f"  Weight decay: {group['opt_cfg'].get('weight_decay', group['opt_cfg'].get('wd', 'default'))}")
+                
+                # Log all parameter names
+                for param_name in sorted(group_param_names):
+                    logger.info(f"    - {param_name}")
+        
+        # Check for unassigned parameters
+        unassigned = set(all_params.keys()) - assigned_params
+        if unassigned:
+            raise ValueError(
+                f"Parameters not assigned to any optimizer: {sorted(unassigned)}"
+            )
+        
+        return OptimizersContainer(model, optimizers)

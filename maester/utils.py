@@ -26,6 +26,13 @@ from torch._utils import _get_available_device_type, _get_device_module
 from maester.log_utils import logger
 from maester.models.gemma.model import Embedding as GemmaEmbedding
 
+def get_device_info() -> tuple[str, torch.device]:
+    device_type = _get_available_device_type() or "cuda"
+    device_module = _get_device_module(device_type)  # default device_module:torch.cuda
+    return device_type, device_module
+
+device_type, device_module = get_device_info()
+
 def dist_max(x: int | float, mesh: DeviceMesh) -> torch.Tensor:
     tensor = torch.tensor(x).cuda()
     return funcol.all_reduce(tensor, reduceOp=c10d.ReduceOp.MAX.name, group=mesh)

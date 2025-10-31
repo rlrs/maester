@@ -123,7 +123,8 @@ def main():
         else:
             dp_degree, dp_rank = 1, 0
         logger.info(f"world mesh: {world_mesh}")
-        #logger.info(f"dp mesh: {dp_mesh}")
+        if parallel_dims.dp_enabled:
+            logger.info(f"{dp_mesh=}")
 
         # Get tokenizer to determine vocab size
         if os.path.isfile(cfg.tokenizer_name):
@@ -241,52 +242,11 @@ def main():
 
         # data_monitor = DataMonitor(train_state, log_freq=cfg.log_freq)
 
-        if cfg.enable_mup:
-            mup_decay_params = []
-            decay_params = []
-            nodecay_params = []
-            for name, param in model.named_parameters():
-                if param.dim() >= 2:
-                    if 'attention' in name or 'feed_forward' in name:
-                        # logger.info(f"Mup weight: {name}")
-                        mup_decay_params.append(param)
-                    else:
-                        # logger.info(f"Decay weight: {name}")
-                        decay_params.append(param)
-                else:
-                    # logger.info(f"Nodecay weight: {name}")
-                    nodecay_params.append(param)
-            optimizer: torch.optim.Optimizer = cfg.opt_class([
-                {'params': mup_decay_params, 'weight_decay': cfg.opt_cfg['weight_decay'], 'lr': cfg.opt_cfg['lr'] / model_config.mup_width_mul},
-                {'params': decay_params, 'weight_decay': cfg.opt_cfg['weight_decay'], 'lr': cfg.opt_cfg['lr']},
-                {'params': nodecay_params, 'weight_decay': 0.0, 'lr': cfg.opt_cfg['lr']},
-            ], **cfg.opt_cfg)
-        else:
-            decay_params = []
-            nodecay_params = []
-            for name, param in model.named_parameters():
-                if "tok_embeddings" in name:
-                    if dp_rank == 0:
-                        logger.info(f"Nodecay weight: {name}")
-                    nodecay_params.append(param)  
-                elif param.dim() >= 2:
-                    if dp_rank == 0:
-                        logger.info(f"Decay weight: {name}")
-                    decay_params.append(param)
-                else:
-                    if dp_rank == 0:
-                        logger.info(f"Nodecay weight: {name}")
-                    nodecay_params.append(param) 
-            weight_decay = cfg.opt_cfg.get('weight_decay', 0.1)
-            optimizer: torch.optim.Optimizer = cfg.opt_class([{
-                'params': decay_params,
-                'weight_decay': weight_decay
-            },
-            {
-                'params': nodecay_params,
-                'weight_decay': 0.0
-            }], **cfg.opt_cfg)
-        scheduler = get_lr_scheduler(optimizer, cfg)
+        # Build optimizers using model-specific builder
+        optimizers_builder = model_name_to_optimizers_builder[cfg.model_name]
+        optimizers = optimizers_builder(model, cfg, parallel_dims)
+        
+        scheduler = get_lr_scheduler(optimizers, cfg)
 
         metric_logger = build_metric_logger(cfg)
 
@@ -347,7 +307,7 @@ def main():
             global_micro_step = train_state.step * grad_accum_steps
 
             while train_state.step < cfg.train_num_steps:
-                optimizer.zero_grad(set_to_none=True)
+                optimizers.zero_grad(set_to_none=True)
 
                 for micro_idx in range(grad_accum_steps):
                     global_micro_step += 1
@@ -416,10 +376,11 @@ def main():
                     ):
                         model.set_requires_gradient_sync(True)
 
-                grad_norms = clip_grad_norm(  # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
-                    model.parameters(), cfg.max_grad_norm, foreach=True
-                )
-                optimizer.step()
+                # TODO: re-enable grad clipping (broken w/ MoE) and/or monitoring?
+                # grad_norms = clip_grad_norm( # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
+                #     model.parameters(), cfg.max_grad_norm, foreach=True
+                # )
+                optimizers.step()
                 scheduler.step()
                 train_state.step += 1
 
@@ -446,11 +407,11 @@ def main():
                     # TODO: re-enable grad norm logging?
                     # param_to_name = {param: name for name, param in model.named_parameters()}
                     # exp_avgs, exp_avg_sqs, param_names = [], [], []
-                    # for group in optimizer.param_groups:
+                    # for group in optimizers.param_groups:
                     #     for p in group['params']:
                     #         if p.grad is None:
                     #             continue
-                    #         state = optimizer.state[p]
+                    #         state = optimizers.state[p]
                     #         if 'exp_avg' in state:  # Check if states initialized
                     #             exp_avgs.append(state['exp_avg'])
                     #             exp_avg_sqs.append(state['exp_avg_sq'])
@@ -514,8 +475,8 @@ def main():
                             "padding/avg_length": all_lengths.float().mean().item(),
                             "padding/std_length": all_lengths.float().std().item(),
                         })
-                    for i in range(len(optimizer.param_groups)):
-                        metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
+                    # for i in range(len(optimizer.param_groups)):
+                    #     metrics[f"lr/group{i}"] = scheduler.get_last_lr()[i]
                     # for gn, (name, _) in zip(grad_norms, model.named_parameters()):
                     #     cn = clean_param_name(name)
                     #     metrics[f"{cn}/grad_norm"] = gn
