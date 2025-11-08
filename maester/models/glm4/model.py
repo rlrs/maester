@@ -509,12 +509,15 @@ class Glm4MoeTextModel(nn.Module):
         else:
             self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
-    def init_weights(self):
+    def init_weights(self, buffer_device: torch.device | None = None):
         """Initialize weights following GLM4 pattern."""
+        buffer_device = buffer_device or self.freqs_cis.device
+        with torch.device(buffer_device):
+            self.freqs_cis = self._precompute_freqs_cis(self.rotary_dim)
         nn.init.normal_(self.tok_embeddings.weight, std=self.config.initializer_range)
         
         for layer in self.layers.values():
-            layer.init_weights()
+            layer.init_weights(buffer_device=buffer_device)
 
         self.norm.reset_parameters()
         
