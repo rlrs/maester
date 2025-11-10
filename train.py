@@ -257,9 +257,14 @@ def main():
 
         def loss_fn(pred, labels):
             return F.cross_entropy(pred.flatten(0, 1).float(), labels.flatten(0, 1))
+
+        def opt_step():
+            optimizers.step()
+            scheduler.step()
         
-        if cfg.compile:
-            loss_fn = torch.compile(loss_fn)
+        # if cfg.compile:
+        #     loss_fn = torch.compile(loss_fn)
+        #     opt_step = torch.compile(opt_step)
 
         # training loop
         cleanup_before_training()
@@ -380,8 +385,9 @@ def main():
                 # grad_norms = clip_grad_norm( # note: maester.utils.clip_grad_norm, not torch.nn.utils.clip_grad_norm_
                 #     model.parameters(), cfg.max_grad_norm, foreach=True
                 # )
-                optimizers.step()
-                scheduler.step()
+                #optimizers.step()
+                #scheduler.step()
+                opt_step()
                 train_state.step += 1
 
                 if train_state.step % cfg.gc_freq == 0:
