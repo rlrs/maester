@@ -81,9 +81,9 @@ class ParallelDims:
             dp_mesh_dim_names.append("dp_replicate")
             dp_cp_mesh_dim_names.append("dp_replicate")
         if self.dp_shard_enabled:
-            dp_mesh_dim_names.append("dp_shard")
-            dp_shard_cp_mesh_dim_names.append("dp_shard")
-            dp_cp_mesh_dim_names.append("dp_shard")
+            dp_mesh_dim_names.append("dp_shard_cp")
+            dp_shard_cp_mesh_dim_names.append("dp_shard_cp")
+            dp_cp_mesh_dim_names.append("dp_shard_cp")
         # if self.cp_enabled:
         #     dp_shard_cp_mesh_dim_names.append("cp")
         #     dp_cp_mesh_dim_names.append("cp")
