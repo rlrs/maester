@@ -7,7 +7,8 @@ from torch.distributed._composable.fsdp import (
 )
 from torch.distributed._composable.replicate import replicate
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    checkpoint_wrapper as ptd_checkpoint_wrapper
+    checkpoint_wrapper as ptd_checkpoint_wrapper,
+    CheckpointWrapper
 )
 from torch.distributed.tensor import Partial, Replicate, Shard
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
@@ -25,6 +26,7 @@ from collections import defaultdict
 from maester.config import Config, TORCH_DTYPE_MAP
 from maester.parallelisms.parallel_dims import ParallelDims
 from maester.log_utils import logger
+from maester.models import moe as moe_module
 from .expert_parallel import ExpertParallel, ExpertTensorParallel, TensorParallel, NoParallel
 
 # for selective op activation checkpointing
@@ -211,12 +213,52 @@ def apply_ac(model: nn.Module, ac_config: Config):
 def apply_compile(model: nn.Module):
     """Compile each transformer layer individually."""
     torch._dynamo.config.capture_scalar_outputs = True # experimental, avoid graph break on MoE
-    for layer_id, layer in model.layers.items():
-        fullgraph = True
-        if layer.moe_enabled: # TODO: remove when Moe supports fullgraph
-            fullgraph = False
-        compiled_layer = torch.compile(layer, fullgraph=fullgraph)
-        model.layers[layer_id] = compiled_layer
+    for layer_id, transformer_block in model.layers.items():
+        if transformer_block.moe_enabled:
+            # If it is a MoE layer, FSDP(GroupedExperts) will cause a graph break
+            # So we must weave compile wrappers around those FSDP hooks to
+            # prevent AC from falling back the whole graph to eager.
+            if isinstance(transformer_block, CheckpointWrapper):
+                block = transformer_block._checkpoint_wrapped_module
+            else:
+                block = transformer_block
+            for attr_name, submod in block.named_children():
+                assert getattr(block, attr_name) == getattr(transformer_block, attr_name)
+
+                if isinstance(submod, moe_module.MoE):
+                    # avoid graph breaking on the GroupedExperts' FSDP hooks
+                    # by wrapping each submod's forward instead of their __call__
+                    moe = submod
+                    for attr_name, submod in moe.named_children():
+                        # if attr_name == "experts":
+                        #     # NOTE: We don't compile token dispatch and token combine due to an issue on B200:
+                        #     # https://github.com/pytorch/torchtitan/issues/1940
+                        #     continue
+                        setattr(
+                            moe,
+                            attr_name,
+                            torch.compile(
+                                submod, fullgraph=True
+                            ),
+                        )
+                else:
+                    setattr(
+                        block,
+                        attr_name,
+                        torch.compile(
+                            submod, fullgraph=True
+                        )
+                    )
+        else:
+            # If it's not a MoE layer, there is no FSDP(GroupedExperts)
+            # So we can compile the whole block
+            transformer_block = torch.compile(transformer_block, fullgraph=True)
+        model.layers[layer_id] = transformer_block # TODO: use register_module?
+
+        moe_module._run_experts_grouped_mm = torch.compile(
+            moe_module._run_experts_grouped_mm,
+            fullgraph=True,
+        )
     logger.info("Compiled each transformer layer with torch.compile")
         
 def apply_fsdp(
@@ -322,8 +364,57 @@ def apply_fsdp(
         )
     fully_shard(model, **fsdp_config)
 
-    # TODO: set up explicit prefetching when EP is enabled, as D2H syncs
+    # set up explicit prefetching when EP is enabled, as D2H syncs
     # in EP could interfere with implicit prefetching in FSDP
+    if ep_degree == 1:
+        return
+
+    # fwd
+    transformer_blocks = list(model.layers.values())
+    next_transformer_blocks = transformer_blocks[1:] + [None]
+
+    if model.tok_embeddings is not None and len(model.layers) > 0:
+        model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
+
+    for transformer_block, next_transformer_block in zip(
+        transformer_blocks, next_transformer_blocks
+    ):
+        if next_transformer_block is not None:
+            if next_transformer_block.moe_enabled:
+                transformer_block.set_modules_to_forward_prefetch(
+                    [next_transformer_block, next_transformer_block.moe.experts]
+                )
+            else:
+                transformer_block.set_modules_to_forward_prefetch(
+                    [next_transformer_block]
+                )
+        elif model.norm is not None and model.output is not None:
+            transformer_block.set_modules_to_forward_prefetch(
+                [model.norm, model.output]
+            )
+    
+    # bwd
+    reversed_transformer_blocks = list(reversed(model.layers.values()))
+    prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
+
+    if model.norm is not None and model.output is not None and len(model.layers) > 0:
+        model.output.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+
+    for transformer_block, prev_transformer_block in zip(
+        reversed_transformer_blocks, prev_transformer_blocks
+    ):
+        if prev_transformer_block is not None:
+            if prev_transformer_block.moe_enabled:
+                transformer_block.set_modules_to_backward_prefetch(
+                    [prev_transformer_block, prev_transformer_block.moe.experts]
+                )
+            else:
+                transformer_block.set_modules_to_backward_prefetch(
+                    [prev_transformer_block]
+                )
+        elif model.tok_embeddings is not None:
+            transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
+    
 
 def apply_moe_ep_tp(
     model: nn.Module,

@@ -8,6 +8,11 @@ from torch.distributed.tensor import DTensor
 
 from .utils import indices_padding_wrapper
 
+try:
+    import primus_turbo.pytorch as primus
+    _PRIMUS_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _PRIMUS_AVAILABLE = False
 
 @dataclass
 class MoEArgs:
@@ -100,29 +105,46 @@ def _run_experts_grouped_mm(
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor | None,
 ) -> torch.Tensor:
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+    # Accept x either as:
+    # - 2D: (sum M_i, dim) with num_tokens_per_expert provided
+    # - 3D: (G, T, dim) without num_tokens_per_expert (uniform T per expert)
+    if num_tokens_per_expert is not None:
+        assert x.dim() == 2, "When num_tokens_per_expert is provided, x must be 2D (sum M_i, dim)."
+        lens = num_tokens_per_expert.to(device=x.device, dtype=torch.long)
+        A = x.contiguous()  # (sum M_i, dim)
+        G = int(lens.numel())
+        # Optional: preserve existing padding convention if any
+        # num_padding = A.shape[0] - int(lens.sum().item())
+    else:
+        assert x.dim() == 3, "Without num_tokens_per_expert, x must be 3D (G, T, dim)."
+        G, T, D = x.shape
+        lens = torch.full((G,), T, device=x.device, dtype=torch.long)
+        A = x.reshape(G * T, D).contiguous()  # (G*T, dim)
+        # num_padding = 0
 
-    # h = F.silu(
-    #     torch._grouped_mm(x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets)
-    # )
-    # h = h * torch._grouped_mm(
-    #     x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets
-    # )
-    # out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
-    
-    w1_t = w1.transpose(-2, -1).contiguous()
-    w2_t = w2.transpose(-2, -1).contiguous()
-    w3_t = w3.transpose(-2, -1).contiguous()
+    if _PRIMUS_AVAILABLE:
+        # primus.ops.grouped_gemm(A_concat, B_batched, group_lens)
+        h1 = primus.ops.grouped_gemm(A, w1, lens)
+        h3 = primus.ops.grouped_gemm(A, w3, lens)
+        h = F.silu(h1) * h3
+        out = primus.ops.grouped_gemm(h, w2, lens).to(x.dtype)
+    else:
+        # Fallback to torch._grouped_mm (expects offs = exclusive cumsum)
+        offs = torch.cumsum(lens, dim=0, dtype=torch.int32)
+        h1 = F.silu(torch._grouped_mm(A.to(torch.bfloat16), w1.to(torch.bfloat16), offs=offs))
+        h3 = torch._grouped_mm(A.to(torch.bfloat16), w3.to(torch.bfloat16), offs=offs)
+        h = h1 * h3
+        out = torch._grouped_mm(h, w2.to(torch.bfloat16), offs=offs).to(x.dtype)
 
-    gate = torch._grouped_mm(x, w1_t, offs=offsets)
-    activated = F.silu(gate)
+    # If the caller had extra padded rows in x (rare; usually zero), append zeros to match.
+    # if num_padding > 0:
+    #     out = torch.vstack((out, out.new_zeros((num_padding, out.shape[-1]))))
 
-    up = torch._grouped_mm(x, w3_t, offs=offsets)
+    # If the caller passed 3D input, return 3D as well for parity with the for-loop path.
+    if num_tokens_per_expert is None:
+        out = out.view(G, -1, out.shape[-1])
 
-    prod = activated * up
-    out = torch._grouped_mm(prod, w2_t, offs=offsets)
-
-    return out.to(dtype=x.dtype)
+    return out
 
 class GroupedExperts(nn.Module):
     def __init__(
@@ -134,9 +156,11 @@ class GroupedExperts(nn.Module):
     ):
         super().__init__()
         self.num_experts = num_experts
-        self.w1 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
-        self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
-        self.w3 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
+        # NOTE: pre-transposed for matmuls
+        self.w1 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim)) 
+        self.w2 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
+        self.w3 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
+
         self.use_grouped_mm = use_grouped_mm
 
     def forward(
