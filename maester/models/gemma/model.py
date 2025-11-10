@@ -1,14 +1,12 @@
-import torch
-from torch import nn
-import torch.nn.functional as F
-from torch.nn.attention.flex_attention import (
-    flex_attention as _flex_attention,
-    create_block_mask,
-)
-
 from dataclasses import dataclass
 
-from cut_cross_entropy import linear_cross_entropy, LinearCrossEntropyImpl
+import torch
+import torch.nn.functional as F
+from cut_cross_entropy import LinearCrossEntropyImpl, linear_cross_entropy
+from torch import nn
+from torch.nn.attention.flex_attention import create_block_mask
+from torch.nn.attention.flex_attention import flex_attention as _flex_attention
+
 
 @dataclass
 class ModelArgs:

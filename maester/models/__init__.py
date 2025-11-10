@@ -4,12 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from maester.models.llama import llama2_configs, llama3_configs, mistral_configs, Transformer
-from maester.models.gemma import gemma3_configs, GemmaTextModel
-from maester.models.deepseek import deepseek_configs, DeepSeekModel, build_deepseek_optimizers
-from maester.models.glm4 import glm4_configs, Glm4MoeTextModel
-from maester.parallelisms import parallelize_gemma, parallelize_llama, parallelize_deepseek
+from maester.models.deepseek import (DeepSeekModel, build_deepseek_optimizers,
+                                     deepseek_configs)
+from maester.models.gemma import GemmaTextModel, gemma3_configs
+from maester.models.glm4 import Glm4MoeTextModel, glm4_configs
+from maester.models.llama import (Transformer, llama2_configs, llama3_configs,
+                                  mistral_configs)
 from maester.optimizers import build_optimizers
+from maester.parallelisms import (parallelize_deepseek, parallelize_gemma,
+                                  parallelize_llama)
 
 models_config = {
     "llama2": llama2_configs,

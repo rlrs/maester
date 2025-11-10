@@ -8,17 +8,19 @@
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from cut_cross_entropy import linear_cross_entropy, LinearCrossEntropyImpl
 
-from maester.models.norms import create_norm
 from maester.models.llama.tied_linear import TiedLinear
+from maester.models.norms import create_norm
+
+# from cut_cross_entropy import linear_cross_entropy, LinearCrossEntropyImpl
+
 
 
 @dataclass

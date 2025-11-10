@@ -4,10 +4,10 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-from maester.log_utils import logger
-from maester.models.moe import MoE, FeedForward, MoEArgs
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from maester.log_utils import logger
+from maester.models.moe import FeedForward, MoE, MoEArgs
 
 # -------------------------
 # Config
@@ -561,7 +561,8 @@ class Glm4MoeTextModel(nn.Module):
         hidden_states = self._process_hidden_states(hidden_states, input_positions)
 
         if labels is not None:
-            from cut_cross_entropy import linear_cross_entropy, LinearCrossEntropyImpl
+            from cut_cross_entropy import (LinearCrossEntropyImpl,
+                                           linear_cross_entropy)
             w = self.tok_embeddings.weight if self.config.tie_word_embeddings else self.output.weight
             loss = linear_cross_entropy(
                 hidden_states.flatten(0, 1),

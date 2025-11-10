@@ -1,4 +1,4 @@
-from maester.models.gemma.model import ModelArgs, GemmaTextModel
+from maester.models.gemma.model import GemmaTextModel, ModelArgs
 
 __all__ = ["GemmaTextModel", "ModelArgs"]
 

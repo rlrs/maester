@@ -1,4 +1,4 @@
-from maester.models.glm4.model import ModelArgs, Glm4MoeTextModel
+from maester.models.glm4.model import Glm4MoeTextModel, ModelArgs
 from maester.models.moe import MoEArgs
 
 __all__ = ["Glm4MoeTextModel", "glm4_configs"]
@@ -76,9 +76,9 @@ glm4_configs = {
     ),
     "106B": ModelArgs(
         vocab_size=151_552,
-        dim=4096,
+        dim=2048,
         intermediate_size=10944,
-        n_layers=46,
+        n_layers=20,
         n_heads=96,
         n_kv_heads=8,
         head_dim=128,
