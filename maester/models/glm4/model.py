@@ -40,6 +40,7 @@ class ModelArgs:
     bos_token_id: Optional[int] = None
     attention_bias: bool = False
     tied_embeddings: bool = False
+    attention_backend: str = "flash" # 'cudnn' is faster but only available on nvidia
 
     # MoE-specific parameters
     moe_args: MoEArgs = field(default_factory=MoEArgs)
@@ -275,7 +276,7 @@ class Glm4MoeAttention(nn.Module):
         if rotary_dim % 2 != 0:
             rotary_dim -= 1
         self.rotary_dim = max(rotary_dim, 2)
-        self._attention_backend = "cudnn"
+        self._attention_backend = config.attention_backend
 
     def set_attention_backend(self, backend: str) -> None:
         backend_normalized = backend.lower()
