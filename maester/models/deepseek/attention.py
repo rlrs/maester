@@ -10,13 +10,10 @@ from typing import Callable, ClassVar
 
 import torch
 import torch.nn.functional as F
-from torch.nn.attention import sdpa_kernel, SDPBackend
-from torch.nn.attention.flex_attention import (
-    _mask_mod_signature,
-    BlockMask,
-    create_block_mask,
-    flex_attention,
-)
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.flex_attention import (BlockMask, _mask_mod_signature,
+                                               create_block_mask,
+                                               flex_attention)
 
 from maester.utils import has_cuda_capability
 

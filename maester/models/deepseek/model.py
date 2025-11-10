@@ -1,18 +1,19 @@
 import math
+from typing import Optional, Tuple
+
 import torch
 import torch.distributed as dist
-
 import torch.distributed._symmetric_memory as symm_mem
 import torch.nn.functional as f
 import torch.utils.checkpoint
-
-from typing import Optional, Tuple
+from cut_cross_entropy import LinearCrossEntropyImpl, linear_cross_entropy
 from torch import nn
 
-from cut_cross_entropy import linear_cross_entropy, LinearCrossEntropyImpl
+from maester.models.moe import FeedForward, MoE
+
 from .args import DeepSeekModelArgs
-from .moe import FeedForward, MoE
 from .attention import build_attention, init_attention_mask
+
 
 # Adapted from https://github.com/DeepSeek-ai/DeepSeek-V3/blob/main/inference/model.py#L294
 def precompute_freqs_cis(args: DeepSeekModelArgs) -> torch.Tensor:

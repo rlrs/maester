@@ -8,8 +8,8 @@ import torch
 import torch.nn as nn
 
 from maester.config import Config
-from maester.parallelisms import ParallelDims
 from maester.optimizers import OptimizersContainer, build_optimizers
+from maester.parallelisms import ParallelDims
 
 _DEAD_THRESHOLD_FRACTION = 0.05  # consider experts below 5% of ideal load effectively dead
 
@@ -117,7 +117,7 @@ def build_deepseek_optimizers(model: nn.Module, cfg: Config, parallel_dims: Para
                 wandb_module = None
         
         # Iterate through model layers
-        for layer_name, layer in model.model.layers.items():
+        for layer_name, layer in model.layers.items():
             if layer.moe_enabled:
                 moe = layer.moe
                 if not hasattr(moe, "tokens_per_expert"):

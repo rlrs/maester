@@ -1,7 +1,10 @@
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Literal, Optional
+
 from torch import nn
+
 from maester.log_utils import logger
+
 
 @dataclass
 class DeepSeekModelArgs:

@@ -11,15 +11,10 @@ from typing import Callable
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed._functional_collectives import all_to_all_single_autograd
-from torch.distributed.tensor import (
-    DeviceMesh,
-    distribute_module,
-    distribute_tensor,
-    DTensor,
-    Replicate,
-    Shard,
-)
+from torch.distributed._functional_collectives import \
+    all_to_all_single_autograd
+from torch.distributed.tensor import (DeviceMesh, DTensor, Replicate, Shard,
+                                      distribute_module, distribute_tensor)
 from torch.distributed.tensor.parallel import ParallelStyle
 from torch.distributed.tensor.placement_types import Placement
 
@@ -258,9 +253,7 @@ def expert_parallel(func: Callable) -> Callable:
             w3 = w3.to_local()
 
         if num_tokens_per_expert is not None:
-            from .moe_indices import (
-                generate_permute_indices,
-            )
+            from .moe_indices import generate_permute_indices
 
             experts_per_ep_rank = w1.shape[0]
             num_ep_ranks = num_tokens_per_expert.shape[0] // experts_per_ep_rank

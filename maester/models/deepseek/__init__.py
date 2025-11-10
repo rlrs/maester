@@ -1,4 +1,4 @@
-from maester.models.deepseek.model import DeepSeekModelArgs, DeepSeekModel
+from maester.models.deepseek.model import DeepSeekModel, DeepSeekModelArgs
 from maester.models.deepseek.optimizer import build_deepseek_optimizers
 
 __all__ = ["DeepSeekModel", "DeepSeekModelArgs", "build_deepseek_optimizers"]
