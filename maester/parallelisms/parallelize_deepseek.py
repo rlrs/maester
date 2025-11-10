@@ -62,7 +62,7 @@ def parallelize_deepseek(
         )
 
     if config.ac_mode != "none":
-        apply_ac(model.model, config)
+        apply_ac(model, config)
 
     if config.compile:
         apply_compile(model)
@@ -422,7 +422,7 @@ def apply_moe_ep_tp(
     ep_mesh: DeviceMesh | None,
     ep_tp_mesh: DeviceMesh | None,
 ):
-    for transformer_block in model.model.layers.values():
+    for transformer_block in model.layers.values():
         if not transformer_block.moe_enabled:
             continue
 
