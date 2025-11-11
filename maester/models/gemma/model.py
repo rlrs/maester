@@ -7,6 +7,8 @@ from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
 from torch.nn.attention.flex_attention import flex_attention as _flex_attention
 
+from maester.log_utils import logger
+
 
 @dataclass
 class ModelArgs:
@@ -38,6 +40,46 @@ class ModelArgs:
     vision_config: dict | None = None  # For multimodal models
     tied_embeddings: bool = True  # For training compatibility
     init_std: float = 0.02  # For weight initialization
+
+    def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
+        """
+        Calculate the number of parameters and FLOPS per token.
+        Adopted from GLM4/deepseek implementation.
+        """
+        nparams_embedding = 0
+        nparams_dense = 0
+
+        for name, p in model.named_parameters():
+            if "embedding" in name:
+                nparams_embedding += p.numel()
+                nparams_dense += p.numel()
+            else:
+                nparams_dense += p.numel()
+                
+        nparams = nparams_dense
+
+        logger.info(
+            f"Total parameter count: {nparams:,} (embeddings: {nparams_embedding:,})"
+        )
+
+        l, h, q, t = (
+            self.n_layers,
+            self.n_heads,
+            self.dim // self.n_heads,
+            seq_len,
+        )
+        # Reasoning behind the factor of 12 for the self-attention part of the formula:
+        # 1. each self-attention has 2 matmul in the forward and 4 in the backward (6)
+        # 2. the flash attention does 1 more matmul recomputation in the backward
+        #    but recomputation should not be counted in calculating MFU           (+0)
+        # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
+        # 4. we follow the convention and do not account for sparsity in causal attention
+        num_flops_per_token = (
+            6 * (nparams_dense - nparams_embedding)
+            + 12 * l * h * q * t
+        )
+
+        return nparams, num_flops_per_token
 
 def precompute_freqs_cis(dim: int,
                          end: int,

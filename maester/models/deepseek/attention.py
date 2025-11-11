@@ -215,9 +215,7 @@ class ScaledDotProductAttention(torch.nn.Module):
         scale: float | None = None,
     ) -> torch.Tensor:
         assert self.backends, "SDPA Backends should not be empty."
-        #with sdpa_kernel(self.backends, set_priority=True):
-        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION): # force CuDNN for perf, or crash
-            print(q.shape, k.shape, v.shape, scale)
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
 
 

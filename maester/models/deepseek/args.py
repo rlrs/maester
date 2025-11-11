@@ -1,9 +1,10 @@
-from dataclasses import dataclass
-from typing import Literal, Optional
+from dataclasses import dataclass, field
+from typing import Literal
 
 from torch import nn
 
 from maester.log_utils import logger
+from maester.models.moe import MoEArgs
 
 
 @dataclass
@@ -20,17 +21,13 @@ class DeepSeekModelArgs:
     n_heads: int = 16
     norm_eps: float = 1e-5  # eps used for RMSNorm
     tied_embeddings: bool = False # always False for DeepSeek
+    attention_backend: str = "flash" # 'cudnn' is faster but only available on nvidia
 
-    # MoE
-    n_routed_experts: int = 8
-    n_shared_experts: int = 0
-    n_activated_experts: int = 4
-    n_expert_groups: int = 1
-    n_limited_groups: int = 1
-    score_func: Literal["softmax", "sigmoid"] = "softmax"
-    route_scale: float = 1.0
-    use_grouped_mm: bool = True
-    load_balance_coeff: float = 1e-3
+    # MoE-specific parameters
+    moe_args: MoEArgs = field(default_factory=MoEArgs)
+    moe_intermediate_size: int = 1408
+    first_k_dense_replace: int = 1
+    use_qk_norm: bool = False
 
     # MLA
     q_lora_rank: int = 0
@@ -77,7 +74,7 @@ class DeepSeekModelArgs:
         nparams_sparse_active = (
             nparams_moe_router
             + nparams_shared_expert
-            + nparams_experts * self.n_activated_experts // self.n_routed_experts
+            + nparams_experts * self.moe_args.top_k // self.moe_args.num_experts
         )
 
         logger.info(

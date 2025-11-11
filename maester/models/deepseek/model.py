@@ -232,7 +232,7 @@ class Attention(nn.Module):
 
         # Reshape and project output
         output = output.transpose(1, 2)  # (bsz, seqlen, n_heads, v_head_dim)
-        output = output.view(bsz, seqlen, -1)  # (bsz, seqlen, n_heads * v_head_dim)
+        output = output.contiguous().view(bsz, seqlen, -1)  # (bsz, seqlen, n_heads * v_head_dim)
         return self.wo(output)  # (bsz, seqlen, dim)
 
     def init_weights(self, init_std: float):
@@ -265,10 +265,14 @@ class TransformerBlock(nn.Module):
         self.attention = Attention(model_args)
         self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
-        self.moe_enabled = layer_id >= model_args.n_dense_layers
+        self.moe_enabled = layer_id >= model_args.first_k_dense_replace
 
         if self.moe_enabled:
-            self.moe = MoE(model_args)
+            self.moe = MoE(
+                model_args.moe_args,
+                dim=model_args.dim,
+                hidden_dim=model_args.moe_intermediate_size,
+            )
         else:
             self.feed_forward = FeedForward(model_args.dim, model_args.inter_dim)
 
@@ -354,6 +358,9 @@ class DeepSeekModel(nn.Module):
     def forward(
         self,
         tokens: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        document_ids: Optional[torch.Tensor] = None,
         eos_id: int | None = None,
         input_batch: torch.Tensor | None = None,
     ):
@@ -373,6 +380,7 @@ class DeepSeekModel(nn.Module):
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
+        # TODO: Use labels, position_ids, document_ids
         if self.model_args.use_flex_attn:
             init_attention_mask(
                 input_batch if input_batch is not None else tokens, eos_id=eos_id

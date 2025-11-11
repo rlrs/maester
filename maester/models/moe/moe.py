@@ -162,6 +162,22 @@ class GroupedExperts(nn.Module):
         self.w3 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
 
         self.use_grouped_mm = use_grouped_mm
+        # Cache whether the DTensor mesh has an 'ep' dim to avoid unsupported
+        # Python checks inside compiled regions.
+        self._has_ep_dim_cached = None
+    
+    def _has_ep_dim(self) -> bool:
+        # If not DTensor, EP dim can't exist.
+        if not isinstance(self.w1, DTensor):
+            return False
+        # During compilation, only read cached value to avoid tuple membership checks.
+        if torch._dynamo.is_compiling():
+            return bool(self._has_ep_dim_cached) if self._has_ep_dim_cached is not None else False
+        # Outside compilation, compute once and cache.
+        if self._has_ep_dim_cached is None:
+            mesh_dim_names = getattr(self.w1.device_mesh, "mesh_dim_names", None)
+            self._has_ep_dim_cached = ("ep" in mesh_dim_names) if isinstance(mesh_dim_names, (list, tuple)) else False
+        return bool(self._has_ep_dim_cached)
 
     def forward(
         self,
@@ -184,10 +200,8 @@ class GroupedExperts(nn.Module):
             #       to prepare for grouped_mm;
             #       otherwise, EP will handle the padding.
             num_tokens_per_expert_int = num_tokens_per_expert.to(dtype=torch.int32)
-            if (
-                not isinstance(self.w1, DTensor)
-                or "ep" not in self.w1.device_mesh.mesh_dim_names
-            ):
+            has_ep_dim = self._has_ep_dim()
+            if (not isinstance(self.w1, DTensor)) or (not has_ep_dim):
                 run_experts_fn = indices_padding_wrapper(_run_experts_grouped_mm)
             else:
                 run_experts_fn = _run_experts_grouped_mm

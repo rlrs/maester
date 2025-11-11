@@ -44,13 +44,10 @@ def group_expert_weights(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch
                 expert_groups[group_key] = {}
             expert_groups[group_key][expert_idx] = value
         elif key.startswith("__shared__"):
-            # Handle shared expert - needs to be transposed and unsqueezed
+            # Handle shared expert: keep standard Linear weight shape [out_features, in_features]
             actual_key = key[10:]  # Remove "__shared__" prefix
-            # Transpose from [out_features, in_features] to [in_features, out_features]
-            # then add unsqueezed dimension to make it [1, in_features, out_features]
-            transposed = value.t()
-            new_state_dict[actual_key] = transposed.unsqueeze(0)
-            print(f"Converted shared expert {actual_key} from {value.shape} to {transposed.unsqueeze(0).shape}")
+            new_state_dict[actual_key] = value
+            print(f"Kept shared expert {actual_key} with shape {value.shape}")
         else:
             # Keep non-expert weights as-is
             new_state_dict[key] = value
@@ -128,8 +125,8 @@ def convert_deepseek_weights(input_dir: Path, output_dir: Path):
     # Save to DCP format
     print("Writing to DCP format...")
     output_dir.mkdir(parents=True, exist_ok=True)
-    storage_writer = DCP.filesystem.FileSystemWriter(str(output_dir))
-    DCP.save({"model": state_dict}, storage_writer=storage_writer)
+    writer = DCP.filesystem.FileSystemWriter(str(output_dir))
+    DCP.save({"model": state_dict}, storage_writer=writer)
     
     # Copy config from input directory if available
     if config_path.exists():
@@ -159,7 +156,7 @@ def convert_deepseek_model(safetensors_files: list) -> Dict[str, torch.Tensor]:
     return state_dict
 
 
-def map_deepseek_key(key: str) -> str:
+def map_deepseek_key(key: str) -> str | None:
     """Map HuggingFace DeepSeek keys to our format."""
     
     # Embeddings
@@ -212,11 +209,11 @@ def map_deepseek_key(key: str) -> str:
             # Shared experts - need to add dimension for GroupedExperts format
             elif "shared_experts" in key:
                 if key.endswith("gate_proj.weight"):
-                    return f"__shared__layers.{layer_idx}.moe.shared_expert.w1"
+                    return f"__shared__layers.{layer_idx}.moe.shared_experts.w1.weight"
                 elif key.endswith("up_proj.weight"):
-                    return f"__shared__layers.{layer_idx}.moe.shared_expert.w3"
+                    return f"__shared__layers.{layer_idx}.moe.shared_experts.w3.weight"
                 elif key.endswith("down_proj.weight"):
-                    return f"__shared__layers.{layer_idx}.moe.shared_expert.w2"
+                    return f"__shared__layers.{layer_idx}.moe.shared_experts.w2.weight"
             
             # Routed experts - need to be collected into grouped tensors
             elif "experts" in key:
