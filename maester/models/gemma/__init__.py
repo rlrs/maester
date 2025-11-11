@@ -3,15 +3,15 @@ from maester.models.gemma.model import ModelArgs, GemmaTextModel
 __all__ = ["GemmaTextModel", "ModelArgs"]
 
 gemma3_configs = {
-    "270M": ModelArgs(
-        vocab_size=262_144,
-        dim=640,
-        n_layers=18,
+    "debug": ModelArgs(
+        vocab_size=262_144,  # Actual size from google/gemma-3-1b-pt tokenizer
+        dim=1152,
+        n_layers=5,
         n_heads=4,
         num_key_value_heads=1,
         head_dim=256,
-        intermediate_size=2048,
-        attn_types=["local_sliding", "local_sliding", "local_sliding", "local_sliding", "local_sliding", "global"],
+        intermediate_size=6912,
+        attn_types=["local_sliding", "local_sliding", "global", "local_sliding", "local_sliding"],
         use_post_ffw_norm=True,
         use_pre_ffw_norm=True,
         sliding_window_size=512,

@@ -20,6 +20,8 @@ from cut_cross_entropy import linear_cross_entropy, LinearCrossEntropyImpl
 from maester.models.norms import create_norm
 from maester.models.llama.tied_linear import TiedLinear
 
+from torch.distributed.device_mesh import DeviceMesh
+
 
 @dataclass
 class ModelArgs:
@@ -490,12 +492,13 @@ class Transformer(nn.Module):
             return output
 
     @classmethod
-    def from_model_args(cls, model_args: ModelArgs) -> "Transformer":
+    def from_model_args(cls, model_args: ModelArgs, cp_device_mesh: Optional[DeviceMesh] = None) -> "Transformer":
         """
         Initialize a Transformer model from a ModelArgs object.
 
         Args:
             model_args (ModelArgs): Model configuration arguments.
+            cp_device_mesh (Optional[DeviceMesh]): Device mesh for context parallelism.
 
         Returns:
             Transformer: Transformer model.
