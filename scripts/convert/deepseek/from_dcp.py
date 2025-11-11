@@ -22,7 +22,7 @@ from typing import Dict, Any, Optional
 import torch
 import torch.distributed.checkpoint as DCP
 from safetensors.torch import save_file
-from torch.distributed.checkpoint import FileSystemReader
+from torch.distributed.checkpoint.filesystem import FileSystemReader
 from torch.distributed.checkpoint.metadata import Metadata, STATE_DICT_TYPE, TensorStorageMetadata
 from torch.distributed.checkpoint._traverse import set_element
 from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
@@ -53,10 +53,8 @@ def ungroup_expert_weights(state_dict: Dict[str, torch.Tensor]) -> Dict[str, tor
                 new_state_dict[new_key] = expert_weight
             print(f"Ungrouped {num_experts} experts from {key}")
             
-        # Handle shared expert weights
-        elif "moe.shared_expert.w" in key and value.dim() == 3:
-            # This is a shared expert tensor [1, in_features, out_features]
-            # Don't ungroup - just keep as is for mapping
+        # Handle shared expert weights (kept as-is; typically 2D [out, in])
+        elif "moe.shared_experts.w" in key:
             new_state_dict[key] = value
             print(f"Keeping shared expert {key} with shape {value.shape} for mapping")
             
@@ -79,8 +77,8 @@ class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
     def set_up_planner(
         self,
         state_dict: STATE_DICT_TYPE,
-        metadata: Metadata,
-        is_coordinator: bool,
+        metadata: Optional[Metadata] = None,
+        is_coordinator: bool = False,
     ) -> None:
         assert not state_dict
 
@@ -324,17 +322,14 @@ def map_to_hf_deepseek_key(key: str, tensor: torch.Tensor) -> Optional[str]:
             if key.endswith("router.gate.weight"):
                 return f"model.layers.{layer_idx}.mlp.gate.weight"
             
-            # Shared expert (grouped tensor that needs special handling)
-            elif "shared_expert.w" in key and not key.endswith(".weight"):
-                # Extract weight type and handle the grouped tensor
-                if key.endswith("w1"):
-                    # Need to squeeze and transpose the tensor
-                    # This will be done in the main conversion function
-                    return f"__shared__model.layers.{layer_idx}.mlp.shared_experts.gate_proj.weight"
-                elif key.endswith("w3"):
-                    return f"__shared__model.layers.{layer_idx}.mlp.shared_experts.up_proj.weight"
-                elif key.endswith("w2"):
-                    return f"__shared__model.layers.{layer_idx}.mlp.shared_experts.down_proj.weight"
+            # Shared experts (direct 2D tensors saved in DCP)
+            elif "shared_experts" in key:
+                if key.endswith("w1.weight"):
+                    return f"model.layers.{layer_idx}.mlp.shared_experts.gate_proj.weight"
+                elif key.endswith("w3.weight"):
+                    return f"model.layers.{layer_idx}.mlp.shared_experts.up_proj.weight"
+                elif key.endswith("w2.weight"):
+                    return f"model.layers.{layer_idx}.mlp.shared_experts.down_proj.weight"
             
             # Routed experts
             elif "experts" in key and not "shared" in key:
