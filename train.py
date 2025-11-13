@@ -466,7 +466,7 @@ def main():
                     
                     # Aggregate data loading times across ALL ranks (TP ranks load redundantly)
                     # Flatten world mesh to get all ranks
-                    global_mesh = world_mesh._flatten() if hasattr(world_mesh, '_flatten') else world_mesh
+                    global_mesh = world_mesh._flatten(mesh_dim_name="global") if hasattr(world_mesh, '_flatten') else world_mesh
                     global_avg_data_loading = dist_mean(time_data_loading, global_mesh).item()
                     global_max_data_loading = dist_max(time_data_loading, global_mesh).item()
                     global_avg_data_loading_pct = dist_mean(time_data_loading_pct, global_mesh).item()
