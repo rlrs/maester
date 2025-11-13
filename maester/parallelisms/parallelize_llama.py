@@ -60,28 +60,25 @@ def parallelize_llama(
                 "fused_rmsnorm is not compatible with torch.compile yet. "
                 "Please use rmsnorm or layernorm."
             )
-        apply_compile(model)
+        apply_compile(model, fullgraph=not parallel_dims.cp_enabled)
 
-    use_fsdp = parallel_dims.dp_shard_enabled or (
-        world_mesh.ndim == 1 and world_mesh.size() == 1
-    )
 
-    if use_fsdp:
-        if parallel_dims.dp_shard_enabled:
-            if parallel_dims.dp_replicate_enabled:
-                dp_mesh = world_mesh["dp_replicate", "dp_shard"]
+    if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:
+        if parallel_dims.dp_replicate_enabled:
+            if parallel_dims.cp_enabled:
+                dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
             else:
-                dp_mesh = world_mesh["dp"]
+                dp_mesh_dim_names = ("dp_replicate", "dp_shard")
         else:
-            dp_mesh = world_mesh if world_mesh.ndim == 1 else world_mesh["dp"]
-
-        apply_fsdp(
-            model,
-            dp_mesh,
-            param_dtype=TORCH_DTYPE_MAP[config.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[config.mixed_precision_reduce],
-        )
-        if parallel_dims.dp_shard_enabled and parallel_dims.dp_replicate_enabled:
+            if parallel_dims.cp_enabled:
+                dp_mesh_dim_names = ("dp_shard_cp",)
+            else:
+                dp_mesh_dim_names = ("dp",)
+        
+        dp_mesh = world_mesh[tuple(dp_mesh_dim_names)]
+        apply_fsdp(model, dp_mesh, param_dtype=TORCH_DTYPE_MAP[config.mixed_precision_param], 
+                   reduce_dtype=TORCH_DTYPE_MAP[config.mixed_precision_reduce])
+        if parallel_dims.dp_replicate_enabled:
             logger.info("Applied HSDP to the model")
         else:
             logger.info("Applied FSDP to the model")
@@ -250,16 +247,16 @@ def apply_ac(model: nn.Module, ac_config: Config):
     logger.info(f"Applied {ac_config.ac_mode} activation checkpointing to the model")
 
 
-def apply_compile(model: nn.Module):
+def apply_compile(model: nn.Module, fullgraph: bool = True):
     """
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
     for layer_id, transformer_block in model.layers.named_children():
-        transformer_block = torch.compile(transformer_block, fullgraph=True)
+        transformer_block = torch.compile(transformer_block, fullgraph=fullgraph)
         model.layers.register_module(layer_id, transformer_block)
 
-    logger.info("Compiling each TransformerBlock with torch.compile")
+    logger.info(f"Compiling each TransformerBlock with torch.compile (fullgraph={fullgraph})")
 
 
 def apply_fsdp(

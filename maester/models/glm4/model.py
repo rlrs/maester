@@ -604,7 +604,7 @@ class Glm4MoeTextModel(nn.Module):
         return hidden_states
 
     @classmethod
-    def from_model_args(cls, model_args: ModelArgs) -> "Glm4MoeTextModel":
+    def from_model_args(cls, model_args: ModelArgs, cp_device_mesh=None) -> "Glm4MoeTextModel":
         """Initialize from model args (compatible with training loop)."""
         return cls(model_args)
 
