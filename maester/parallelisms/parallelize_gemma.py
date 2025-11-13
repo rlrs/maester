@@ -53,7 +53,7 @@ def parallelize_gemma(
 
     # Compile each layer individually
     if config.compile:
-        apply_compile(model)
+        apply_compile(model, fullgraph=not parallel_dims.cp_enabled) # TODO: fullgraph for CP?
 
     # Apply FSDP
     use_fsdp = parallel_dims.dp_enabled or (
@@ -69,7 +69,6 @@ def parallelize_gemma(
             dp_mesh,
             param_dtype=TORCH_DTYPE_MAP[config.mixed_precision_param],
             reduce_dtype=TORCH_DTYPE_MAP[config.mixed_precision_reduce],
-            tp_enabled=parallel_dims.tp_enabled,
             #pp_enabled=parallel_dims.pp_enabled,
         )
 
@@ -257,10 +256,10 @@ def apply_ac(model: nn.Module, config: Config):
     logger.info("Applied activation checkpointing to the model")
 
 
-def apply_compile(model: nn.Module):
+def apply_compile(model: nn.Module, fullgraph: bool = False):
     """Compile each transformer layer individually."""
     for layer_id, layer in enumerate(model.model.layers):
-        compiled_layer = torch.compile(layer, fullgraph=True)
+        compiled_layer = torch.compile(layer, fullgraph=fullgraph)
         model.model.layers[layer_id] = compiled_layer
     logger.info("Compiled each transformer layer with torch.compile")
 
@@ -270,7 +269,6 @@ def apply_fsdp(
     dp_mesh: DeviceMesh,
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
-    tp_enabled: bool,
     pp_enabled: bool = False,
 ):
     """Apply FSDP to Gemma model."""

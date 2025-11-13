@@ -11,6 +11,7 @@ from maester.utils import device_type
 class ParallelDims:
     dp_replicate: int
     dp_shard: int
+    cp: int
     tp: int
     # cp: int # TODO: implement context parallelism
     ep: int
@@ -23,27 +24,27 @@ class ParallelDims:
         self._validate()
 
     def _validate(self):
-        dp_replicate, dp_shard, tp, ep = self.dp_replicate, self.dp_shard, self.tp, self.ep
-        for d in (dp_replicate, tp, ep):
+        dp_replicate, dp_shard, tp, ep, cp = self.dp_replicate, self.dp_shard, self.tp, self.ep, self.cp
+        for d in (dp_replicate, tp, ep, cp):
             assert d >= 1, "Parallelism degree should be >= 1, except for dp_shard"
         assert dp_shard == -1 or dp_shard >= 1, " dp_shard must -1 or >=1."
 
         dp = dp_replicate * dp_shard
         if dp < 0:
             dp = self.world_size // (tp)
-            self.dp_shard = dp_shard = dp // dp_replicate
+            self.dp_shard = dp_shard = self.world_size // (dp_replicate * tp * cp)
 
         assert dp_replicate >= 1
         assert dp_shard >= 1
         assert tp >= 1, tp
-        assert dp_replicate * dp_shard * tp == self.world_size, (
+        assert cp >= 1, cp
+        assert dp_replicate * dp_shard * tp * cp == self.world_size, (
             f"Invalid parallel dims: dp_replicate({dp_replicate}) * dp_shard({dp_shard}) * "
-            f"tp({tp}) != WORLD_SIZE({self.world_size})"
+            f"tp({tp}) * cp({cp}) != WORLD_SIZE({self.world_size})"
         )
 
         if ep > 1:
-            #assert ep % cp == 0 and (dp_shard * cp) % ep == 0
-            assert ep % tp == 0 and (dp_shard * tp) % ep == 0
+            assert ep % cp == 0 and (dp_shard * cp) % ep == 0
 
     def build_mesh(self):
         if self.ep > 1:
@@ -56,8 +57,8 @@ class ParallelDims:
         dims = []
         names = []
         for d, name in zip(
-            [self.dp_replicate, self.dp_shard, self.tp],
-            ["dp_replicate", "dp_shard_cp", "tp"],
+            [self.dp_replicate, self.dp_shard, self.cp, self.tp],
+            ["dp_replicate", "dp_shard_cp", "cp", "tp"],
         ):
             if d > 1:
                 dims.append(d)
@@ -84,9 +85,9 @@ class ParallelDims:
             dp_mesh_dim_names.append("dp_shard_cp")
             dp_shard_cp_mesh_dim_names.append("dp_shard_cp")
             dp_cp_mesh_dim_names.append("dp_shard_cp")
-        # if self.cp_enabled:
-        #     dp_shard_cp_mesh_dim_names.append("cp")
-        #     dp_cp_mesh_dim_names.append("cp")
+        if self.cp_enabled:
+            dp_shard_cp_mesh_dim_names.append("cp")
+            dp_cp_mesh_dim_names.append("cp")
 
         if dp_mesh_dim_names != []:
             mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
@@ -103,9 +104,8 @@ class ParallelDims:
         # With ep, dp_shard and ep are derived submeshes:
         # dp_shard = dp_shard_mod_ep * dp_shard_in_ep
         # ep = dp_shard_in_ep * cp
-        # NOTE: cp not implemented
-        dp_shard_mod_ep = self.dp_shard * self.tp // self.ep
-        dp_shard_in_ep = self.ep // self.tp
+        dp_shard_mod_ep = self.dp_shard * self.cp * self.tp // self.ep
+        dp_shard_in_ep = self.ep // (self.cp * self.tp)
 
         dims = []
         names = []
@@ -114,9 +114,10 @@ class ParallelDims:
                 self.dp_replicate,
                 dp_shard_mod_ep,
                 dp_shard_in_ep,
+                self.cp,
                 self.tp,
             ],
-            ["dp_replicate", "dp_shard_mod_ep", "dp_shard_in_ep", "tp"],
+            ["dp_replicate", "dp_shard_mod_ep", "dp_shard_in_ep", "cp", "tp"],
         ):
             # dp_shard_mod_ep is needed even if it's 1, whose FSDP wrapping
             # helps the MoE layers do mixed precision training
@@ -150,10 +151,10 @@ class ParallelDims:
             dp_shard_cp_mesh_dim_names.append("dp_shard_in_ep")
             dp_cp_mesh_dim_names.append("dp_shard_in_ep")
             ep_mesh_dim_names.append("dp_shard_in_ep")
-        # if self.cp_enabled:
-        #     dp_shard_cp_mesh_dim_names.append("cp")
-        #     dp_cp_mesh_dim_names.append("cp")
-        #     ep_mesh_dim_names.append("cp")
+        if self.cp_enabled:
+            dp_shard_cp_mesh_dim_names.append("cp")
+            dp_cp_mesh_dim_names.append("cp")
+            ep_mesh_dim_names.append("cp")
 
         mesh[tuple(dp_mesh_dim_names)]._flatten(mesh_dim_name="dp")
         mesh[tuple(dp_shard_cp_mesh_dim_names)]._flatten(mesh_dim_name="dp_shard_cp")
@@ -177,16 +178,24 @@ class ParallelDims:
         return self.dp_shard > 1
 
     @property
+    def dp_cp_enabled(self):
+        return self.dp_enabled or self.cp_enabled
+
+    @property
+    def cp_enabled(self):
+        return self.cp > 1
+
+    @property
+    def fsdp_enabled(self):
+        return self.dp_shard_enabled or self.cp_enabled
+
+    @property
     def tp_enabled(self):
         return self.tp > 1
 
     @property
     def ep_enabled(self):
         return self.ep > 1
-
-    @property
-    def fsdp_enabled(self):
-        return self.dp_shard_enabled
 
     @property
     def loss_parallel_enabled(self):
@@ -211,6 +220,10 @@ class ParallelDims:
     @cached_property
     def model_parallel_size(self):
         return self.tp
+
+    @cached_property
+    def non_data_parallel_size(self):
+        return self.cp * self.tp
     
     @cached_property
     def dense_params_mesh_ndim(self):

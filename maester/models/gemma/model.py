@@ -6,6 +6,7 @@ from cut_cross_entropy import LinearCrossEntropyImpl, linear_cross_entropy
 from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
 from torch.nn.attention.flex_attention import flex_attention as _flex_attention
+from torch.distributed import DeviceMesh
 
 from maester.log_utils import logger
 
@@ -285,7 +286,8 @@ class GemmaAttention(nn.Module):
     def __init__(
         self,
         config: ModelArgs,
-        attn_type: str
+        attn_type: str,
+        cp_device_mesh: DeviceMesh | None
     ):
         super().__init__()
 
@@ -448,13 +450,15 @@ class Gemma2DecoderLayer(nn.Module):
     def __init__(
         self,
         config: ModelArgs,
-        attn_type: str
+        attn_type: str,
+        cp_device_mesh: DeviceMesh | None
     ):
         super().__init__()
         self.attn_type = attn_type
         self.self_attn = GemmaAttention(
             config=config,
-            attn_type=attn_type
+            attn_type=attn_type,
+            cp_device_mesh=cp_device_mesh
         )
         self.mlp = GemmaMLP(
             hidden_size=config.dim,
@@ -523,7 +527,7 @@ class Gemma2DecoderLayer(nn.Module):
         self.mlp.init_weights(init_std)
 
 class GemmaModel(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelArgs, cp_device_mesh: DeviceMesh | None):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -535,7 +539,7 @@ class GemmaModel(nn.Module):
                 if config.attn_types is not None
                 else "global" 
             )
-            self.layers.append(Gemma2DecoderLayer(config, attn_type))
+            self.layers.append(Gemma2DecoderLayer(config, attn_type, cp_device_mesh))
         self.norm = RMSNorm(config.dim, eps=config.rms_norm_eps)
 
     def forward(
@@ -569,13 +573,14 @@ class GemmaModel(nn.Module):
     
 class GemmaTextModel(nn.Module):
     """Text-only Gemma model compatible with training setup."""
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelArgs, cp_device_mesh: DeviceMesh | None = None):
         super().__init__()
         self.config = config
         self.model_args = config  # For compatibility with training code
         self.vocab_size = config.vocab_size
         self.n_layers = config.n_layers
-        
+
+        self.cp_device_mesh = cp_device_mesh
         # Text embeddings
         self.tok_embeddings = Embedding(
             num_embeddings=config.vocab_size,
@@ -583,7 +588,7 @@ class GemmaTextModel(nn.Module):
         )
         
         # Core transformer model
-        self.model = GemmaModel(config)
+        self.model = GemmaModel(config, cp_device_mesh=cp_device_mesh)
         
         # Precompute RoPE frequencies following multimodal pattern
         head_dim = config.head_dim
@@ -772,9 +777,9 @@ class GemmaTextModel(nn.Module):
             return output
     
     @classmethod
-    def from_model_args(cls, model_args: ModelArgs) -> "GemmaTextModel":
+    def from_model_args(cls, model_args: ModelArgs, cp_device_mesh: DeviceMesh | None = None) -> "GemmaTextModel":
         """Initialize from model args (compatible with training loop)."""
-        return cls(model_args)
+        return cls(model_args, cp_device_mesh=cp_device_mesh)
 
 
 class Gemma3MultiModalModel(nn.Module):

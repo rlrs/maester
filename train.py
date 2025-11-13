@@ -19,6 +19,8 @@ import torch.nn.functional as F
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.tensor.parallel import loss_parallel
+from torch.distributed.tensor.experimental import context_parallel
+from torch.distributed.tensor.experimental._attention import set_rotate_method
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
@@ -98,6 +100,7 @@ def main():
         dp_shard=cfg.data_parallel_shard_degree,
         dp_replicate=cfg.data_parallel_replicate_degree,
         tp=cfg.tensor_parallel_degree,
+        cp=cfg.context_parallel_degree,
         ep=cfg.expert_parallel_degree,
         world_size=world_size,
         enable_loss_parallel=cfg.enable_loss_parallel,
@@ -125,6 +128,17 @@ def main():
         logger.info(f"world mesh: {world_mesh}")
         if parallel_dims.dp_enabled:
             logger.info(f"{dp_mesh=}")
+
+        # TODO: Is this still needed? `_set_cp_global_var` is only available in torch 2.9.0
+        # if parallel_dims.cp_enabled: # the following is necessary for CP w/ flex attention
+        #     from torch.distributed.tensor.experimental._attention import _set_cp_global_var, _DispatchMode, _cp_options
+
+        #     # set_rotate_method("alltoall")  # alltoall or allgather (only allgather for flex)
+        #     _set_cp_global_var("cp_shard_dim", 2)
+        #     # _cp_options.enable_load_balance = True  # no load balancing for flex
+        #     torch.distributed.tensor.experimental._attention._dispatch_mode = (
+        #         _DispatchMode.TORCH_FUNCTION
+        #     )
 
         # Get tokenizer to determine vocab size
         if os.path.isfile(cfg.tokenizer_name):
@@ -158,7 +172,7 @@ def main():
             logger.info(
                 f"Building {cfg.model_name} {cfg.flavor} with {model_config}"
             )
-            model = model_cls.from_model_args(model_config)
+            model = model_cls.from_model_args(model_config, cp_device_mesh=world_mesh["cp"] if parallel_dims.cp_enabled else None)
 
         # log model size
         # model_param_count = get_num_params(model)
@@ -331,19 +345,34 @@ def main():
                     # Get document_ids if available (for flex attention document masking in packed data)
                     document_ids = batch.get("document_ids", None)
 
-                    # Collect padding stats if available (SFT mode)
-                    if "stats" in batch and "actual_lengths" in batch["stats"]:
-                        padding_lengths_since_last_log.append(batch["stats"]["actual_lengths"])
-
-                    ntokens_since_last_log += labels.numel()
-                    data_loading_times.append(timer() - data_load_start)
-
                     input_ids = input_ids.cuda()
                     labels = labels.cuda()
                     if position_ids is not None:
                         position_ids = position_ids.cuda()
                     if document_ids is not None:
                         document_ids = document_ids.cuda()
+                    
+                    buffers = [input_ids, labels]
+                    buffer_seq_dims = [1, 1] # shard on seq dim
+                    if hasattr(model, 'freqs_cis'):
+                        buffers.extend([model.freqs_cis])
+                        buffer_seq_dims.extend([0])
+                    elif hasattr(model, 'local_freqs_cis') and hasattr(model, 'global_freqs_cis'):
+                        buffers.extend([model.local_freqs_cis, model.global_freqs_cis])
+                        buffer_seq_dims.extend([0, 0])
+                    context_parallel_ctx = context_parallel(
+                        world_mesh["cp"],
+                        buffers=buffers,
+                        buffer_seq_dims=buffer_seq_dims,
+                        no_restore_buffers={input_ids, labels},  # don't restore
+                    ) if parallel_dims.cp_enabled else contextlib.nullcontext()
+
+                    # Collect padding stats if available (SFT mode)
+                    if "stats" in batch and "actual_lengths" in batch["stats"]:
+                        padding_lengths_since_last_log.append(batch["stats"]["actual_lengths"])
+
+                    ntokens_since_last_log += labels.numel()
+                    data_loading_times.append(timer() - data_load_start)
 
                     sync_grads_now = True
                     if skip_sync_during_accum:
@@ -352,7 +381,7 @@ def main():
                     if fsdp_can_toggle_sync and grad_accum_steps > 1:
                         model.set_requires_gradient_sync(sync_grads_now)
 
-                    with loss_parallel_ctx():
+                    with loss_parallel_ctx(), context_parallel_ctx:
                         if cfg.enable_cut_cross_entropy:
                             loss = model(
                                 input_ids,
@@ -428,7 +457,7 @@ def main():
                     time_delta = timer() - time_last_log
 
                     total_tokens += ntokens_since_last_log
-                    tps = ntokens_since_last_log / (time_delta * parallel_dims.model_parallel_size)
+                    tps = ntokens_since_last_log / (time_delta * parallel_dims.non_data_parallel_size)
                     mfu = 100 * num_flop_per_token * tps / gpu_peak_flops
 
                     time_end_to_end = time_delta / cfg.log_freq
