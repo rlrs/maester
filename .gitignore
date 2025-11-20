@@ -14,9 +14,13 @@ core
 
 .env
 .venv
+.cache
 
 logs/
 separate-logs/
 *.distcp
 
 wandb/
+
+data/
+models/

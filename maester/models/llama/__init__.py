@@ -86,6 +86,14 @@ llama3_configs = {
         multiple_of=1024,
         rope_theta=500000,
     ),
+    "Comma7B": ModelArgs(
+        dim=4096,
+        n_layers=32,
+        n_heads=32,
+        rope_theta=100000.0,
+        max_seq_len=4096,
+        vocab_size=64256,
+    ),
     "8B": ModelArgs(
         dim=4096,
         n_layers=32,

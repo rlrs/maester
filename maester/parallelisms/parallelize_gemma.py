@@ -62,7 +62,7 @@ def parallelize_gemma(
     if use_fsdp:
         dp_mesh = world_mesh["dp"] if (parallel_dims.dp_enabled and world_mesh.ndim > 1) else world_mesh
         if parallel_dims.dp_enabled:
-            assert dp_mesh.mesh_dim_names == ("dp",), dp_mesh.mesh_dim_names
+            assert dp_mesh.mesh_dim_names == ("dp_shard_cp",), dp_mesh.mesh_dim_names
 
         apply_fsdp(
             model,
