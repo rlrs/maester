@@ -3,11 +3,13 @@ from functools import cached_property
 
 from torch.distributed.device_mesh import init_device_mesh
 
+from maester.config import Config
 from maester.log_utils import logger
 
 
 @dataclass
 class ParallelDims:
+    cfg: Config
     dp_replicate: int
     dp_shard: int
     tp: int
@@ -56,7 +58,8 @@ class ParallelDims:
             names = ("dp",)
         logger.info(f"Building {len(dims)}-D device mesh with {names}, {dims}")
         names = tuple(names)
-        mesh = init_device_mesh(device_type, dims, mesh_dim_names=names)
+        backend_override = {i: self.cfg.backend for i in range(len(dims))} if hasattr(self.cfg, "backend") else None
+        mesh = init_device_mesh(device_type, dims, mesh_dim_names=names, backend_override=backend_override)
         # Create all the submesh here to ensure all required process groups are
         # initialized
         if self.dp_replicate > 1 and self.dp_shard > 1:

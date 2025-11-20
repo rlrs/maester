@@ -1,0 +1,42 @@
+model_name = "llama3"
+flavor = "Comma1B"
+tokenizer_name = "common-pile/comma-v0.1-2t"
+
+# job 
+job_name = "comma-1b"
+wandb_project = "comma-1b"
+enable_wandb = false
+
+# parallelism
+num_nodes = 1
+data_parallel_shard_degree = 2
+data_parallel_replicate_degree = 1
+
+# training settings
+train_batch_size = 128
+gradient_accumulation_steps = 1
+seq_len = 1024
+train_num_steps = 76403
+scheduler = "linear_warmup_constant_sqrt_decay"
+warmup_steps = 1000
+cooldown_steps = 1
+checkpoint_interval = 1000
+compile = true
+enable_cut_cross_entropy = false
+ac_mode = "none"
+selective_ac_option = "op"
+
+[dataset]
+bos_token = 2
+eos_token = 3
+data_dirs = [
+    "/work/production/data/comma-1b-cp-0-of-2-train/",
+]
+dataset_weights = "1.0"
+
+[opt_cfg] # must specify *all* fields here, will not merge with defaults
+lr = 1e-5
+betas = [0.9, 0.95]
+weight_decay = 0.1
+eps = 1e-9
+fused = true

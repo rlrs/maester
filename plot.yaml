@@ -1,0 +1,29 @@
+colors:
+  blue:   [112,112,255]
+  orange: [186,228,188]
+  green:  [123,204,123]
+  red:    [255,112,112]
+  purple: [  8,104,172]
+  yellow: [186,186,  0]
+  pink:   [224, 86,224]
+  teal:   [  0,186,224]
+repo: /work/training/maester
+metric: loss
+smooth: [exponential, 64]
+ylim: [1, 3]
+
+figure1:
+  runs:
+    - {hash: c9b73f7799754f388d1510db, color: red, label: "munin-7b-open-stage1.log", offset: 0}
+    - {hash: 7e0b88c922bb43ad920572fa, color: red, label: "munin-7b-open-stage2.log", offset: 3785}
+    - {hash: f187fb583e2e483382f9c2a6, color: red, label: "munin-7b-open-stage3.log", offset: 5677}
+    - {hash: 0c92b426b0ba498aacd473fb, color: blue, label: "munin-7b-open-stage1-4k.log"}
+    - {hash: 0fed07bdbac24cdeb162c4ae, color: pink, label: "munin-7b-open-stage0-4k.log", offset: 0}
+    - {hash: b6061ef78bb14cceb538d8ec, color: pink, label: "munin-7b-open-stage01-4k.log", offset: 2759}
+    - {hash: f03eccf2180349edab55e89f, color: green, label: "munin-7b-open-stage1-4kn.log", linestyle: "-."}
+    - {hash: 5e18f54da9a44ed68dfcd622, color: yellow, label: "munin-7b-open-stage1-1k.log"}
+    - {hash: 451cc3709dda4fbeb356a6d0, color: green, label: "munin-7b-open-stage1-2k.log"}
+    - {hash: 40636f1109c64fc8a5421564, color: green, label: "munin-7b-open-stage1-8k.log"}
+    - {hash: 7cd5574b313c401b80d4c314, color: green, label: "munin-7b-open-stage1-16k.log"}
+    - {hash: d8715176648740e88154a02d, color: green, label: "munin-7b-open-stage1-32k.log"}
+    - {hash: b1a4f916219f422b98066749, color: green, label: "munin-7b-open-stage1-64k.log"}

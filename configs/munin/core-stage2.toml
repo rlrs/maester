@@ -1,0 +1,44 @@
+model_name = "llama3"
+flavor = "Comma7B"
+tokenizer_name = "common-pile/comma-v0.1-2t"
+
+# job 
+job_name = "munin-7b-core-stage2"
+wandb_project = "munin-7b-core-stage2"
+enable_wandb = false
+
+# parallelism
+num_nodes = 1
+data_parallel_shard_degree = 8
+data_parallel_replicate_degree = 1
+
+# training settings
+train_batch_size = 8
+gradient_accumulation_steps = 4
+gradient_accumulation_sync_each_step = true
+seq_len = 4096
+train_num_steps = 8772
+scheduler = "linear_warmup_constant_sqrt_decay"
+warmup_steps = 250
+cooldown_steps = 522
+checkpoint_interval = 1000
+forced_load_path = "/work/training/maester/jobs/munin-7b-core-stage3b/checkpoints/step-79752/"
+compile = true
+enable_cut_cross_entropy = false
+ac_mode = "none"
+selective_ac_option = "op"
+
+[dataset]
+bos_token = 2
+eos_token = 1
+data_dirs = [
+    "/work/production/data/munin-core-dfm-0-of-1-dyna-0-of-1-cp-7-of-16-train/",
+]
+dataset_weights = "1.0"
+
+[opt_cfg] # must specify *all* fields here, will not merge with defaults
+lr = 1e-5
+betas = [0.9, 0.95]
+weight_decay = 0.1
+eps = 1e-9
+fused = true

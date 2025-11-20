@@ -1,0 +1,42 @@
+model_name = "llama3"
+flavor = "Comma7B-4k"
+tokenizer_name = "/work/training/maester/odinllm/models/comma-v0.1-2t-4kn"
+
+# job 
+job_name = "munin-7b-open-stage1-4kn"
+wandb_project = "munin-7b-open-stage1-4kn"
+enable_wandb = false
+
+# parallelism
+num_nodes = 1
+data_parallel_shard_degree = 8
+data_parallel_replicate_degree = 1
+
+# training settings
+train_batch_size = 8
+seq_len = 4096
+train_num_steps = 27592
+scheduler = "linear_warmup_constant_sqrt_decay"
+warmup_steps = 1000
+cooldown_steps = 1000
+checkpoint_interval = 1000
+forced_load_path = "/work/training/maester/comma-v0.1-2t-4kn-dcp/"
+compile = true
+enable_cut_cross_entropy = false
+ac_mode = "none"
+selective_ac_option = "op"
+
+[dataset]
+bos_token = 2
+eos_token = 1
+data_dirs = [
+    "/work/production/data/munin-open-dyna-0-of-1-cp-0-of-16-train/",
+]
+dataset_weights = "1.0"
+
+[opt_cfg] # must specify *all* fields here, will not merge with defaults
+lr = 1e-5
+betas = [0.9, 0.95]
+weight_decay = 0.1
+eps = 1e-9
+fused = true

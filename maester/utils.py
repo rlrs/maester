@@ -143,7 +143,7 @@ def init_distributed(cfg):
     #     _warn_overwrite_env(TRACE_FILE, f"{dump_dir}/rank_")
 
     torch.distributed.init_process_group(
-        "nccl", timeout=timedelta(seconds=cfg.init_timeout_seconds)
+        cfg.backend if hasattr(cfg, "backend") else "nccl", timeout=timedelta(seconds=cfg.init_timeout_seconds)
     )
 
     # to mitigate the memory issue that collectives using

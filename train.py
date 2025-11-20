@@ -14,6 +14,7 @@ from typing import Any
 
 import numpy as np
 import torch
+torch.set_float32_matmul_precision('high')
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.checkpoint.stateful import Stateful
@@ -33,6 +34,7 @@ from maester.memory import cleanup_before_training
 from maester.metrics import build_gpu_memory_monitor, build_metric_logger, register_logits_monitoring, WeightScaleMonitor
 from maester.data_monitor import DataMonitor
 from maester.models import (
+    freeze_model_params,
     model_name_to_cls,
     models_config,
     model_name_to_parallelize,
@@ -71,6 +73,7 @@ torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce co
 def main():
     init_logger()
     logger.info(f"Starting training.")
+#    os.environ["LOCAL_RANK"] = str(int(os.environ.get("LOCAL_RANK", "0")) % 2)
 
     if len(sys.argv) > 1: 
         config_path = Path(sys.argv[1]) / "config.json"
@@ -94,6 +97,7 @@ def main():
     # init world mesh
     world_size = int(os.environ["WORLD_SIZE"])
     parallel_dims = ParallelDims(
+        cfg=cfg,
         dp_shard=cfg.data_parallel_shard_degree,
         dp_replicate=cfg.data_parallel_replicate_degree,
         tp=cfg.tensor_parallel_degree,
@@ -174,6 +178,22 @@ def main():
         gpu_memory_monitor = build_gpu_memory_monitor()
         # obtain the peak flops of bf16 type for MFU calculation
         gpu_peak_flops = get_peak_flops(torch.cuda.get_device_properties(0).name)
+
+        # Freeze/unfreeze model parameters as specified in config
+        frozen = freeze_model_params(
+            model,
+            freeze_patterns=cfg.freeze,
+            unfreeze_patterns=cfg.unfreeze,
+        )
+        logger.info(f"Frozen parameters:\n{json.dumps(frozen, indent=2)}")
+        # print total vs trainable parameters
+        total_params = get_num_params(model)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(
+            f"Total parameters: {total_params:,}, "
+            f"Trainable parameters: {trainable_params:,} "
+            f"({100 * trainable_params / total_params:.2f}%)"
+        )
 
         # Choose parallelization function based on model type
         parallelize = model_name_to_parallelize[cfg.model_name]
@@ -465,7 +485,7 @@ def main():
                     
                     # Aggregate data loading times across ALL ranks (TP ranks load redundantly)
                     # Flatten world mesh to get all ranks
-                    global_mesh = world_mesh._flatten() if hasattr(world_mesh, '_flatten') else world_mesh
+                    global_mesh = world_mesh._flatten(mesh_dim_name="global") if hasattr(world_mesh, '_flatten') else world_mesh
                     global_avg_data_loading = dist_mean(time_data_loading, global_mesh).item()
                     global_max_data_loading = dist_max(time_data_loading, global_mesh).item()
                     global_avg_data_loading_pct = dist_mean(time_data_loading_pct, global_mesh).item()

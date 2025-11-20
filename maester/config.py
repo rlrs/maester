@@ -145,6 +145,10 @@ class Config(BaseSettings):
     warmup_steps: int = 50
     cooldown_steps: int = 100  # used for some schedules
 
+    # freezing
+    freeze: list[str] = []
+    unfreeze: list[str] = []
+
     # fsdp
     mixed_precision_param: str = 'bfloat16'
     mixed_precision_reduce: str = 'float32'
@@ -156,6 +160,7 @@ class Config(BaseSettings):
     # experimental
     enable_async_tensor_parallel: bool = False
     enable_compiled_autograd: bool = True
+#    backend: str = "gloo"
 
     # profiling
     enable_profiling: bool = True
