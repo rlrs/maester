@@ -1,8 +1,27 @@
-from maester.models.gemma.model import ModelArgs, GemmaTextModel
+from maester.models.gemma.model import GemmaTextModel, ModelArgs
 
 __all__ = ["GemmaTextModel", "ModelArgs"]
 
 gemma3_configs = {
+    "270M": ModelArgs(
+        vocab_size=262_144,
+        dim=640,
+        n_layers=18,
+        n_heads=4,
+        num_key_value_heads=1,
+        head_dim=256,
+        intermediate_size=2048,
+        attn_types=["local_sliding", "local_sliding", "local_sliding", "local_sliding", "local_sliding", "global"],
+        use_post_ffw_norm=True,
+        use_pre_ffw_norm=True,
+        sliding_window_size=512,
+        rope_wave_length={
+            "local_sliding": 10_000,
+            "global": 1_000_000,
+        },
+        use_qk_norm=True,
+        vision_config=None,
+    ),
     "1B": ModelArgs(
         vocab_size=262_144,  # Actual size from google/gemma-3-1b-pt tokenizer
         dim=1152,
