@@ -57,17 +57,10 @@ class OptimizerWrapper(Stateful):
         self.optim = optim
 
     def state_dict(self) -> Dict[str, Any]:
-        optim_ref = getattr(self.optim, "optimizers", None)
-        if optim_ref is not None:
-            return get_optimizer_state_dict(self.model, optim_ref)
         return get_optimizer_state_dict(self.model, self.optim) # TODO: fails for optimizers without state, like plain SGD
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        optim_ref = getattr(self.optim, "optimizers", None)
-        if optim_ref is not None:
-            set_optimizer_state_dict(self.model, optim_ref, optim_state_dict=state_dict)
-        else:
-            set_optimizer_state_dict(self.model, self.optim, optim_state_dict=state_dict)
+        set_optimizer_state_dict(self.model, self.optim, optim_state_dict=state_dict)
 
 class DataLoaderWrapper(Stateful):
     def __init__(self, dataloader: DataLoader) -> None:

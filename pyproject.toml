@@ -23,9 +23,8 @@ dependencies = [
     "pydantic",
     "tensorboard",
     "pydantic-settings[toml]>=2.6.0",
-    "triton>=3", # OpenAI Triton (PyPI). Not the same as pytorch-triton.
+    "triton>=3",  # OpenAI Triton (PyPI). Not the same as pytorch-triton.
     "cut-cross-entropy",
-    "pytest>=8.4.2",
 ]
 
 [build-system]

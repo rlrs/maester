@@ -8,20 +8,17 @@
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
 
-import math
 from dataclasses import dataclass
+import math
 from typing import Optional, Tuple
-from cut_cross_entropy import LinearCrossEntropyImpl, linear_cross_entropy
+
 import torch
 import torch.nn.functional as F
 from torch import nn
+from cut_cross_entropy import linear_cross_entropy, LinearCrossEntropyImpl
 
-from maester.models.llama.tied_linear import TiedLinear
 from maester.models.norms import create_norm
-from maester.log_utils import logger
-
-# from cut_cross_entropy import linear_cross_entropy, LinearCrossEntropyImpl
-
+from maester.models.llama.tied_linear import TiedLinear
 
 
 @dataclass
@@ -47,41 +44,6 @@ class ModelArgs:
     mup_input_alpha: float = 1.0
     mup_output_alpha: float = 1.0
     mup_width_mul: float = 1.0 # = width / base_width
-
-    def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
-        """
-        Calculate the number of parameters and FLOPS per token.
-        Adopted from GLM4/deepseek implementation for consistency across models.
-        """
-        nparams_embedding = 0
-        nparams_dense = 0
-
-        for name, p in model.named_parameters():
-            if "embedding" in name:
-                nparams_embedding += p.numel()
-                nparams_dense += p.numel()
-            else:
-                nparams_dense += p.numel()
-
-        nparams = nparams_dense
-
-        logger.info(
-            f"Total parameter count: {nparams:,} (embeddings: {nparams_embedding:,})"
-        )
-
-        l, h, q, t = (
-            self.n_layers,
-            self.n_heads,
-            self.dim // self.n_heads,
-            seq_len,
-        )
-        # See gemma/deepseek notes for the factor of 12 in attention FLOPs.
-        num_flops_per_token = (
-            6 * (nparams_dense - nparams_embedding)
-            + 12 * l * h * q * t
-        )
-
-        return nparams, num_flops_per_token
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:

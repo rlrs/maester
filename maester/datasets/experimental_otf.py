@@ -1309,20 +1309,9 @@ class Sampling_Dataset(_Stateful_Dataset):
 
         # Build subdataset iterators
         self.data = []
-        match self.cfg.dataset_type:
-            case "parquet":
-                dataset_class = ParquetDataset
-            case "jinx":
-                try:
-                    from .jinx_dataset import JinxDataset
-                    dataset_class = JinxDataset
-                except ImportError:
-                    raise ImportError("JinxDataset requires the mldataforge package. Please install it with `pip install mldataforge`.")
-            case _:
-                raise ValueError(f"Unsupported dataset type {self.cfg.dataset_type}. Supported types are 'parquet' and 'jinx'.")
         for i, d in enumerate(data_dirs):
             self.data.append(
-                dataset_class(
+                ParquetDataset(
                     data_dir=d,
                     rank=rank,
                     worldsize=worldsize,

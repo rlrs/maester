@@ -1,17 +1,13 @@
+from typing import Optional, List, Tuple, Union
 import math
-from typing import List, Optional, Tuple, Union
-
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from transformers import (AutoConfig, AutoModelForCausalLM, GenerationMixin,
-                          PretrainedConfig, PreTrainedModel)
+from transformers import PreTrainedModel, PretrainedConfig
 from transformers.activations import ACT2FN
-from transformers.modeling_outputs import (BaseModelOutputWithPast,
-                                           CausalLMOutputWithPast)
-
+from transformers import AutoConfig, AutoModelForCausalLM, GenerationMixin
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from maester.models.norms import RMSNorm
-
 
 class MupLlamaConfig(PretrainedConfig):
     model_type = "mup_llama"
