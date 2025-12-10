@@ -395,6 +395,6 @@ class DeepSeekModel(nn.Module):
         return output
 
     @classmethod
-    def from_model_args(cls, model_args: DeepSeekModelArgs) -> "DeepSeekModel":
+    def from_model_args(cls, model_args: DeepSeekModelArgs, cp_device_mesh=None) -> "DeepSeekModel":
         """Initialize from model args (compatible with training loop)."""
         return cls(model_args)
