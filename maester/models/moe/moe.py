@@ -12,6 +12,7 @@ try:
     import primus_turbo.pytorch as primus
     _PRIMUS_AVAILABLE = True
 except (ImportError, RuntimeError):
+    primus = None
     _PRIMUS_AVAILABLE = False
 
 @dataclass
@@ -24,6 +25,13 @@ class MoEArgs:
     route_norm: bool = False
     route_scale: float = 1.0
     score_before_experts: bool = True
+    router_type: Literal[
+        "token_choice_topk",
+        "flexolmo_linear_with_constrained_expert_bias",
+    ] = "token_choice_topk"
+    # If True, apply a learned expert bias constrained to <= 0 to logits[:, 1:],
+    # matching the pattern used in FlexOlmo's MoELinearRouterWithExpertBias.
+    flexolmo_constrained_expert_bias: bool = True
 
     # token-choice
     top_k: int = 1
@@ -123,6 +131,7 @@ def _run_experts_grouped_mm(
         # num_padding = 0
 
     if _PRIMUS_AVAILABLE:
+        assert primus is not None
         # primus.ops.grouped_gemm(A_concat, B_batched, group_lens)
         h1 = primus.ops.grouped_gemm(A, w1, lens)
         h3 = primus.ops.grouped_gemm(A, w3, lens)
@@ -337,6 +346,82 @@ class TokenChoiceTopKRouter(nn.Module):
         nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=init_std)
 
 
+class FlexOlmoLinearTopKRouter(nn.Module):
+    """
+    Minimal FlexOlmo-like router:
+    - linear logits
+    - optional learned expert bias constrained to <= 0 applied to logits[:, 1:]
+    - softmax over experts
+    - token-choice top-k selection
+
+    This is intentionally minimal and designed to plug into the existing `MoE` module.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_experts: int,
+        top_k: int,
+        route_norm: bool,
+        route_scale: float,
+        constrained_expert_bias: bool = True,
+    ):
+        super().__init__()
+        self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.route_norm = route_norm
+        self.route_scale = route_scale
+        self.constrained_expert_bias = constrained_expert_bias
+
+        # Bias for experts 1..(E-1), matching FlexOlmo behavior.
+        self.expert_bias_param = nn.Parameter(
+            torch.empty(num_experts - 1, dtype=torch.float32)
+        )
+
+    def forward(
+        self, x: torch.Tensor, expert_bias: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # logits shape (N, num_experts)
+        x_fp32 = x.to(torch.float32)
+        weight_fp32 = self.gate.weight.to(torch.float32)
+        logits = F.linear(x_fp32, weight_fp32)
+
+        if self.constrained_expert_bias and self.num_experts > 1:
+            constrained = torch.minimum(
+                self.expert_bias_param,
+                self.expert_bias_param.new_zeros(()),
+            )
+            logits[:, 1:] = logits[:, 1:] + constrained.unsqueeze(0)
+
+        # Optional external load-balancing bias (existing Maester mechanism)
+        if expert_bias is not None:
+            logits = logits + expert_bias.to(dtype=logits.dtype)
+
+        scores = F.softmax(logits, dim=1)
+        top_scores, selected_experts_indices = torch.topk(
+            scores, k=self.top_k, dim=1, sorted=False
+        )
+
+        if self.route_norm:
+            denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
+            top_scores = top_scores / denominator
+        top_scores = top_scores * self.route_scale
+
+        num_tokens_per_expert = torch.histc(
+            selected_experts_indices.view(-1),
+            bins=self.num_experts,
+            min=0,
+            max=self.num_experts,
+        )
+
+        return top_scores, selected_experts_indices, num_tokens_per_expert
+
+    def init_weights(self, init_std: float):
+        nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=init_std)
+        nn.init.trunc_normal_(self.expert_bias_param, mean=0.0, std=init_std)
+
+
 # NOTE: the reason we make this a stateless module is to support
 #       expert_tensor_parallel_degree=1 with consistent TP/EP APIs.
 class TokenReorderer(nn.Module):
@@ -409,15 +494,31 @@ class MoE(nn.Module):
             num_experts=num_experts,
             use_grouped_mm=moe_args.use_grouped_mm,
         )
-        self.router = TokenChoiceTopKRouter(
-            dim=dim,
-            num_experts=num_experts,
-            top_k=moe_args.top_k,
-            score_func=moe_args.score_func,
-            route_norm=moe_args.route_norm,
-            route_scale=moe_args.route_scale,
-            _debug_force_load_balance=moe_args._debug_force_load_balance,
-        )
+        if moe_args.router_type == "token_choice_topk":
+            self.router = TokenChoiceTopKRouter(
+                dim=dim,
+                num_experts=num_experts,
+                top_k=moe_args.top_k,
+                score_func=moe_args.score_func,
+                route_norm=moe_args.route_norm,
+                route_scale=moe_args.route_scale,
+                _debug_force_load_balance=moe_args._debug_force_load_balance,
+            )
+        elif moe_args.router_type == "flexolmo_linear_with_constrained_expert_bias":
+            if moe_args.score_func != "softmax":
+                raise ValueError(
+                    "flexolmo_linear_with_constrained_expert_bias expects score_func='softmax'."
+                )
+            self.router = FlexOlmoLinearTopKRouter(
+                dim=dim,
+                num_experts=num_experts,
+                top_k=moe_args.top_k,
+                route_norm=moe_args.route_norm,
+                route_scale=moe_args.route_scale,
+                constrained_expert_bias=moe_args.flexolmo_constrained_expert_bias,
+            )
+        else:
+            raise ValueError(f"Unknown moe_args.router_type: {moe_args.router_type}")
         self.reorderer = TokenReorderer(num_experts=num_experts, top_k=moe_args.top_k)
         self.shared_experts = (
             FeedForward(dim=dim, hidden_dim=hidden_dim * moe_args.num_shared_experts)
