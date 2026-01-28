@@ -1,6 +1,10 @@
 """Run in singularity container on a machine with enough RAM. For example:
-python scripts/convert_dcp_to_hf.py /path/to/checkpoints/ /path/to/output/ \
- --upload danish-foundation-models/munin-7b-{expname} --name step-1000 --base mistralai/Mistral-7B-v0.1
+
+python -u scripts/convert/llama/from_dcp_yarn.py \
+  /path/to/checkpoints/ \
+  /path/to/output/ \
+  --base danish-foundation-models/munin-open-7b-pt
+
 """
 
 import argparse
